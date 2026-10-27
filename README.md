@@ -2,7 +2,7 @@
 
 Status: `~local generation only`. The tested backend, SQLite database, Ollama text inference, and ComfyUI fallback-image generation run locally. Public-source retrieval still uses the internet. Supabase is schema preparation only, not the active runtime. See [file-by-file change notes](docs/local-generation-changes.md).
 
-Local working prototype with a native SwiftUI client and Python backend. This initial snapshot contains work completed before the hackathon; see [HACKATHON.md](HACKATHON.md) for the baseline and contributor attribution. Instagram supplies familiar feed conventions; the visual identity is provisional.
+Local working prototype with a native SwiftUI client and Python backend. This initial snapshot contains work completed before the hackathon, developed by Deeveshizm and Ujwal Jain with coding-agent assistance. Instagram supplies familiar feed conventions; the visual identity is provisional.
 
 ## Run
 
