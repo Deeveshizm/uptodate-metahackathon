@@ -1,0 +1,8 @@
+<!doctype html><html lang="en"><head><title>A local newsletter-to-post prototype</title></head>
+<body><article><h1>A local newsletter-to-post prototype</h1>
+<h2>Problem</h2><p>Readers receive useful ideas scattered across newsletter emails and public article links. The prototype gathers those sources into a finite daily reading feed.</p>
+<h2>Approach</h2><p>The engine downloads an accessible source, extracts addressable evidence spans, and asks a local Ollama model to produce a structured knowledge post. A separate model call checks the draft against the supplied source spans. Human approval is still required before a post appears in the feed.</p>
+<h2>Behavior</h2><p>The reader can bookmark a post privately, mark it read, open its original source, or copy a prompt into an external AI app. Importing an EML file remains supported alongside adding a source URL.</p>
+<h2>Limitations</h2><p>This is a prototype rather than a validated research system. A matching quote does not prove a generated interpretation is correct. A receiving email domain and a signup agent must be connected before automatic newsletter signup works.</p>
+<h2>Access</h2><p>New drafts remain private and enter a review queue. Public distribution requires an explicit permission assertion and a publication signup URL.</p>
+</article></body></html>

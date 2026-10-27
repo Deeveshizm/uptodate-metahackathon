@@ -1,0 +1,507 @@
+import hashlib
+import html
+import json
+import os
+import secrets
+import uuid
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from .demo import DEMO_LIMITS, DEMO_POSTS, DEMO_SENDER, DEMO_SIGNUP, DEMO_SOURCE_NAME, DEMO_SUBJECT
+from .pipeline import make_drafts, parse_newsletter, safe_url
+from .store import Store
+from .generation import Ollama
+from .retrieval import SourceError, public_url
+from .source_engine import SourceEngine
+
+
+def uid():
+    return uuid.uuid4().hex
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class AccountInput(BaseModel):
+    timezone: str = "UTC"
+
+
+class NewsletterInput(BaseModel):
+    url: str = Field(min_length=8, max_length=3000)
+    auto_subscribe: bool = True
+
+
+class GenerationInput(BaseModel):
+    url: str = Field(min_length=8, max_length=3000)
+    source_id: str | None = None
+    mode: Literal["article", "digest"] = "article"
+    refresh: bool = False
+
+
+class SourcePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    muted: bool | None = None
+    signup_url: str | None = Field(default=None, max_length=2000)
+
+
+class Approval(BaseModel):
+    reviewed: bool
+    rights: Literal["private", "public"] = "private"
+
+
+def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None):
+    store = Store(db_path or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3")))
+    engine = SourceEngine(store, source_fetcher, generator, subscription_agent, illustrator)
+
+    def process_job(job_id):
+        with store.connect() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job or job["status"] != "queued":
+                return
+            if job["kind"] != "email":
+                # The source engine owns claiming and processing these job types.
+                source_job = True
+            else:
+                source_job = False
+            if source_job:
+                claimed = False
+            else:
+                claimed = db.execute("UPDATE jobs SET status='processing' WHERE id=? AND status='queued'", (job_id,)).rowcount
+        if source_job:
+            engine.process(job_id)
+            return
+        if not claimed:
+            return
+        try:
+            drafts = make_drafts(json.loads(job["payload"]))
+            with store.connect() as db:
+                for draft in drafts:
+                    post_id = uid()
+                    db.execute("""INSERT INTO posts
+                        (id,user_id,source_id,job_id,title,hook,finding,limitations,original_url,evidence,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (post_id, job["user_id"], job["source_id"], job_id, draft["title"],
+                         draft["hook"], draft["finding"], draft["limitations"], draft["original_url"],
+                         json.dumps(draft["evidence"]), now()))
+                    engine.publish_ready(db, post_id)
+                db.execute("UPDATE jobs SET status='completed',stage='completed',payload=NULL WHERE id=?", (job_id,))
+        except Exception:
+            with store.connect() as db:
+                db.execute("UPDATE jobs SET status='failed',error='Extraction failed; re-import the edition',payload=NULL WHERE id=?", (job_id,))
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # One local process only. Recover interrupted jobs after restart.
+        with store.connect() as db:
+            # The user opted into an automatic PRIVATE feed. Preserve rejected
+            # posts and public permission gates; promote prior valid local drafts.
+            for post in db.execute("SELECT id FROM posts WHERE status='review' AND rights='private'").fetchall():
+                engine.publish_ready(db, post["id"])
+            db.execute("UPDATE jobs SET status='queued' WHERE status='processing'")
+            pending = [r["id"] for r in db.execute("SELECT id FROM jobs WHERE status='queued'")]
+        for job_id in pending:
+            process_job(job_id)
+        yield
+
+    app = FastAPI(title="UpToDate prototype", version="0.1.0", lifespan=lifespan)
+    app.state.store = store
+    app.state.engine = engine
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver", "[::1]"])
+    bearer = HTTPBearer(auto_error=False)
+
+    def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+        if not credentials or credentials.scheme.lower() != "bearer":
+            raise HTTPException(401, "A local account token is required")
+        token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
+        with store.connect() as db:
+            row = db.execute("SELECT * FROM users WHERE token_hash=?", (token_hash,)).fetchone()
+        if not row:
+            raise HTTPException(401, "Account token is invalid or deleted")
+        return dict(row)
+
+    def account_json(user):
+        return {key: user[key] for key in ("id", "alias", "timezone")}
+
+    def local_day(user):
+        return datetime.now(ZoneInfo(user["timezone"])).date().isoformat()
+
+    def get_post(db, user, post_id):
+        row = db.execute("SELECT * FROM posts WHERE id=? AND user_id=?", (post_id, user["id"])).fetchone()
+        if not row:
+            raise HTTPException(404, "Post not found")
+        return row
+
+    def post_json(db, row, user):
+        source = db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
+        analysis, visual = json.loads(row["analysis"]), json.loads(row["visual"])
+        tags = []
+        if row["generation"] == "extractive":
+            tags.append({"code": "original_analysis_pending", "label": "Original analysis pending", "detail": "Imported excerpt from the newsletter; original-source analysis is not complete."})
+        elif row["verification"] == "machine_checked":
+            if visual.get("status") != "ready":
+                tags.append({"code": "image_pending", "label": "Image pending", "detail": visual.get("detail", "Source visual is still being prepared.")})
+            if not analysis.get("provenance"):
+                tags.append({"code": "source_update_pending", "label": "Source update pending", "detail": "This earlier post has not yet been regenerated with original-source provenance."})
+        return {
+            **{k: row[k] for k in ("id", "title", "hook", "finding", "limitations", "original_url", "status", "rights", "generation", "published_date", "verification")},
+            "analysis": analysis, "visual": visual, "tags": tags,
+            "publication": analysis.get("publication", {}),
+            "is_demo": bool(row["is_demo"]), "source": dict(source),
+            "author": source["name"], "newsletter_name": source["name"], "newsletter_url": source["url"],
+            "evidence": json.loads(row["evidence"]),
+            "bookmarked": bool(db.execute("SELECT 1 FROM bookmarks WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
+            "read": bool(db.execute("SELECT 1 FROM reads WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
+        }
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "mode": "local-prototype", "generation": "ollama", "email_import": True}
+
+    @app.get("/v1/engine")
+    def engine_status(user=Depends(current_user)):
+        return {**Ollama().status(), "signup_agent_configured": engine.subscription_agent is not None,
+                "receiving_alias_ready": not user["alias"].endswith(".invalid")}
+
+    def validate_source_url(value):
+        try:
+            return public_url(value)
+        except SourceError as exc:
+            raise HTTPException(422, str(exc))
+
+    @app.post("/v1/newsletters", status_code=202)
+    def add_newsletter(body: NewsletterInput, background: BackgroundTasks, user=Depends(current_user)):
+        url = validate_source_url(body.url)
+        identity = "newsletter:" + hashlib.sha256(url.encode()).hexdigest()
+        with store.connect() as db:
+            source = db.execute("SELECT * FROM sources WHERE user_id=? AND sender=?", (user["id"], identity)).fetchone()
+            if source:
+                existing = db.execute("SELECT id,status FROM jobs WHERE source_id=? AND kind='newsletter' ORDER BY created_at DESC LIMIT 1", (source["id"],)).fetchone()
+                return {"source_id": source["id"], "job_id": existing["id"] if existing else None,
+                        "status": source["subscription_status"], "duplicate": True, "post_generation": "automatic"}
+            source_id, job_id = uid(), uid()
+            db.execute("INSERT INTO sources(id,user_id,name,sender,url,signup_url,subscription_status) VALUES(?,?,?,?,?,?,'queued')",
+                       (source_id, user["id"], urlsplit(url).hostname, identity, url, url))
+            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
+                       (job_id, user["id"], source_id, identity, "Add newsletter by link", body.model_dump_json(), now()))
+        background.add_task(process_job, job_id)
+        return {"source_id": source_id, "job_id": job_id, "status": "queued", "duplicate": False, "post_generation": "automatic"}
+
+    @app.post("/v1/generation", status_code=202)
+    def generate_from_url(body: GenerationInput, background: BackgroundTasks, user=Depends(current_user)):
+        url = validate_source_url(body.url)
+        identity = "generate-v1:" + hashlib.sha256(f"{url}:{body.mode}:{body.source_id or ''}".encode()).hexdigest()
+        with store.connect() as db:
+            if not body.refresh:
+                existing = db.execute("SELECT id,status FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], identity)).fetchone()
+                if existing:
+                    return {"job_id": existing["id"], "status": existing["status"], "duplicate": True}
+            else:
+                identity += ":" + uid()
+            if body.source_id:
+                source = db.execute("SELECT id FROM sources WHERE id=? AND user_id=?", (body.source_id, user["id"])).fetchone()
+                if not source:
+                    raise HTTPException(404, "Source not found")
+                source_id = source["id"]
+            else:
+                host = urlsplit(url).hostname
+                sender = "web:" + host
+                source = db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (user["id"], sender)).fetchone()
+                source_id = source["id"] if source else uid()
+                if not source:
+                    db.execute("INSERT INTO sources(id,user_id,name,sender,url) VALUES(?,?,?,?,?)", (source_id, user["id"], host, sender, url))
+            job_id = uid()
+            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'generation')",
+                       (job_id, user["id"], source_id, identity, "Generate from " + urlsplit(url).hostname, body.model_dump_json(), now()))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued", "duplicate": False}
+
+    @app.post("/v1/posts/{post_id}/regenerate", status_code=202)
+    def regenerate_post(post_id: str, background: BackgroundTasks, user=Depends(current_user)):
+        with store.connect() as db:
+            post = get_post(db, user, post_id)
+            if post["rights"] != "private" or post["status"] == "rejected" or not post["generation"].startswith("ollama:"):
+                raise HTTPException(409, "Only active private source-engine posts can be regenerated")
+            analysis = json.loads(post["analysis"])
+            url = analysis.get("provenance", {}).get("newsletter_issue_url") or post["original_url"]
+            identity = "regenerate:" + post_id
+            existing = db.execute("SELECT id,status FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], identity)).fetchone()
+            if existing and existing["status"] in ("queued", "processing"):
+                return {"job_id": existing["id"], "status": existing["status"], "duplicate": True}
+            job_id = existing["id"] if existing else uid()
+            payload = json.dumps({"url": url, "mode": "article", "replace_post_id": post_id})
+            if existing:
+                db.execute("UPDATE jobs SET status='queued',stage='queued',payload=?,error=NULL,result='{}' WHERE id=?", (payload, job_id))
+            else:
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'generation')",
+                           (job_id, user["id"], post["source_id"], identity, "Regenerate from original source", payload, now()))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued", "duplicate": False}
+
+    @app.post("/v1/jobs/{job_id}/retry", status_code=202)
+    def retry_job(job_id: str, background: BackgroundTasks, user=Depends(current_user)):
+        with store.connect() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"])).fetchone()
+            if not job:
+                raise HTTPException(404, "Job not found")
+            if job["status"] != "failed" or not job["payload"]:
+                raise HTTPException(409, "Only failed source jobs with a retained request can be retried")
+            db.execute("UPDATE jobs SET status='queued',stage='queued',error=NULL WHERE id=?", (job_id,))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued"}
+
+    @app.post("/v1/dev/accounts", status_code=201)
+    def create_account(body: AccountInput):
+        try:
+            ZoneInfo(body.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(422, "Unknown timezone")
+        token = secrets.token_urlsafe(32)
+        user = {"id": uid(), "alias": f"{secrets.token_hex(12)}@inbox.prototype.invalid", "timezone": body.timezone}
+        with store.connect() as db:
+            db.execute("INSERT INTO users(id,token_hash,alias,created_at,timezone) VALUES(?,?,?,?,?)",
+                       (user["id"], hashlib.sha256(token.encode()).hexdigest(), user["alias"], now(), body.timezone))
+        return {**account_json(user), "token": token, "alias_deliverable": False}
+
+    @app.get("/v1/me")
+    def me(user=Depends(current_user)):
+        return {**account_json(user), "alias_deliverable": False}
+
+    @app.delete("/v1/me", status_code=204)
+    def delete_account(user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute("DELETE FROM users WHERE id=?", (user["id"],))
+
+    @app.post("/v1/dev/demo")
+    def seed_demo(user=Depends(current_user)):
+        with store.connect() as db:
+            existing = db.execute("SELECT id FROM jobs WHERE user_id=? AND fingerprint='roundup-oct-18'", (user["id"],)).fetchone()
+            if existing:
+                return {"status": "already_loaded", "job_id": existing["id"]}
+            source = db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (user["id"], DEMO_SENDER)).fetchone()
+            source_id, job_id = (source["id"] if source else uid()), uid()
+            if source:
+                db.execute("UPDATE sources SET name=?,signup_url=CASE WHEN signup_url='' THEN ? ELSE signup_url END WHERE id=?",
+                           (DEMO_SOURCE_NAME, DEMO_SIGNUP, source_id))
+            else:
+                db.execute("INSERT INTO sources(id,user_id,name,sender,signup_url) VALUES(?,?,?,?,?)",
+                           (source_id, user["id"], DEMO_SOURCE_NAME, DEMO_SENDER, DEMO_SIGNUP))
+            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (job_id, user["id"], source_id, "roundup-oct-18", DEMO_SUBJECT, "completed", now()))
+            for draft in DEMO_POSTS:
+                db.execute("""INSERT INTO posts
+                    (id,user_id,source_id,job_id,title,hook,finding,limitations,original_url,evidence,rights,status,is_demo,generation,created_at,published_date)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,'public','approved',1,'seeded-sample',?,?)""",
+                    (uid(), user["id"], source_id, job_id, draft["title"], draft["hook"], draft["finding"],
+                     DEMO_LIMITS, draft["original_url"], json.dumps([{"source": DEMO_SUBJECT, "quote": draft["finding"], "url": draft["original_url"]}]), now(), local_day(user)))
+        return {"status": "loaded", "job_id": job_id}
+
+    @app.post("/v1/import/email", status_code=202)
+    async def import_email(background: BackgroundTasks, file: UploadFile = File(...), user=Depends(current_user)):
+        raw = await file.read(2_000_001)
+        await file.close()
+        if len(raw) > 2_000_000:
+            raise HTTPException(413, "Email must be under 2 MB")
+        try:
+            parsed = parse_newsletter(raw)
+        except (ValueError, LookupError, TypeError):
+            raise HTTPException(422, "Cannot extract a readable newsletter with a valid sender and source link")
+        with store.connect() as db:
+            existing = db.execute("SELECT id,status FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], parsed["fingerprint"])).fetchone()
+            if existing:
+                return {"job_id": existing["id"], "status": existing["status"], "duplicate": True}
+            source = db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (user["id"], parsed["sender"])).fetchone()
+            source_id = source["id"] if source else uid()
+            if not source:
+                db.execute("INSERT INTO sources(id,user_id,name,sender) VALUES(?,?,?,?)", (source_id, user["id"], parsed["source_name"], parsed["sender"]))
+            job_id = uid()
+            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at) VALUES(?,?,?,?,?,'queued',?,?)",
+                       (job_id, user["id"], source_id, parsed["fingerprint"], parsed["subject"], json.dumps(parsed), now()))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued", "duplicate": False}
+
+    @app.get("/v1/jobs")
+    def jobs(user=Depends(current_user)):
+        with store.connect() as db:
+            rows = db.execute("SELECT id,source_id,subject,status,error,created_at,kind,stage,result FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 100", (user["id"],)).fetchall()
+            return [{**dict(row), "result": json.loads(row["result"])} for row in rows]
+
+    @app.get("/v1/me/sources")
+    def sources(user=Depends(current_user)):
+        with store.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM sources WHERE user_id=? ORDER BY name", (user["id"],))]
+
+    @app.patch("/v1/me/sources/{source_id}")
+    def patch_source(source_id: str, body: SourcePatch, user=Depends(current_user)):
+        with store.connect() as db:
+            source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone()
+            if not source:
+                raise HTTPException(404, "Source not found")
+            if body.name is not None:
+                if not body.name.strip():
+                    raise HTTPException(422, "Newsletter name cannot be empty")
+                db.execute("UPDATE sources SET name=? WHERE id=?", (body.name.strip(), source_id))
+            if body.signup_url is not None:
+                url = safe_url(body.signup_url) if body.signup_url else ""
+                if body.signup_url and not url:
+                    raise HTTPException(422, "Use a public HTTP(S) signup URL")
+                db.execute("UPDATE sources SET signup_url=? WHERE id=?", (url, source_id))
+            if body.muted is not None:
+                db.execute("UPDATE sources SET muted=? WHERE id=?", (body.muted, source_id))
+            return dict(db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone())
+
+    @app.get("/v1/review")
+    def review(user=Depends(current_user)):
+        with store.connect() as db:
+            return [post_json(db, row, user) for row in db.execute("SELECT * FROM posts WHERE user_id=? AND status='review' ORDER BY created_at", (user["id"],)).fetchall()]
+
+    @app.post("/v1/review/{post_id}/approve")
+    def approve(post_id: str, body: Approval, user=Depends(current_user)):
+        if not body.reviewed:
+            raise HTTPException(422, "Review the excerpt and original source before approving")
+        with store.connect() as db:
+            row = get_post(db, user, post_id)
+            if body.rights == "public":
+                source = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()
+                if not source["signup_url"]:
+                    raise HTTPException(422, "Set the publication signup URL before public approval")
+            db.execute("UPDATE posts SET status='approved',rights=?,published_date=COALESCE(published_date,?) WHERE id=?", (body.rights, local_day(user), post_id))
+            analysis = json.loads(row["analysis"])
+            analysis["publication"] = {"mode": "manual", "human_reviewed": True}
+            db.execute("UPDATE posts SET analysis=? WHERE id=?", (json.dumps(analysis), post_id))
+            pending = db.execute("SELECT 1 FROM posts WHERE job_id=? AND status='review'", (row["job_id"],)).fetchone()
+            if not pending:
+                db.execute("UPDATE jobs SET status='completed' WHERE id=?", (row["job_id"],))
+            return post_json(db, get_post(db, user, post_id), user)
+
+    @app.post("/v1/review/{post_id}/reject", status_code=204)
+    def reject(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            row = get_post(db, user, post_id)
+            if row["status"] == "rejected":
+                raise HTTPException(409, "Post is already removed")
+            db.execute("UPDATE posts SET status='rejected' WHERE id=?", (post_id,))
+            if not db.execute("SELECT 1 FROM posts WHERE job_id=? AND status='review'", (row["job_id"],)).fetchone():
+                db.execute("UPDATE jobs SET status='completed' WHERE id=?", (row["job_id"],))
+
+    @app.get("/v1/feed")
+    def feed(day: date | None = None, user=Depends(current_user)):
+        edition_date = day.isoformat() if day else local_day(user)
+        with store.connect() as db:
+            rows = db.execute("""SELECT p.* FROM posts p JOIN sources s ON s.id=p.source_id
+                WHERE p.user_id=? AND p.status='approved' AND p.published_date=? AND s.muted=0
+                ORDER BY p.created_at DESC,p.id DESC""", (user["id"], edition_date)).fetchall()
+            posts = [post_json(db, row, user) for row in rows]
+        return {"date": edition_date, "posts": posts, "total": len(posts), "unread": sum(not p["read"] for p in posts), "finite": True}
+
+    @app.get("/v1/bookmarks")
+    def bookmarks(user=Depends(current_user)):
+        with store.connect() as db:
+            rows = db.execute("SELECT p.* FROM posts p JOIN bookmarks b ON b.post_id=p.id WHERE b.user_id=? AND p.status='approved' ORDER BY p.created_at DESC", (user["id"],)).fetchall()
+            return [post_json(db, row, user) for row in rows]
+
+    @app.get("/v1/posts/{post_id}")
+    def post(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            return post_json(db, get_post(db, user, post_id), user)
+
+    @app.get("/v1/posts/{post_id}/image")
+    def post_image(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            get_post(db, user, post_id)
+            asset = db.execute("SELECT image,content_type FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, "Post has no ready visual")
+            return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+    @app.post("/v1/posts/{post_id}/image/retry", status_code=202)
+    def retry_visual(post_id: str, background: BackgroundTasks, user=Depends(current_user)):
+        with store.connect() as db:
+            post = get_post(db, user, post_id)
+            if post["status"] == "rejected" or not post["generation"].startswith("ollama:"):
+                raise HTTPException(409, "Visual generation is only available for active source-engine posts")
+            visual = json.loads(post["visual"])
+            if visual.get("kind") == "source" and visual.get("status") == "ready":
+                return {"status": "ready", "detail": "Existing source visual retained; image generation was not requested"}
+            pending = db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='visual' AND status IN ('queued','processing') AND fingerprint=?", (user["id"], "visual:" + post_id)).fetchone()
+            if pending:
+                return {"job_id": pending["id"], "status": "queued"}
+            # A stable per-post visual job provides idempotent retries.
+            existing = db.execute("SELECT id FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], "visual:" + post_id)).fetchone()
+            job_id = existing["id"] if existing else uid()
+            payload = json.dumps({"post_id": post_id})
+            if existing:
+                db.execute("UPDATE jobs SET status='queued',payload=?,error=NULL WHERE id=?", (payload, job_id))
+            else:
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'visual')",
+                           (job_id, user["id"], post["source_id"], "visual:" + post_id, "Prepare post visual", payload, now()))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued"}
+
+    def published_post(db, user, post_id):
+        row = get_post(db, user, post_id)
+        if row["status"] != "approved":
+            raise HTTPException(409, "This draft is not published")
+        return row
+
+    @app.post("/v1/posts/{post_id}/bookmark", status_code=204)
+    def bookmark(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            published_post(db, user, post_id)
+            db.execute("INSERT OR IGNORE INTO bookmarks VALUES(?,?)", (user["id"], post_id))
+
+    @app.delete("/v1/posts/{post_id}/bookmark", status_code=204)
+    def unbookmark(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            get_post(db, user, post_id)
+            db.execute("DELETE FROM bookmarks WHERE user_id=? AND post_id=?", (user["id"], post_id))
+
+    @app.post("/v1/posts/{post_id}/read", status_code=204)
+    def mark_read(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            published_post(db, user, post_id)
+            db.execute("INSERT OR IGNORE INTO reads VALUES(?,?)", (user["id"], post_id))
+
+    @app.post("/v1/posts/{post_id}/share")
+    def share(post_id: str, request: Request, user=Depends(current_user)):
+        with store.connect() as db:
+            row = published_post(db, user, post_id)
+            signup = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()["signup_url"]
+            if row["rights"] != "public" or not signup:
+                return {"url": row["original_url"], "mode": "original-source", "local_only": False}
+            existing = db.execute("SELECT token FROM shares WHERE post_id=?", (post_id,)).fetchone()
+            token = existing["token"] if existing else secrets.token_urlsafe(24)
+            if not existing:
+                db.execute("INSERT INTO shares VALUES(?,?)", (token, post_id))
+        return {"url": str(request.base_url) + "s/" + token, "mode": "public-preview", "local_only": True}
+
+    @app.get("/s/{token}", response_class=HTMLResponse)
+    def shared_page(token: str):
+        with store.connect() as db:
+            row = db.execute("""SELECT p.*,s.name AS source_name,s.signup_url FROM shares l
+                JOIN posts p ON p.id=l.post_id JOIN sources s ON s.id=p.source_id
+                WHERE l.token=? AND p.rights='public' AND p.status='approved' AND s.signup_url!=''""", (token,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Shared post is unavailable")
+        e = lambda key: html.escape(str(row[key]), quote=True)
+        banner = "Seeded sample edition" if row["is_demo"] else "Manually reviewed newsletter excerpt"
+        return HTMLResponse(f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1"><title>{e('title')}</title>
+            <style>body{{font:18px/1.6 system-ui;max-width:650px;margin:50px auto;padding:24px}}p{{white-space:pre-line}}a{{color:#245c49}}.cta{{display:inline-block;padding:12px 20px;background:#245c49;color:white;border-radius:10px}}</style></head>
+            <body><small>LOCAL PROTOTYPE · {banner}</small><h1>{e('title')}</h1><p>{e('hook')}</p>
+            <p>{e('finding')}</p><p><small>{e('limitations')}</small></p><p>From {e('source_name')}</p>
+            <p><a href="{e('original_url')}" rel="noreferrer noopener">Read the original source</a></p>
+            <hr><a class="cta" href="{e('signup_url')}" rel="noreferrer noopener">Sign up for this newsletter</a>
+            </body></html>""", headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
+
+    return app
