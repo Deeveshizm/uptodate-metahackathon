@@ -7,12 +7,11 @@ data/
 DerivedData/
 xcuserdata/
 .DS_Store
-.env
-.env.local
-.env.*
-!.env.example
-*.sqlite3
-*.sqlite3-*
-*.safetensors
-*.gguf
-*.xcuserstate
+.env*
+**/.env*
+*.env
+*.env.*
+# Keep local plans, notes and new verification cases out of application commits.
+*.md
+tests/
+supabase/tests/

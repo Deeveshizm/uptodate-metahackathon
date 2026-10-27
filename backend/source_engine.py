@@ -3,12 +3,13 @@ import json
 import hashlib
 import re
 import uuid
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
-from .documents import digest_links, parse_document, primary_source_urls, publication_name
+from .documents import Document, digest_links, make_spans, parse_document, primary_source_urls, publication_name
 from .discovery import discover_issue, issue_mode
 from .generation import generate
 from .retrieval import PublicFetcher, SourceError
@@ -36,13 +37,18 @@ class SourceEngine:
     def process(self, job_id):
         with self.store.connect() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=? AND status='queued'", (job_id,)).fetchone()
+            if job and job["kind"] != "visual":
+                source = db.execute("SELECT subscription_status FROM sources WHERE id=? AND user_id=?", (job["source_id"], job["user_id"])).fetchone()
+                if source and source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "unsubscribing"):
+                    db.execute("UPDATE jobs SET status='cancelled',stage='cancelled',payload=NULL WHERE id=?", (job_id,))
+                    return
             if not job or not db.execute("UPDATE jobs SET status='processing',error=NULL WHERE id=? AND status='queued'", (job_id,)).rowcount:
                 return
         try:
             payload = json.loads(job["payload"])
             if job["kind"] == "visual":
                 self.render_visual(job, payload)
-            elif job["kind"] == "newsletter":
+            elif job["kind"] in ("newsletter", "subscription"):
                 self.inspect_newsletter(job, payload)
             else:
                 self.generate_posts(job, payload)
@@ -54,8 +60,8 @@ class SourceEngine:
     def fail(self, job, message):
         with self.store.connect() as db:
             db.execute("UPDATE jobs SET status='failed',stage='failed',error=? WHERE id=?", (message, job["id"]))
-            if job["kind"] == "newsletter":
-                db.execute("UPDATE sources SET subscription_status='failed',subscription_detail=? WHERE id=?", (message, job["source_id"]))
+            if job["kind"] in ("newsletter", "subscription"):
+                db.execute("UPDATE sources SET subscription_status='failed',subscription_detail=? WHERE id=? AND subscription_status NOT IN ('unsubscribed','unsubscribe_pending')", (message, job["source_id"]))
 
     def inspect_newsletter(self, job, payload):
         self.stage(job["id"], "inspecting_newsletter")
@@ -71,9 +77,14 @@ class SourceEngine:
         feed_url = safe_url(urljoin(resource.url, feed.get("href", ""))) if feed else ""
         with self.store.connect() as db:
             user = db.execute("SELECT alias FROM users WHERE id=?", (job["user_id"],)).fetchone()
-        if not user:
+            source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (job["source_id"], job["user_id"])).fetchone()
+        if not user or not source:
             return
-        if not payload.get("auto_subscribe", True):
+        if source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "submitted", "confirmation_required", "email_received", "receiving"):
+            status, detail = source["subscription_status"], source["subscription_detail"]
+        elif source["subscription_status"] == "submitting":
+            status, detail = "manual_action", "A previous signup may have been transmitted; check incoming mail before explicitly retrying"
+        elif not payload.get("auto_subscribe", True):
             status, detail = "not_requested", "Newsletter saved; automatic signup was not requested"
         elif user["alias"].endswith(".invalid"):
             status, detail = "needs_inbox", "Connect a receiving email domain before signup; the current account alias cannot receive confirmation emails"
@@ -81,21 +92,40 @@ class SourceEngine:
             status, detail = "needs_agent", "Receiving alias is ready; configure the signup agent to continue"
         else:
             self.stage(job["id"], "submitting_signup")
+            domain = urlsplit(resource.url).hostname or ""
+            for prefix in ("www.", "newsletter.", "newsletters."):
+                if domain.startswith(prefix):
+                    domain = domain[len(prefix):]
+                    break
+            with self.store.connect() as db:
+                claimed = db.execute("UPDATE sources SET subscription_status='submitting',subscription_alias=?,expected_sender_domain=? WHERE id=? AND user_id=? AND subscription_status NOT IN ('submitting','submitted','confirmation_required','email_received','receiving','unsubscribed','unsubscribe_pending')",
+                                     (user["alias"], domain, job["source_id"], job["user_id"])).rowcount
+            if not claimed:
+                with self.store.connect() as db:
+                    db.execute("UPDATE jobs SET status='completed',stage='completed',result=?,payload=NULL WHERE id=?", (json.dumps({"subscription_status": "in_progress", "detail": "Another signup already owns this subscription"}), job["id"]))
+                return
             try:
-                outcome = self.subscription_agent.subscribe(url=resource.url, email=user["alias"])
+                def still_allowed():
+                    with self.store.connect() as db:
+                        owner = db.execute("SELECT u.alias,s.subscription_status FROM users u JOIN sources s ON s.user_id=u.id WHERE u.id=? AND s.id=?", (job["user_id"], job["source_id"])).fetchone()
+                    return bool(owner and owner["alias"] == user["alias"] and owner["subscription_status"] not in ("unsubscribed", "unsubscribe_pending", "unsubscribing"))
+                options = {"before_submit": still_allowed} if getattr(self.subscription_agent, "supports_submission_guard", False) is True else {}
+                outcome = self.subscription_agent.subscribe(url=resource.url, email=user["alias"], **options)
                 status, detail = outcome["status"], outcome["detail"]
             except SourceError as exc:
                 status, detail = "failed", str(exc)
             if status not in ("submitted", "confirmation_required", "manual_action", "failed"):
                 raise SourceError("Signup agent returned an unrecognized subscription status")
-        self.stage(job["id"], "discovering_public_issue")
-        try:
-            content = discover_issue(resource, self.fetcher)
-        except SourceError as exc:
-            content = {"status": "discovery_failed", "detail": str(exc), "feed_url": feed_url}
+        content = {"status": "not_requested", "detail": "Subscription-only retry; public discovery was not repeated"}
+        if job["kind"] == "newsletter":
+            self.stage(job["id"], "discovering_public_issue")
+            try:
+                content = discover_issue(resource, self.fetcher)
+            except SourceError as exc:
+                content = {"status": "discovery_failed", "detail": str(exc), "feed_url": feed_url}
         generation_job_id = None
         with self.store.connect() as db:
-            db.execute("UPDATE sources SET name=?,signup_url=?,feed_url=?,subscription_status=?,subscription_detail=? WHERE id=?",
+            db.execute("UPDATE sources SET name=?,signup_url=?,feed_url=?,subscription_status=CASE WHEN subscription_status IN ('unsubscribed','unsubscribe_pending','email_received','receiving') THEN subscription_status ELSE ? END,subscription_detail=CASE WHEN subscription_status IN ('unsubscribed','unsubscribe_pending','email_received','receiving') THEN subscription_detail ELSE ? END WHERE id=?",
                        (name, resource.url, feed_url, status, detail, job["source_id"]))
             if content["status"] == "found":
                 identity = "auto-generate-v1:" + hashlib.sha256((job["source_id"] + ":" + content["url"]).encode()).hexdigest()
@@ -177,9 +207,18 @@ class SourceEngine:
 
     def generate_posts(self, job, payload):
         self.stage(job["id"], "fetching_source")
-        root = parse_document(self.fetcher.fetch(payload["url"]))
+        if job["kind"] == "received_email":
+            # A new input adapter, using the same original-source selection,
+            # local model, verifier and source-first image handling as URL jobs.
+            # The synthetic edition ID is never fetched or used as a post link.
+            root = Document("email:" + payload["fingerprint"], payload["subject"],
+                            make_spans([(payload["text"], "Newsletter", None)]),
+                            [{"url": url, "title": url} for url in payload["urls"]],
+                            {"format": "email"})
+        else:
+            root = parse_document(self.fetcher.fetch(payload["url"]))
         self.save_document(job, root)
-        mode = issue_mode(root) if payload.get("mode") == "auto" else payload.get("mode")
+        mode = "digest" if job["kind"] == "received_email" else (issue_mode(root) if payload.get("mode") == "auto" else payload.get("mode"))
         if mode == "digest":
             candidates = digest_links(root, limit=3)
             if not candidates:
@@ -209,7 +248,7 @@ class SourceEngine:
                     results.append({"url": document.url, "status": "duplicate", "post_id": duplicate["id"]})
                     continue
                 draft = self.generator(document, stage=lambda stage: self.stage(job["id"], stage))
-                draft["analysis"]["provenance"] = {"newsletter_issue_url": root.url, "secondary_url": secondary.url,
+                draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] == "received_email" else root.url, "secondary_url": secondary.url,
                                                     "original_url": document.url, "content_author": document.metadata.get("author", "")}
                 visual, image = choose_visual(document, draft, self.fetcher, self.illustrator,
                                               stage=lambda stage: self.stage(job["id"], stage))
@@ -254,6 +293,9 @@ class SourceEngine:
                        (state, state, error, json.dumps({"items": results}), state, job["id"]))
 
     def insert_post(self, db, post_id, job, document, draft, visual):
+        source = db.execute("SELECT subscription_status FROM sources WHERE id=? AND user_id=?", (job["source_id"], job["user_id"])).fetchone()
+        if not source or source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "unsubscribing"):
+            raise SourceError("Newsletter was unsubscribed; no new post was published")
         db.execute("""INSERT INTO posts
             (id,user_id,source_id,job_id,title,hook,finding,limitations,original_url,evidence,generation,analysis,verification,visual,created_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",

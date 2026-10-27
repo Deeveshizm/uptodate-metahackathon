@@ -135,6 +135,15 @@ def parse_document(resource: Resource) -> Document:
         "publisher": publication_name(soup),
         "format": "html",
     }
+    if urlsplit(resource.url).hostname in ("arxiv.org", "www.arxiv.org"):
+        paper = re.fullmatch(r"/(?:abs|html)/(\d{4}\.\d{4,5})(?:v\d+)?/?", urlsplit(resource.url).path)
+        if paper:
+            for anchor in soup.find_all("a", href=True):
+                candidate = safe_url(urljoin(resource.url, anchor["href"]))
+                parsed = urlsplit(candidate)
+                if parsed.hostname in ("arxiv.org", "www.arxiv.org") and re.fullmatch(r"/pdf/" + re.escape(paper[1]) + r"(?:v\d+)?(?:\.pdf)?/?", parsed.path):
+                    metadata["pdf_url"] = candidate
+                    break
     for element in soup(["script", "style", "noscript", "nav", "footer", "header", "form", "aside", "svg", "iframe"]):
         element.decompose()
     main = content_root(soup)

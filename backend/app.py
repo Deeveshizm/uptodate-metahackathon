@@ -1,4 +1,6 @@
 import hashlib
+import asyncio
+from contextlib import suppress
 import html
 import json
 import os
@@ -23,6 +25,10 @@ from .store import Store
 from .generation import Ollama
 from .retrieval import SourceError, public_url
 from .source_engine import SourceEngine
+from .auth import SupabaseAuth
+from .receiving import ReceivingError, TemporaryRelay
+from .signup import FormSignup
+from .subscriptions import Subscriptions
 
 
 def uid():
@@ -35,6 +41,11 @@ def now():
 
 class AccountInput(BaseModel):
     timezone: str = "UTC"
+
+
+class ProfilePatch(BaseModel):
+    display_name: str | None = Field(default=None, max_length=100)
+    timezone: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class NewsletterInput(BaseModel):
@@ -60,9 +71,49 @@ class Approval(BaseModel):
     rights: Literal["private", "public"] = "private"
 
 
-def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None):
+def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None, auth_provider=None, test_relay=None, receiving_poll=True):
     store = Store(db_path or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3")))
     engine = SourceEngine(store, source_fetcher, generator, subscription_agent, illustrator)
+    if subscription_agent is None and os.environ.get("NEWSLETTER_SIGNUP_MODE", "") in ("form", "browser"):
+        from .browser_signup import BrowserSignup
+        engine.subscription_agent = FormSignup(engine.fetcher, browser=BrowserSignup() if os.environ.get("NEWSLETTER_SIGNUP_MODE") == "browser" else None)
+    auth = auth_provider if auth_provider is not None else SupabaseAuth.from_environment()
+    relay = test_relay if test_relay is not None else TemporaryRelay.from_environment()
+    subscriptions = Subscriptions(store, engine.fetcher)
+    if relay and (not auth or auth.relay_aliases):
+        raise ValueError("Temporary receiving requires verified accounts with permanent relay activation disabled")
+
+    def receive_mail():
+        try:
+            result = relay.sync(store)
+        except ReceivingError:
+            return
+        if result and result.get("received"):
+            with store.connect() as db:
+                pending_unsubscribe = [row["id"] for row in db.execute("SELECT s.id FROM sources s JOIN source_mail_actions a ON a.source_id=s.id WHERE s.user_id=? AND s.subscription_status='unsubscribe_pending' AND a.one_click=1", (relay.owner_id,))]
+            for source_id in pending_unsubscribe:
+                subscriptions.unsubscribe(relay.owner_id, source_id)
+        with store.connect() as db:
+            active = db.execute("SELECT 1 FROM test_relay_aliases WHERE user_id=? AND status='active'", (relay.owner_id,)).fetchone()
+            if active:
+                for source in db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_status='needs_inbox'", (relay.owner_id,)).fetchall():
+                    fingerprint = "relay-ready-signup:" + source["id"]
+                    previous = db.execute("SELECT 1 FROM jobs WHERE user_id=? AND fingerprint=?", (relay.owner_id, fingerprint)).fetchone()
+                    if not previous:
+                        db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
+                                   (uid(), relay.owner_id, source["id"], fingerprint, "Resume signup with ready relay",
+                                    json.dumps({"url": source["signup_url"], "auto_subscribe": True}), now()))
+                        db.execute("UPDATE sources SET subscription_status='queued' WHERE id=?", (source["id"],))
+            jobs = [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='received_email' AND status='queued'", (relay.owner_id,))]
+            jobs += [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='newsletter' AND fingerprint LIKE 'relay-ready-signup:%' AND status='queued'", (relay.owner_id,))]
+        for job_id in jobs:
+            process_job(job_id)
+        return result
+
+    async def poll_mail():
+        while True:
+            await asyncio.to_thread(receive_mail)
+            await asyncio.sleep(30)
 
     def process_job(job_id):
         with store.connect() as db:
@@ -112,17 +163,46 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             pending = [r["id"] for r in db.execute("SELECT id FROM jobs WHERE status='queued'")]
         for job_id in pending:
             process_job(job_id)
-        yield
+        poller = asyncio.create_task(poll_mail()) if relay and relay.reader and receiving_poll else None
+        try:
+            yield
+        finally:
+            if poller:
+                poller.cancel()
+                with suppress(asyncio.CancelledError):
+                    await poller
 
     app = FastAPI(title="UpToDate prototype", version="0.1.0", lifespan=lifespan)
     app.state.store = store
     app.state.engine = engine
+    app.state.test_relay = relay
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver", "[::1]"])
     bearer = HTTPBearer(auto_error=False)
+
+    def remember_verified_user(profile):
+        # Local content is keyed by verified UUID; the main email is never used
+        # as a subscription address. Pending/disabled relays cannot reach agents.
+        with store.connect() as db:
+            placeholder = f'{profile["id"]}@inbox.prototype.invalid'
+            db.execute("INSERT OR IGNORE INTO users(id,token_hash,alias,created_at,timezone) VALUES(?,?,?,?,?)",
+                       (profile["id"], "external:" + profile["id"], placeholder, now(), profile["timezone"]))
+            if relay:
+                try:
+                    profile = relay.profile(db, profile)
+                except ValueError:
+                    raise HTTPException(409, "Temporary relay configuration conflicts with an existing address") from None
+            alias = (profile.get("alias") if profile.get("alias_status") == "active" else None) or placeholder
+            db.execute("UPDATE users SET alias=?,timezone=? WHERE id=?", (alias, profile["timezone"], profile["id"]))
+        return {**profile, "alias": profile.get("alias") or ""}
 
     def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if not credentials or credentials.scheme.lower() != "bearer":
             raise HTTPException(401, "A local account token is required")
+        if auth:
+            profile = auth.identity(credentials.credentials)
+            # Stable Supabase UUID owns local content. No email, password, JWT,
+            # or refresh token is persisted in the local content database.
+            return remember_verified_user(profile)
         token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
         with store.connect() as db:
             row = db.execute("SELECT * FROM users WHERE token_hash=?", (token_hash,)).fetchone()
@@ -131,7 +211,11 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         return dict(row)
 
     def account_json(user):
-        return {key: user[key] for key in ("id", "alias", "timezone")}
+        return {**{key: user[key] for key in ("id", "alias", "timezone")},
+                "alias": user.get("alias") or "",
+                "email": user.get("email"), "display_name": user.get("display_name"),
+                "alias_status": user.get("alias_status", "unconfigured"),
+                "alias_scope": user.get("alias_scope", "permanent")}
 
     def local_day(user):
         return datetime.now(ZoneInfo(user["timezone"])).date().isoformat()
@@ -168,10 +252,15 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def health():
         return {"status": "ok", "mode": "local-prototype", "generation": "ollama", "email_import": True}
 
+    @app.get("/v1/auth/config")
+    def auth_configuration():
+        # Publishable client configuration only. Never expose the admin key.
+        return auth.configuration() if auth else {"mode": "local"}
+
     @app.get("/v1/engine")
     def engine_status(user=Depends(current_user)):
         return {**Ollama().status(), "signup_agent_configured": engine.subscription_agent is not None,
-                "receiving_alias_ready": not user["alias"].endswith(".invalid")}
+                "receiving_alias_ready": bool(user["alias"]) and user.get("alias_status") == "active"}
 
     def validate_source_url(value):
         try:
@@ -196,6 +285,42 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                        (job_id, user["id"], source_id, identity, "Add newsletter by link", body.model_dump_json(), now()))
         background.add_task(process_job, job_id)
         return {"source_id": source_id, "job_id": job_id, "status": "queued", "duplicate": False, "post_generation": "automatic"}
+
+    @app.post("/v1/me/sources/{source_id}/subscribe", status_code=202)
+    def subscribe_source(source_id: str, background: BackgroundTasks, user=Depends(current_user)):
+        if user.get("alias_status") != "active" or not user.get("alias") or user["alias"].endswith(".invalid"):
+            raise HTTPException(409, "Your account's receiving alias must be active before signup")
+        with store.connect() as db:
+            source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone()
+            if not source:
+                raise HTTPException(404, "Newsletter not found")
+            if source["subscription_status"] in ("submitted", "confirmation_required", "email_received", "receiving", "submitting"):
+                raise HTTPException(409, "Signup was already submitted; check confirmation or incoming mail")
+            url = validate_source_url(source["signup_url"] or source["url"])
+            fingerprint = "subscribe-only:" + source_id + ":" + hashlib.sha256(user["alias"].encode()).hexdigest()
+            existing = db.execute("SELECT id,status FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], fingerprint)).fetchone()
+            if existing and existing["status"] in ("queued", "processing"):
+                return {"job_id": existing["id"], "status": existing["status"], "duplicate": True}
+            job_id = existing["id"] if existing else uid()
+            payload = json.dumps({"url": url, "auto_subscribe": True})
+            if existing:
+                db.execute("UPDATE jobs SET status='queued',stage='queued',payload=?,error=NULL,result='{}' WHERE id=?", (payload, job_id))
+            else:
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'subscription')",
+                           (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
+            db.execute("UPDATE sources SET subscription_status='queued',subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
+        background.add_task(process_job, job_id)
+        return {"job_id": job_id, "status": "queued", "duplicate": False}
+
+    @app.post("/v1/me/sources/{source_id}/unsubscribe")
+    def unsubscribe_source(source_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            if not db.execute("SELECT 1 FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone():
+                raise HTTPException(404, "Newsletter not found")
+        try:
+            return subscriptions.unsubscribe(user["id"], source_id)
+        except SourceError as exc:
+            raise HTTPException(503, str(exc)) from None
 
     @app.post("/v1/generation", status_code=202)
     def generate_from_url(body: GenerationInput, background: BackgroundTasks, user=Depends(current_user)):
@@ -262,6 +387,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @app.post("/v1/dev/accounts", status_code=201)
     def create_account(body: AccountInput):
+        if auth:
+            raise HTTPException(404, "Development accounts are disabled; use Supabase sign-up")
         try:
             ZoneInfo(body.timezone)
         except (ZoneInfoNotFoundError, ValueError):
@@ -274,11 +401,51 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         return {**account_json(user), "token": token, "alias_deliverable": False}
 
     @app.get("/v1/me")
-    def me(user=Depends(current_user)):
-        return {**account_json(user), "alias_deliverable": False}
+    def me(user=Depends(current_user), credentials=Depends(bearer)):
+        if auth and auth.relay_aliases:
+            user = remember_verified_user(auth.ensure_relay(credentials.credentials, user))
+        return {**account_json(user), "alias_deliverable": user.get("alias_status") == "active"}
+
+    def require_test_relay(user):
+        if not relay or user["id"] != relay.owner_id:
+            raise HTTPException(404, "Temporary receiving is not enabled for this account")
+
+    @app.get("/v1/relay/test")
+    def test_receiving_status(user=Depends(current_user)):
+        require_test_relay(user)
+        with store.connect() as db:
+            counts = dict(db.execute("SELECT state,COUNT(*) FROM test_relay_receipts WHERE user_id=? GROUP BY state", (user["id"],)).fetchall())
+        return {"scope": "temporary_single_account", "provider_configured": relay.reader is not None,
+                "alias_status": user["alias_status"], "receipts": counts, "last_error": relay.last_error}
+
+    @app.post("/v1/relay/test/sync", status_code=202)
+    def sync_test_receiving(background: BackgroundTasks, user=Depends(current_user)):
+        require_test_relay(user)
+        if not relay.reader:
+            raise HTTPException(503, "Save RESEND_API_KEY in the ignored backend settings file")
+        background.add_task(receive_mail)
+        return {"status": "queued"}
+
+    @app.patch("/v1/me")
+    def update_profile(body: ProfilePatch, user=Depends(current_user), credentials=Depends(bearer)):
+        if not auth:
+            raise HTTPException(409, "Profile editing requires a verified account")
+        fields = body.model_dump(exclude_none=True)
+        if "timezone" in fields:
+            try:
+                ZoneInfo(fields["timezone"])
+            except (ZoneInfoNotFoundError, ValueError):
+                raise HTTPException(422, "Unknown timezone")
+        if "display_name" in fields:
+            fields["display_name"] = fields["display_name"].strip()
+        if fields:
+            auth.update_profile(credentials.credentials, user["id"], fields)
+        return account_json(remember_verified_user(auth.identity(credentials.credentials)))
 
     @app.delete("/v1/me", status_code=204)
     def delete_account(user=Depends(current_user)):
+        if auth:
+            auth.delete(user["id"])
         with store.connect() as db:
             db.execute("DELETE FROM users WHERE id=?", (user["id"],))
 

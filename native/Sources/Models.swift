@@ -5,6 +5,10 @@ struct Account: Codable {
     let alias: String
     let timezone: String
     let token: String?
+    var email: String? = nil
+    var displayName: String? = nil
+    var aliasStatus: String? = nil
+    var aliasScope: String? = nil
 }
 
 struct NewsletterSource: Codable, Identifiable {
@@ -17,6 +21,31 @@ struct NewsletterSource: Codable, Identifiable {
     let feedUrl: String?
     let subscriptionStatus: String?
     let subscriptionDetail: String?
+
+    var subscriptionTitle: String {
+        switch subscriptionStatus {
+        case "queued", "submitting": "Signup in progress"
+        case "submitted": "Signup submitted · waiting for email"
+        case "confirmation_required": "Confirm your subscription"
+        case "email_received": "Publisher email received · waiting for an edition"
+        case "receiving": "Newsletter emails connected"
+        case "needs_inbox": "Waiting for your newsletter address"
+        case "needs_agent", "manual_action", "failed": "Signup needs attention"
+        case "unsubscribe_pending", "unsubscribing": "Publisher unsubscribe pending · new posts stopped"
+        case "unsubscribed": "Unsubscribed"
+        default: "Newsletter saved"
+        }
+    }
+}
+
+struct NewsletterAdded: Decodable {
+    let sourceId: String
+}
+
+struct UnsubscribeResult: Decodable {
+    let status: String
+    let detail: String
+    let actionUrl: String?
 }
 
 struct Evidence: Codable {

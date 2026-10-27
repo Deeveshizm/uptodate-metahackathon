@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 import warnings
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urljoin, urlsplit
@@ -32,9 +33,12 @@ def html_figures(resource, document_license):
     soup = BeautifulSoup(resource.body, "html.parser")
     main = content_root(soup)
     figures, seen = [], set()
-    for image in main.find_all("img", limit=30):
-        raw = image.get("data-src") or image.get("src", "")
-        url = safe_url(urljoin(resource.url, raw))
+    for image in main.find_all(["img", "object", "embed", "svg"], limit=50):
+        inline_svg = image.name == "svg"
+        if image.name in ("object", "embed") and not image.find_parent("figure"):
+            continue
+        raw = image.get("data-src") or image.get("data") or image.get("src", "")
+        url = resource.url + "#" + str(image.find_parent("figure").get("id", "figure")) if inline_svg and image.find_parent("figure") else safe_url(urljoin(resource.url, raw))
         if not url or url in seen or re.search(r"logo|avatar|tracking|pixel|favicon|badge", url, re.I):
             continue
         seen.add(url)
@@ -48,9 +52,43 @@ def html_figures(resource, document_license):
         # A page-wide license does not override a third-party credit or exception.
         if not license_node and re.search(r"courtesy|all rights reserved|used with permission|copyright|©|third.party", caption, re.I):
             license_url = ""
-        figures.append({"id": f"html-{len(figures) + 1}", "url": url, "caption": caption[:1000],
-                        "license_url": license_url, "page": None})
+        candidate = {"id": f"html-{len(figures) + 1}", "url": url, "caption": caption[:1000],
+                     "license_url": license_url, "page": None}
+        if inline_svg:
+            candidate["svg_data"] = str(image).encode()
+        figures.append(candidate)
     return figures
+
+
+def rasterize_svg(data):
+    """Render original vector artwork, without scripts or external resources."""
+    import pymupdf
+    if len(data) > 2_000_000 or re.search(br"<!ENTITY|<\s*(?:script|foreignobject)\b", data, re.I):
+        raise SourceError("Source vector requires unsupported markup; inspect the linked PDF")
+    clean = re.sub(br"<!DOCTYPE[^>]*>", b"", data, flags=re.I)
+    try:
+        root = ET.fromstring(clean)
+        if root.tag.rsplit("}", 1)[-1].lower() != "svg" or sum(1 for _ in root.iter()) > 50_000:
+            raise ValueError("Invalid vector document")
+        for node in root.iter():
+            for key, value in node.attrib.items():
+                key = key.rsplit("}", 1)[-1].lower()
+                if key.startswith("on") or (key in ("href", "src") and not value.startswith(("#", "data:image/png;base64,", "data:image/jpeg;base64,"))):
+                    raise ValueError("External vector resource")
+            style = " ".join(node.attrib.values()) + (node.text or "" if node.tag.rsplit("}", 1)[-1] == "style" else "")
+            targets = re.findall(r"url\(([^)]*)\)", style, re.I)
+            if re.search(r"@import", style, re.I) or any(not target.strip().strip("'\"").startswith("#") for target in targets):
+                raise ValueError("External vector style")
+        with pymupdf.open(stream=clean, filetype="svg") as vector:
+            page = vector[0]
+            if page.rect.width <= 0 or page.rect.height <= 0:
+                raise ValueError("Empty vector")
+            scale = min(2.0, 1600 / max(page.rect.width, page.rect.height))
+            return decode_image(page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("png"))
+    except SourceError:
+        raise
+    except Exception:
+        raise SourceError("Source vector could not be rendered; inspect the linked PDF") from None
 
 
 def pdf_figures(resource):
@@ -262,15 +300,23 @@ class ComfyIllustrator:
             raise SourceError("Local ComfyUI is unavailable or returned an invalid response") from exc
 
 
-def source_visual(document, draft, fetcher):
+def source_visual(document, draft, fetcher, allow_pdf=True):
     for candidate in rank_figures(document, draft)[:4]:
         try:
             data = candidate.get("image_data")
-            if data is None:
+            source_format = "image"
+            if candidate.get("svg_data") is not None:
+                data = rasterize_svg(candidate["svg_data"])
+                source_format = "svg"
+            elif data is None:
                 resource = fetcher.fetch(candidate["url"])
                 if not resource.content_type.lower().startswith("image/"):
                     continue
-                data = resource.body
+                if "svg" in resource.content_type.lower() or urlsplit(candidate["url"]).path.lower().endswith(".svg"):
+                    data = rasterize_svg(resource.body)
+                    source_format = "svg"
+                else:
+                    data = resource.body
             data = decode_image(data)
             license_url = candidate.get("license_url", "")
             rights_review = not reusable_license(license_url)
@@ -281,9 +327,21 @@ def source_visual(document, draft, fetcher):
                     "license_name": document.metadata.get("license_name", "") if license_url == document.metadata.get("license_url") else "",
                     "rights_status": "needs_review" if rights_review else "recognized_reuse_license",
                     "requires_rights_review": rights_review,
-                    "selection": "caption_relevance"}, data
+                    "selection": "caption_relevance", "source_format": source_format}, data
         except SourceError:
             continue
+    pdf_url = document.metadata.get("pdf_url")
+    if allow_pdf and pdf_url and pdf_url != document.url:
+        try:
+            from .documents import parse_document
+            pdf = parse_document(fetcher.fetch(pdf_url))
+            selected = source_visual(pdf, draft, fetcher, allow_pdf=False)
+            if selected:
+                visual, data = selected
+                return {**visual, "source_url": document.url, "source_format": "pdf",
+                        "attribution": document.metadata.get("author") or visual["attribution"]}, data
+        except SourceError:
+            pass
     return None
 
 

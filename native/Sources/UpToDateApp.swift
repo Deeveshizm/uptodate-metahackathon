@@ -34,15 +34,7 @@ struct RootView: View {
     var body: some View {
         Group {
             if model.account == nil {
-                VStack(alignment: .leading, spacing: 20) {
-                    Text("UpToDate").font(.largeTitle.bold())
-                    Text("A working prototype of your newsletter reading flow.")
-                    Text("Start the local backend, then create a prototype account. Import .eml files or load the sample Weekly Roundup edition. Your alias is a placeholder until a mail provider is connected.")
-                        .foregroundStyle(.secondary)
-                    Button("Start local prototype") { Task { await model.start() } }
-                        .buttonStyle(.borderedProminent).disabled(model.busy)
-                    Text("Backend: http://127.0.0.1:8000").font(.caption)
-                }.padding(30).frame(maxWidth: 600)
+                AuthView()
             } else {
                 VStack(spacing: 0) {
                     HStack(spacing: 18) {
@@ -114,10 +106,12 @@ struct RootView: View {
             }
         }
         .tint(.primary)
+        .onOpenURL { url in Task { await model.handleAuthURL(url) } }
         .task {
+            await model.restore()
             if ProcessInfo.processInfo.arguments.contains("--demo"), model.account == nil {
                 await model.start()
-            } else { await model.restore() }
+            }
             if ProcessInfo.processInfo.arguments.contains("--demo"), model.account != nil, model.feed?.posts.isEmpty != false {
                 await model.loadDemo()
                 model.notice = nil
@@ -156,9 +150,16 @@ struct RootView: View {
 struct FeedView: View {
     @EnvironmentObject private var model: AppModel
     @State private var sourceFilter: String?
+    private var needsNewsletterPrompt: Bool {
+        (model.feed?.posts ?? []).allSatisfy { $0.isDemo }
+    }
+    private var hasNewsletter: Bool {
+        let demoSourceIDs = Set((model.feed?.posts ?? []).filter { $0.isDemo }.map { $0.source.id })
+        return model.sources.contains { !demoSourceIDs.contains($0.id) }
+    }
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 0) {
+            VStack(spacing: 0) {
                 HStack {
                     Menu {
                         Button("All newsletters") { sourceFilter = nil }
@@ -174,18 +175,26 @@ struct FeedView: View {
                     Spacer()
                     Text("\(model.feed?.unread ?? 0) unread").font(.system(size: 11))
                 }.foregroundStyle(.secondary).padding(.horizontal, 20).padding(.vertical, 14)
-                ForEach(Array((model.feed?.posts ?? []).filter { sourceFilter == nil || $0.source.id == sourceFilter }.enumerated()), id: \.element.id) { index, post in
-                    FeedPostCard(post: post, index: index)
-                    Divider().padding(.top, 14)
-                }
-                if model.feed?.posts.isEmpty != false {
+                if needsNewsletterPrompt {
                     VStack(spacing: 16) {
                         Image(systemName: "text.book.closed").font(.system(size: 40, weight: .ultraLight))
-                        Text("Make room for a good idea.").font(.title2.bold())
-                        Text("Import a newsletter from the menu, or load the sample Weekly Roundup edition.").multilineTextAlignment(.center).foregroundStyle(.secondary)
-                        Button("Load sample edition") { Task { await model.loadDemo() } }.buttonStyle(.borderedProminent).disabled(model.busy)
+                        Text(hasNewsletter ? "Your newsletters, turned into posts." : "Subscribe to your first newsletter.").font(.title2.bold())
+                        Text(hasNewsletter ? "Follow signup and confirmation progress in Manage. Posts will appear here as editions are processed." : "Paste a newsletter link. We'll use your private newsletter address for signup and create posts from incoming editions.")
+                            .multilineTextAlignment(.center).foregroundStyle(.secondary)
+                        NewsletterLinkForm()
+                        Text("You can also import an .eml file from Manage.").font(.caption).foregroundStyle(.secondary)
                     }.padding(40)
-                } else {
+                }
+                ForEach(Array(model.sources.filter { ["manual_action", "needs_agent", "failed", "confirmation_required"].contains($0.subscriptionStatus ?? "") }.prefix(3))) { source in
+                    InfoRow("\(source.name): \(source.subscriptionTitle). Open Manage to finish the subscription. Available public posts may already appear below.")
+                }
+                LazyVStack(spacing: 0) {
+                    ForEach(Array((model.feed?.posts ?? []).filter { sourceFilter == nil || $0.source.id == sourceFilter }.enumerated()), id: \.element.id) { index, post in
+                        FeedPostCard(post: post, index: index)
+                        Divider().padding(.top, 14)
+                    }
+                }
+                if model.feed?.posts.isEmpty == false {
                     VStack(spacing: 10) {
                         CaughtUpMark()
                         Text(model.feed?.unread == 0 ? "You're all caught up" : "You're at the end of today's edition").font(.subheadline.weight(.semibold))
@@ -195,6 +204,9 @@ struct FeedView: View {
                 }
             }.frame(maxWidth: FeedStyle.feedWidth).frame(maxWidth: .infinity)
         }.background(.background)
+        #if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+        #endif
         .toolbar(.hidden)
         .refreshable { await model.refresh() }
     }
@@ -364,20 +376,13 @@ struct ManageView: View {
 struct SourceLinkView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @State private var url = ""
     var body: some View {
         NavigationStack {
             PageScroll {
                 SectionHeader("Newsletter link")
-                TextField("https://newsletter.example.com", text: $url)
-                    .textFieldStyle(.roundedBorder).autocorrectionDisabled()
+                NewsletterLinkForm(onAdded: { dismiss() })
                     .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 16)
-                InfoRow("The backend discovers public content, follows the original source, and creates posts automatically. Email signup still needs a receiving alias and signup-agent setup.")
-                ActionRow(title: "Add newsletter", disabled: model.busy || model.offline || url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
-                    Task {
-                        if await model.addNewsletter(url: url.trimmingCharacters(in: .whitespacesAndNewlines), autoSubscribe: true) { dismiss() }
-                    }
-                }
+                InfoRow("Signup uses your account's newsletter address. Supported forms are submitted automatically; confirmation, CAPTCHA, or unsupported forms may need your help. Posts are created automatically from available content.")
             }
             .navigationTitle("Add newsletter")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
@@ -387,12 +392,8 @@ struct SourceLinkView: View {
 struct SourcesView: View {
     @EnvironmentObject private var model: AppModel
     @State private var deleting = false
-    // The alias is only ever copied, never read, so it stays masked.
+    @State private var editingProfile = false
     private var alias: String { model.account?.alias ?? "" }
-    private var maskedAlias: String {
-        guard let at = alias.firstIndex(of: "@") else { return alias.isEmpty ? "" : "••••••••" }
-        return String(repeating: "•", count: 12) + alias[at...]
-    }
 
     var body: some View {
         PageScroll {
@@ -400,7 +401,8 @@ struct SourcesView: View {
             HStack(spacing: 20) {
                 SourceAvatar(name: "Your profile", size: 66, symbol: "person")
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Your reading space").font(.system(size: 21, weight: .semibold)).tracking(-0.4)
+                    Text(model.account?.displayName?.isEmpty == false ? model.account!.displayName! : "Your reading space")
+                        .font(.system(size: 21, weight: .semibold)).tracking(-0.4)
                     HStack(spacing: 22) {
                         profileStat(model.sources.count, "sources")
                         profileStat(model.bookmarks.count, "saved")
@@ -410,15 +412,25 @@ struct SourcesView: View {
                 Spacer()
             }.padding(.horizontal, FeedStyle.gutter).padding(.bottom, 16)
             InfoRow("Follow what you're curious about.")
+            if let email = model.account?.email, !email.isEmpty { InfoRow(email) }
+            if model.authConfiguration?.mode == "supabase" {
+                ActionRow(title: "Edit profile", disabled: model.busy) { editingProfile = true }
+            }
 
-            SectionHeader("Your prototype alias")
+            SectionHeader("Your newsletter address")
+            if alias.isEmpty {
+                InfoRow("Your private newsletter address will appear here once receiving is set up. Your sign-in email is kept separate.")
+            } else {
             Button {
                 copyText(alias)
-                model.notice = "Placeholder alias copied; it cannot receive mail yet."
+                model.notice = model.account?.aliasStatus == "active" ? "Private newsletter address copied." :
+                    (model.account?.aliasStatus == "provisioning" ? "Address copied. Receiving still needs its delivery test." : "Placeholder alias copied; it cannot receive mail yet.")
             } label: {
                 HStack(spacing: 12) {
-                    Text(maskedAlias).font(.system(size: 14, design: .monospaced))
-                        .lineLimit(1).truncationMode(.middle)
+                    Text(alias).font(.system(size: 14, design: .monospaced))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     Spacer()
                     Image(systemName: "doc.on.doc").font(.system(size: 14))
                 }
@@ -426,8 +438,23 @@ struct SourcesView: View {
                 .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 16)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain).accessibilityLabel("Copy alias")
-            InfoRow("Placeholder only. Tap to copy. Import .eml files until a receiving domain is connected.")
+            .buttonStyle(.plain).accessibilityLabel("Copy newsletter address").accessibilityValue(alias)
+            if model.account?.aliasStatus == "active" {
+                InfoRow("Use this address for newsletter subscriptions. Mail goes to UpToDate, with no forwarding to your sign-in email.")
+            } else if model.account?.aliasStatus == "provisioning" {
+                InfoRow("Address assigned. We still need to verify incoming delivery before newsletter signup is enabled.")
+            } else {
+                InfoRow("Placeholder only. Import .eml files until receiving is connected.")
+            }
+            if model.account?.aliasScope == "temporary_test" {
+                InfoRow("Temporary test address. Newsletter subscriptions will need updating when we connect our own domain.")
+            }
+            }
+            if model.authConfiguration?.mode == "supabase" && model.account?.aliasStatus != "active" {
+                ActionRow(title: "Check newsletter address", disabled: model.busy || model.offline) {
+                    Task { await model.refreshAccount() }
+                }
+            }
 
             SectionHeader("Prototype tools")
             ActionRow(title: "Load sample Weekly Roundup edition", disabled: model.busy) {
@@ -436,11 +463,14 @@ struct SourcesView: View {
             RowDivider()
             InfoRow("Account timezone: \(model.account?.timezone ?? "UTC")")
             RowDivider()
-            ActionRow(title: "Delete local account and data", destructive: true,
+            ActionRow(title: "Sign out", disabled: model.busy) { Task { await model.signOut() } }
+            RowDivider()
+            ActionRow(title: "Delete account and data", destructive: true,
                       disabled: model.busy || model.offline) { deleting = true }
         }
         .toolbar(.hidden)
-        .confirmationDialog("Delete this prototype account, imported excerpts, bookmarks, and share links?", isPresented: $deleting, titleVisibility: .visible) {
+        .sheet(isPresented: $editingProfile) { ProfileSettingsView() }
+        .confirmationDialog("Delete your account, imported excerpts, bookmarks, and share links?", isPresented: $deleting, titleVisibility: .visible) {
             Button("Delete account", role: .destructive) { Task { await model.deleteAccount() } }
         }
     }
@@ -457,12 +487,14 @@ struct SourceEditor: View {
     @EnvironmentObject private var model: AppModel
     let source: NewsletterSource
     @State private var signup = ""
+    @State private var confirmingUnsubscribe = false
+    @Environment(\.openURL) private var openURL
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(source.name).font(.system(size: 17, weight: .semibold)).tracking(-0.3)
             Text(source.sender).font(.system(size: 12)).foregroundStyle(.secondary)
             if let status = source.subscriptionStatus, status != "not_requested" {
-                Text(status.replacingOccurrences(of: "_", with: " ")).font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(source.subscriptionTitle).font(.system(size: 11)).foregroundStyle(.secondary)
                 if let detail = source.subscriptionDetail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary) }
             }
             Toggle("Show in daily feed", isOn: Binding(get: { source.muted == 0 }, set: { shown in
@@ -480,9 +512,29 @@ struct SourceEditor: View {
                 .opacity(signup == source.signupUrl ? 0.4 : 1)
             Text("Hiding a source does not unsubscribe at the publisher.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
+            if ["manual_action", "failed", "needs_agent", "needs_inbox"].contains(source.subscriptionStatus ?? "") {
+                Button("Retry signup using my newsletter address") {
+                    Task { await model.retrySubscription(source) }
+                }.font(.system(size: 14)).disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
+            }
+            Button(source.subscriptionStatus == "unsubscribed" ? "Unsubscribed" : "Unsubscribe from newsletter", role: .destructive) {
+                confirmingUnsubscribe = true
+            }
+            .font(.system(size: 14)).buttonStyle(.plain)
+            .disabled(model.busy || model.offline || source.subscriptionStatus == "unsubscribed")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)
         .onAppear { signup = source.signupUrl }
+        .confirmationDialog("Unsubscribe from \(source.name)?", isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
+            Button("Unsubscribe", role: .destructive) {
+                Task {
+                    if let url = await model.unsubscribe(source) { openURL(url) }
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Stop creating new posts and request unsubscribe from the publisher. Existing posts stay available. Some publishers require an extra confirmation.")
+        }
     }
 }

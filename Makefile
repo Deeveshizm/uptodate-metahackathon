@@ -1,11 +1,10 @@
-.PHONY: api api-comfy api-tailnet comfy test build-ios app smoke model engine-test
+.PHONY: api api-comfy api-tailnet comfy browser-install test build-ios app smoke model engine-test
 
 COMFYUI_DIR ?= $(abspath ../ComfyUI)
 TAILNET_OLLAMA_HOST ?=
 TAILNET_OLLAMA_MODEL ?= llama3.1:8b
 
 api-tailnet:
-	$(if $(TAILNET_OLLAMA_HOST),,$(error Set TAILNET_OLLAMA_HOST to your explicitly authorized Tailscale peer))
 	OLLAMA_URL="http://$(TAILNET_OLLAMA_HOST):11434" OLLAMA_TRUSTED_HOST="$(TAILNET_OLLAMA_HOST)" OLLAMA_MODEL="$(TAILNET_OLLAMA_MODEL)" $(MAKE) api-comfy
 
 comfy:
@@ -16,6 +15,9 @@ api-comfy:
 
 api:
 	.venv/bin/python -m uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000
+
+browser-install:
+	.venv/bin/python -m playwright install chromium
 
 test:
 	.venv/bin/python -m pytest -q

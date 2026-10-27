@@ -6,19 +6,19 @@ enum Session {
     #if targetEnvironment(simulator)
     // Unsigned simulator builds have no Keychain application entitlement.
     // Keep this fallback inside the simulator's app sandbox only.
-    private static var simulatorURL: URL {
+    private static func simulatorURL(_ account: String) -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("UpToDate/simulator-session")
+            .appendingPathComponent("UpToDate/simulator-\(account)")
     }
     #endif
 
-    static func read() -> String? {
+    static func read(account: String = "session") -> String? {
         #if targetEnvironment(simulator)
-        guard let data = try? Data(contentsOf: simulatorURL) else { return nil }
+        guard let data = try? Data(contentsOf: simulatorURL(account)) else { return nil }
         return String(data: data, encoding: .utf8)
         #else
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service, kSecAttrAccount as String: "session",
+            kSecAttrService as String: service, kSecAttrAccount as String: account,
             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
@@ -27,14 +27,15 @@ enum Session {
         #endif
     }
 
-    static func save(_ token: String) throws {
+    static func save(_ token: String, account: String = "session") throws {
         #if targetEnvironment(simulator)
-        try FileManager.default.createDirectory(at: simulatorURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(token.utf8).write(to: simulatorURL, options: [.atomic, .completeFileProtection])
+        let url = simulatorURL(account)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(token.utf8).write(to: url, options: [.atomic, .completeFileProtection])
         #else
-        clear()
+        clear(account: account)
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service, kSecAttrAccount as String: "session",
+            kSecAttrService as String: service, kSecAttrAccount as String: account,
             kSecValueData as String: Data(token.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         let status = SecItemAdd(query as CFDictionary, nil)
@@ -44,12 +45,12 @@ enum Session {
         #endif
     }
 
-    static func clear() {
+    static func clear(account: String = "session") {
         #if targetEnvironment(simulator)
-        try? FileManager.default.removeItem(at: simulatorURL)
+        try? FileManager.default.removeItem(at: simulatorURL(account))
         #else
         SecItemDelete([kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service, kSecAttrAccount as String: "session"] as CFDictionary)
+            kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary)
         #endif
     }
 }
