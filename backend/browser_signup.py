@@ -10,6 +10,11 @@ import re
 import threading
 import time
 import zlib
+import os
+import selectors
+import signal
+import subprocess
+import sys
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .retrieval import MAX_BYTES, PinnedHTTP, PinnedHTTPS, Resource, SourceError, public_url, resolve_public
@@ -96,6 +101,7 @@ def signup_response(resource):
 
 class BrowserSignup:
     def __init__(self, transport=None, timeout=45):
+        self.isolated = transport is None
         self.transport, self.timeout = transport or BrowserTransport(), timeout
         self.last_diagnostic = None
 
@@ -107,13 +113,48 @@ class BrowserSignup:
         if not BROWSER_LOCK.acquire(timeout=2):
             return self.manual("Another signup is running; retry this subscription shortly")
         try:
-            return self._subscribe(url, email, before_submit)
+            return self._supervised(url, email, before_submit) if self.isolated else self._subscribe(url, email, before_submit)
         finally:
             BROWSER_LOCK.release()
 
     @staticmethod
     def manual(detail):
         return {"status": "manual_action", "detail": detail, "adapter": "javascript"}
+
+    def _supervised(self, url, email, before_submit):
+        """A stuck browser or intercepted network call cannot hold the worker."""
+        process = subprocess.Popen([sys.executable, "-m", "backend.browser_signup", "--worker"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, start_new_session=True)
+        try:
+            process.stdin.write(json.dumps({"url": url, "email": email, "timeout": self.timeout}) + "\n"); process.stdin.flush()
+            deadline = time.monotonic() + self.timeout + 10
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while time.monotonic() < deadline:
+                    if not selector.select(max(0, deadline - time.monotonic())):
+                        break
+                    line = process.stdout.readline()
+                    if not line:
+                        break
+                    event = json.loads(line)
+                    if event.get("event") == "before_submit":
+                        allowed = before_submit is None or before_submit()
+                        process.stdin.write(json.dumps({"allowed": bool(allowed)}) + "\n"); process.stdin.flush()
+                    elif event.get("event") == "result":
+                        self.last_diagnostic = event.get("diagnostic")
+                        return event["outcome"]
+        except (OSError, ValueError):
+            pass
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            process.stdin.close(); process.stdout.close()
+        return self.manual("Signup timed out. Check incoming mail before retrying; the publisher may have received it. You can also finish signup on the publisher website using your newsletter address.")
 
     def _subscribe(self, url, email, before_submit):
         try:
@@ -127,6 +168,10 @@ class BrowserSignup:
             request = route.request
             parts = urlsplit(request.url)
             body = request.post_data_buffer
+            if state["armed"] and request.method == "GET" and any(email in values for values in parse_qs(parts.query).values()):
+                state["result"] = self.manual("This form would put your newsletter address in a URL. Use the publisher's secure signup instead.")
+                route.abort()
+                return
             if state["armed"] and request.method == "POST" and carries_alias(body, email) and before_submit is not None and not before_submit():
                 state["result"] = state["result"] or self.manual("Signup cancelled because the account or subscription is no longer active")
                 route.abort()
@@ -185,8 +230,8 @@ class BrowserSignup:
                     field = inputs.first
                     form = field.locator("xpath=ancestor::form[1]")
                     scope = form if form.count() else page
-                    if form.count() and (form.get_attribute("method") or "get").lower() == "get":
-                        return self.manual("This page would submit the address in a URL; use its secure signup manually")
+                    # Hydrated forms often omit method while JavaScript sends
+                    # HTTPS POST. Block an actual alias-bearing GET in routing.
                     required = scope.locator('input[required]:visible, select[required]:visible, textarea[required]:visible')
                     for item in required.all():
                         if item.get_attribute("type") != "email" and item.get_attribute("name") != "email":
@@ -214,3 +259,13 @@ class BrowserSignup:
             return state["result"] or self.manual("JavaScript signup could not finish; check browser setup, confirmation, or CAPTCHA before retrying")
         finally:
             self.last_diagnostic = {key: state[key] for key in ("phase", "attempted", "requests")}
+
+
+if __name__ == "__main__":
+    job = json.loads(sys.stdin.readline())
+    worker = BrowserSignup(transport=BrowserTransport(), timeout=job["timeout"])
+    def approved():
+        print(json.dumps({"event": "before_submit"}), flush=True)
+        return json.loads(sys.stdin.readline()).get("allowed") is True
+    outcome = worker.subscribe(url=job["url"], email=job["email"], before_submit=approved)
+    print(json.dumps({"event": "result", "outcome": outcome, "diagnostic": worker.last_diagnostic}), flush=True)

@@ -10,6 +10,7 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pg-bin", type=Path, help="Directory containing initdb, pg_ctl, and psql")
+    parser.add_argument("--setup-file", type=Path, help="Validate a prepared SQL setup file instead of individual migrations")
     args = parser.parse_args()
     binary = args.pg_bin or (Path(shutil.which("psql")).parent if shutil.which("psql") else None)
     if binary is None or not (binary / "initdb").exists():
@@ -30,10 +31,12 @@ def main():
             started = True
             psql = [str(binary / "psql"), "-X", "-v", "ON_ERROR_STOP=1", "-h", str(local), "-p", "55439",
                     "-U", "uptodate_schema_test", "-d", "postgres"]
-            files = [root / "supabase/tests/local_bootstrap.sql",
-                     *sorted((root / "supabase/migrations").glob("*.sql")), root / "supabase/tests/schema_contract.sql"]
+            migrations = [args.setup_file.resolve()] if args.setup_file else sorted((root / "supabase/migrations").glob("*.sql"))
+            files = [root / "supabase/tests/local_bootstrap.sql", *migrations, root / "supabase/tests/schema_contract.sql"]
+            if not args.setup_file:
+                files.append(root / "supabase/tests/relay_contract.sql")
             for path in files:
-                print("Checking", path.relative_to(root), flush=True)
+                print("Checking", path.relative_to(root) if path.is_relative_to(root) else path.name, flush=True)
                 subprocess.run([*psql, "-f", str(path)], check=True, env=env)
             print("Local PostgreSQL schema/RLS contracts passed. No hosted database was accessed.")
         finally:

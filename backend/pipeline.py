@@ -61,7 +61,7 @@ class ArticleHTML(HTMLParser):
             self.text.append(data)
 
 
-def parse_newsletter(raw: bytes) -> dict:
+def parse_newsletter(raw: bytes, require_links=True) -> dict:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     name, sender = parseaddr(str(msg.get("From", "")))
     if not sender or "@" not in sender or "\n" in sender:
@@ -73,24 +73,35 @@ def parse_newsletter(raw: bytes) -> dict:
     if not isinstance(content, str):
         raise ValueError("Unsupported body encoding")
     parser = ArticleHTML()
+    labeled_links = []
     if body.get_content_type() == "text/html":
         parser.feed(content)
         text = "".join(parser.text)
         urls = parser.links
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(content, "html.parser")
+        for anchor in soup.find_all("a", href=True)[:300]:
+            url = safe_url(anchor["href"])
+            if url:
+                parent = anchor.find_parent(["p", "li", "article"])
+                labeled_links.append({"url": url, "title": re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))[:200],
+                                      "context": re.sub(r"\s+", " ", parent.get_text(" ", strip=True) if parent else "")[:500]})
     else:
         text = content
         urls = [safe_url(x.rstrip(".,);>")) for x in re.findall(r"https?://[^\s<>\"]+", text)]
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     text = "\n".join(line for line in lines if line)
-    urls = list(dict.fromkeys(url for url in urls if url and not re.search(
+    all_urls = list(dict.fromkeys(url for url in urls if url and not re.search(
         r"unsubscribe|manage.preferences|email.preferences|view.in.browser", url, re.I
-    )))[:12]
-    if not text or not urls:
+    )))
+    urls = all_urls[:50]
+    if not text or (require_links and not urls):
         raise ValueError("No readable content with an eligible source link")
     return {
         "sender": sender.lower(), "source_name": name or sender.split("@")[1],
         "subject": str(msg.get("Subject", "Untitled edition"))[:300],
-        "text": text[:60000], "urls": urls,
+        "text": text[:60000], "urls": urls, "links": [link for link in labeled_links if link["url"] in urls],
+        "link_limit_reached": len(all_urls) > len(urls),
         # Content hash avoids forged Message-ID collisions; same import is idempotent.
         "fingerprint": hashlib.sha256(raw).hexdigest(),
     }

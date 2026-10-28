@@ -11,6 +11,10 @@
 			<array><string>local.uptodate.prototype</string></array>
 		</dict>
 	</array>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Add ingredients you select to your grocery list.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Add ingredients you select to your grocery list.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

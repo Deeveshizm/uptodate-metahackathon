@@ -44,6 +44,7 @@ struct RootView: View {
                                 Button("Home", systemImage: "house") { selection = 0 }
                                 Button("Saved", systemImage: "bookmark") { selection = 1 }
                                 Button("Manage", systemImage: "newspaper") { selection = 2 }
+                                Button("Read", systemImage: "checkmark.circle") { selection = 4 }
                             }
                             Section {
                                 Button("Profile", systemImage: "person.crop.circle") { selection = 3 }
@@ -85,6 +86,7 @@ struct RootView: View {
                         case 1: NavigationStack { LibraryView() }
                         case 2: NavigationStack { ManageView(importEmail: { importing = true }) }
                         case 3: NavigationStack { SourcesView() }
+                        case 4: NavigationStack { ReadPostsView() }
                         default: NavigationStack { FeedView() }
                         }
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -151,7 +153,7 @@ struct FeedView: View {
     @EnvironmentObject private var model: AppModel
     @State private var sourceFilter: String?
     private var needsNewsletterPrompt: Bool {
-        (model.feed?.posts ?? []).allSatisfy { $0.isDemo }
+        (model.readFeed?.total ?? 0) == 0 && (model.feed?.posts ?? []).allSatisfy { $0.isDemo }
     }
     private var hasNewsletter: Bool {
         let demoSourceIDs = Set((model.feed?.posts ?? []).filter { $0.isDemo }.map { $0.source.id })
@@ -168,13 +170,16 @@ struct FeedView: View {
                         }
                     } label: {
                         HStack(spacing: 5) {
-                            Text(sourceFilter == nil ? "Today's edition" : "Filtered edition")
+                            Text(sourceFilter == nil ? "Unread posts" : "Filtered posts")
                             Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
                         }.font(.system(size: 12, weight: .medium))
                     }
                     Spacer()
                     Text("\(model.feed?.unread ?? 0) unread").font(.system(size: 11))
                 }.foregroundStyle(.secondary).padding(.horizontal, 20).padding(.vertical, 14)
+                ForEach(model.inboxCandidates.filter { $0.status == "pending" }) { candidate in
+                    EmailNewsletterPrompt(candidate: candidate)
+                }
                 if needsNewsletterPrompt {
                     VStack(spacing: 16) {
                         Image(systemName: "text.book.closed").font(.system(size: 40, weight: .ultraLight))
@@ -194,11 +199,13 @@ struct FeedView: View {
                         Divider().padding(.top, 14)
                     }
                 }
-                if model.feed?.posts.isEmpty == false {
+                if let cursor = model.feed?.nextCursor {
+                    OlderPostsControl(cursor: cursor)
+                } else if model.feed?.posts.isEmpty == false || !needsNewsletterPrompt {
                     VStack(spacing: 10) {
                         CaughtUpMark()
-                        Text(model.feed?.unread == 0 ? "You're all caught up" : "You're at the end of today's edition").font(.subheadline.weight(.semibold))
-                        Text("A little more informed. A little less scrolling.").font(.caption).foregroundStyle(.secondary)
+                        Text(model.feed?.unread == 0 ? "You're all caught up" : "You're at the end of your unread posts").font(.subheadline.weight(.semibold))
+                        Text("Posts you mark read are available in Read from the menu.").font(.caption).foregroundStyle(.secondary)
                         Text(model.feed?.date ?? "").font(.caption2).foregroundStyle(.tertiary)
                     }.frame(maxWidth: .infinity).padding(.vertical, 40).padding(.horizontal, 20)
                 }
@@ -258,44 +265,90 @@ struct LibraryView: View {
     }
 }
 
+struct OlderPostsControl: View {
+    @EnvironmentObject private var model: AppModel
+    let cursor: String
+    var read = false
+    var body: some View {
+        Button {
+            Task { await model.loadOlderPosts(read: read) }
+        } label: {
+            HStack {
+                if read ? model.loadingReadHistory : model.loadingOlder { ProgressView() }
+                Text("Load older posts")
+            }.padding(20)
+        }.disabled(read ? model.loadingReadHistory : model.loadingOlder)
+            .task(id: cursor) { await model.loadOlderPosts(read: read) }
+    }
+}
+
+struct ReadPostsView: View {
+    @EnvironmentObject private var model: AppModel
+    var body: some View {
+        PageScroll {
+            PageHeader(title: "Read posts", trailing: "\(model.readFeed?.total ?? 0) read")
+            if model.readFeed?.posts.isEmpty != false {
+                EmptyState(symbol: "checkmark.circle", title: "Nothing marked read yet.",
+                           message: "Choose Mark read on a post to move it from Home to this section.")
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(model.readFeed?.posts ?? []) { post in
+                        NavigationLink { PostDetail(post: post) } label: { PostRow(post: post) }.buttonStyle(.plain)
+                        RowDivider()
+                    }
+                    if let cursor = model.readFeed?.nextCursor { OlderPostsControl(cursor: cursor, read: true) }
+                }
+            }
+        }.toolbar(.hidden).refreshable { await model.refresh() }
+    }
+}
+
 struct PostDetail: View {
     @EnvironmentObject private var model: AppModel
     let post: Post
     @State private var share: ShareResult?
+    @State private var sourceEmail = false
 
     private var current: Post {
-        model.feed?.posts.first(where: { $0.id == post.id }) ?? model.bookmarks.first(where: { $0.id == post.id }) ?? post
+        model.feed?.posts.first(where: { $0.id == post.id }) ?? model.readFeed?.posts.first(where: { $0.id == post.id }) ?? model.bookmarks.first(where: { $0.id == post.id }) ?? post
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text(current.isDemo ? "SAMPLE EDITION · SUMMARIZED FROM A NEWSLETTER" : current.verification == "machine_checked" ? "MACHINE-CHECKED SOURCE SUMMARY" : "IMPORTED NEWSLETTER EXCERPT").font(.caption).foregroundStyle(.secondary)
+                Text(current.isDemo ? "SAMPLE EDITION · SUMMARIZED FROM A NEWSLETTER" : current.verification == "source_preserved" ? "ORIGINAL NEWSLETTER CONTENT" : current.verification == "machine_checked" ? "MACHINE-CHECKED SOURCE SUMMARY" : "IMPORTED NEWSLETTER EXCERPT").font(.caption).foregroundStyle(.secondary)
                 Text(current.title).font(.title.bold())
                 Text(current.hook).font(.title3)
                 ForEach(current.tags ?? []) { tag in
                     Label(tag.label, systemImage: "clock").font(.caption).foregroundStyle(.orange)
                     if let detail = tag.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 }
-                if current.visual?.assetId != nil { PostVisualView(post: current) }
-                else if current.visual?.status == "needs_image_generator" {
-                    Button("Retry source visual") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
+                if !current.gallery.isEmpty { PostVisualView(post: current) }
+                else if ["needs_image_generator", "failed"].contains(current.visual?.status ?? "") {
+                    Button("Retry image") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
                 }
                 Text(current.finding).textSelection(.enabled)
-                if let problem = current.analysis?.problem { Text("Problem").font(.headline); Text(problem) }
-                if let approach = current.analysis?.approach { Text("Approach").font(.headline); Text(approach) }
-                if let impact = current.analysis?.impact { Text("Why it matters").font(.headline); Text(impact) }
-                Text("Limitations").font(.headline)
-                Text(current.limitations).foregroundStyle(.secondary)
+                ForEach(current.analysis?.sections ?? []) { section in
+                    Text(section.heading).font(.headline)
+                    Text(section.text).textSelection(.enabled)
+                }
+                if let abstract = current.paper?.abstract, !abstract.isEmpty {
+                    DisclosureGroup("Original abstract") {
+                        Text(abstract).textSelection(.enabled).padding(.top, 8)
+                    }.accessibilityIdentifier("post.abstract")
+                }
+                if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
                 Text("From \(current.source.name)").font(.caption)
-                if let url = URL(string: current.originalUrl) {
+                if current.isEmailSource {
+                    Button("Read source email") { sourceEmail = true }.accessibilityIdentifier("post.sourceEmail")
+                } else if let url = URL(string: current.originalUrl) {
                     Link("Open original source", destination: url)
                 }
                 Divider()
                 HStack {
                     Button(current.bookmarked ? "Unsave" : "Bookmark") { Task { await model.bookmark(current) } }
-                    Button(current.read ? "Read ✓" : "Mark read") { Task { await model.markRead(current) } }.disabled(current.read)
-                    Button("Share") { Task { share = await model.share(current) } }
+                    Button(current.read ? "Read ✓" : "Mark read") { Task { await model.markRead(current) } }.disabled(current.read).accessibilityIdentifier("post.markRead")
+                    if !current.isEmailSource { Button("Share") { Task { share = await model.share(current) } } }
                 }.buttonStyle(.bordered).disabled(model.busy || model.offline)
                 DisclosureGroup("Evidence and provenance") {
                     ForEach(Array(current.evidence.enumerated()), id: \.offset) { _, evidence in
@@ -305,11 +358,14 @@ struct PostDetail: View {
                         }.padding(.vertical, 8)
                     }
                 }
+                PostContextActionView(post: current)
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 24)
+                .padding(.bottom, 80)
                 .frame(maxWidth: FeedStyle.feedWidth, alignment: .leading).frame(maxWidth: .infinity)
         }
         .background(.background)
         .navigationTitle("Post")
+        .sheet(isPresented: $sourceEmail) { SourceEmailSheet(post: current) }
         .sheet(item: $share) { result in
             VStack(alignment: .leading, spacing: 18) {
                 Text(result.mode == "public-preview" ? "Share preview" : "Share original source").font(.title2.bold())
@@ -334,10 +390,14 @@ struct ManageView: View {
     var body: some View {
         PageScroll {
             PageHeader(title: "Your newsletters", trailing: "\(model.sources.count) sources")
-            InfoRow("Posts appear automatically in your private feed. Pending work is labeled on the post; processing issues appear here.")
+            InfoRow("Manage your subscriptions and choose which newsletters appear in your feed.")
             ActionRow(title: "Add newsletter", disabled: model.busy || model.offline) { addingLink = true }
             RowDivider()
             ActionRow(title: "Import newsletter .eml", disabled: model.busy || model.offline) { importEmail() }
+            if !model.inboxCandidates.isEmpty {
+                SectionHeader("Detected email newsletters")
+                ForEach(model.inboxCandidates) { candidate in EmailNewsletterPrompt(candidate: candidate) }
+            }
             SectionHeader("Newsletters")
             if model.sources.isEmpty {
                 InfoRow("Add a newsletter link or import an email to get started.")
@@ -346,25 +406,6 @@ struct ManageView: View {
                     SourceEditor(source: source)
                     RowDivider()
                 }
-            }
-            SectionHeader("Processing jobs")
-            if model.jobs.isEmpty { InfoRow("No jobs queued.") }
-            ForEach(model.jobs) { job in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(job.subject).font(.system(size: 15))
-                    Text((job.stage?.isEmpty == false ? job.stage! : job.status).replacingOccurrences(of: "_", with: " "))
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    if let error = job.error { Text(error).font(.system(size: 11)).foregroundStyle(.red) }
-                    ForEach(Array((job.result?.items ?? []).enumerated()), id: \.offset) { _, item in
-                        if let error = item.error { Text(error).font(.system(size: 11)).foregroundStyle(.red) }
-                    }
-                    if job.status == "failed", job.kind != "email" {
-                        Button("Retry") { Task { await model.retryJob(job) } }.disabled(model.busy || model.offline)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 14)
-                RowDivider()
             }
         }
         .toolbar(.hidden)
@@ -488,18 +529,21 @@ struct SourceEditor: View {
     let source: NewsletterSource
     @State private var signup = ""
     @State private var confirmingUnsubscribe = false
+    @State private var finishingSignup = false
     @Environment(\.openURL) private var openURL
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(source.name).font(.system(size: 17, weight: .semibold)).tracking(-0.3)
-            Text(source.sender).font(.system(size: 12)).foregroundStyle(.secondary)
             if let status = source.subscriptionStatus, status != "not_requested" {
                 Text(source.subscriptionTitle).font(.system(size: 11)).foregroundStyle(.secondary)
                 if let detail = source.subscriptionDetail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary) }
             }
-            Toggle("Show in daily feed", isOn: Binding(get: { source.muted == 0 }, set: { shown in
-                Task { await model.updateSource(source, muted: !shown) }
-            })).font(.system(size: 15)).disabled(model.busy || model.offline)
+            if source.subscriptionStatus != "unsubscribed" {
+                Toggle("Show in daily feed", isOn: Binding(get: { source.muted == 0 }, set: { shown in
+                    Task { await model.updateSource(source, muted: !shown) }
+                })).font(.system(size: 15)).disabled(model.busy || model.offline)
+            }
+            if source.sourceKind != "email" {
             VStack(alignment: .leading, spacing: 7) {
                 TextField("Publication signup URL", text: $signup)
                     .textFieldStyle(.plain).font(.system(size: 14))
@@ -512,12 +556,25 @@ struct SourceEditor: View {
                 .opacity(signup == source.signupUrl ? 0.4 : 1)
             Text("Hiding a source does not unsubscribe at the publisher.")
                 .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3)
-            if ["manual_action", "failed", "needs_agent", "needs_inbox"].contains(source.subscriptionStatus ?? "") {
-                Button("Retry signup using my newsletter address") {
+            } else {
+                Text("Posts come from emails you chose to connect. Hiding them in the feed does not stop new email processing.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if ["manual_action", "failed", "needs_agent", "needs_inbox", "unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") {
+                if source.sourceKind != "email", !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
+                    Button("Finish signup on publisher website") {
+                        if let url = URL(string: source.signupUrl), ["https", "http"].contains(url.scheme ?? "") {
+                            copyText(model.account?.alias ?? "")
+                            model.notice = "Your newsletter address was copied. Paste it into the publisher’s email field and complete any verification."
+                            finishingSignup = true
+                        }
+                    }.font(.system(size: 14)).accessibilityIdentifier("newsletter.finishSignup")
+                }
+                Button(source.sourceKind == "email" ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry signup using my newsletter address") {
                     Task { await model.retrySubscription(source) }
                 }.font(.system(size: 14)).disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
             }
-            Button(source.subscriptionStatus == "unsubscribed" ? "Unsubscribed" : "Unsubscribe from newsletter", role: .destructive) {
+            Button(source.subscriptionStatus == "unsubscribed" ? "Updates stopped" : source.sourceKind == "email" ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
                 confirmingUnsubscribe = true
             }
             .font(.system(size: 14)).buttonStyle(.plain)
@@ -526,6 +583,9 @@ struct SourceEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)
         .onAppear { signup = source.signupUrl }
+        .sheet(isPresented: $finishingSignup) {
+            if let url = URL(string: source.signupUrl) { PublisherSignupSheet(url: url, alias: model.account?.alias ?? "") }
+        }
         .confirmationDialog("Unsubscribe from \(source.name)?", isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
             Button("Unsubscribe", role: .destructive) {
                 Task {
@@ -534,7 +594,7 @@ struct SourceEditor: View {
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Stop creating new posts and request unsubscribe from the publisher. Existing posts stay available. Some publishers require an extra confirmation.")
+            Text(source.sourceKind == "email" ? "Stop creating posts from these emails. To stop delivery, disable the scheduled email in the sending app. Existing posts stay available." : "Stop creating new posts and request unsubscribe from the publisher. Existing posts stay available. Some publishers require an extra confirmation.")
         }
     }
 }

@@ -178,13 +178,22 @@ struct FeedPostCard: View {
                 Spacer()
             }.padding(.horizontal, 20).padding(.top, 10).padding(.bottom, 22)
 
-            NavigationLink { PostDetail(post: post) } label: {
-                if post.visual?.assetId != nil {
-                    PostVisualView(post: post)
-                } else {
+            if !post.gallery.isEmpty {
+                PostVisualView(post: post, inset: 16)
+            } else if ["machine_checked", "source_preserved"].contains(post.verification ?? "") {
+                NavigationLink { PostDetail(post: post) } label: {
+                    VStack(spacing: 12) {
+                        Image(systemName: "photo").font(.system(size: 34, weight: .light))
+                        Text(post.visual?.status == "failed" ? "Image unavailable" : "Image is being prepared").font(.callout)
+                        Text(post.visual?.status == "failed" ? "Open the post to read it or retry the image." : "You can read the post while its image loads.").font(.caption)
+                    }.foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 220)
+                        .background(.secondary.opacity(0.05))
+                }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
+            } else {
+                NavigationLink { PostDetail(post: post) } label: {
                     EditorialCover(post: post, index: index)
-                }
-            }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
+                }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
+            }
 
             HStack(spacing: 20) {
                 Spacer()
@@ -196,7 +205,7 @@ struct FeedPostCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 5) {
                     Image(systemName: post.isDemo ? "circle.dotted" : "checkmark.seal").font(.system(size: 10))
-                    Text(post.isDemo ? "Seeded sample · not independently verified" : post.verification == "machine_checked" ? "Source linked · machine-checked" : "Imported newsletter excerpt").font(.system(size: 11, weight: .semibold))
+                    Text(post.isDemo ? "Seeded sample · not independently verified" : post.verification == "source_preserved" ? "Original newsletter content" : post.verification == "machine_checked" ? "Source linked · machine-checked" : "Imported newsletter excerpt").font(.system(size: 11, weight: .semibold))
                 }
                 ForEach(post.tags ?? []) { tag in
                     Label(tag.label, systemImage: "clock")
@@ -208,12 +217,16 @@ struct FeedPostCard: View {
                     Text(post.source.name).fontWeight(.semibold)
                     + Text("  " + post.finding)
                 }.font(.system(size: 13)).lineSpacing(3).lineLimit(expanded ? nil : 2)
+                if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.system(size: 13)).lineSpacing(3) }
                 Button(expanded ? "Read less" : "Read more") { expanded.toggle() }.font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                 HStack {
                     Text(post.publishedDate ?? "Today").font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
                     if post.read { Label("Read", systemImage: "checkmark").font(.system(size: 10)).foregroundStyle(.secondary) }
                 }
+                NavigationLink("Open full post") { PostDetail(post: post) }
+                    .font(.system(size: 12, weight: .medium)).accessibilityIdentifier("post.open")
+                PostContextActionView(post: post).padding(.top, 10).padding(.bottom, 8)
             }.padding(.horizontal, 16)
         }
     }

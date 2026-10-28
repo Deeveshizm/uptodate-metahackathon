@@ -26,6 +26,11 @@ class Subscriptions:
             db.execute("UPDATE sources SET subscription_status='unsubscribe_pending',subscription_detail='New post processing stopped; publisher unsubscribe is pending' WHERE id=? AND user_id=?", (source_id, user_id))
             db.execute("UPDATE jobs SET status='cancelled',stage='cancelled',error='Cancelled by newsletter unsubscribe',payload=NULL WHERE source_id=? AND user_id=? AND status='queued' AND kind!='visual'", (source_id, user_id))
         if not action:
+            if source["source_kind"] == "email":
+                detail="Email processing stopped. Disable the scheduled task in the sending app if you also want it to stop sending mail. Existing posts are kept."
+                with self.store.connect() as db:
+                    db.execute("UPDATE sources SET subscription_status='unsubscribed',subscription_detail=? WHERE id=? AND user_id=?",(detail,source_id,user_id))
+                return {"status":"unsubscribed","detail":detail}
             return {"status": "unsubscribe_pending", "detail": "New posts are stopped. Publisher unsubscribe needs the unsubscribe instructions from a delivered newsletter email."}
         if not action["one_click"]:
             return {"status": "unsubscribe_pending", "detail": "New posts are stopped. Finish unsubscribing on the publisher page that opens.", "action_url": action["unsubscribe_url"]}

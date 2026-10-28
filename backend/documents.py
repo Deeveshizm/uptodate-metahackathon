@@ -102,7 +102,66 @@ class Document:
 
     @property
     def content_hash(self):
-        return hashlib.sha256("\n".join(s["text"] for s in self.spans).encode()).hexdigest()
+        return self.metadata.get("source_content_hash") or hashlib.sha256("\n".join(s["text"] for s in self.spans).encode()).hexdigest()
+
+
+def source_metadata(soup, url):
+    """Original metadata and structured actions are extracted, never invented."""
+    result = {}
+    robots = soup.find("meta", attrs={"name": re.compile(r"^(?:robots|googlebot)$", re.I)})
+    if robots and re.search(r"\bnoindex\b", robots.get("content", ""), re.I):
+        result["private"] = True
+    abstract = soup.select_one('.ltx_abstract, section.abstract, blockquote.abstract, #abstract')
+    if abstract:
+        text = normalize(abstract.get_text(" "))
+        if abstract.name in ("h1", "h2", "h3", "h4"):
+            parts = []
+            for sibling in abstract.find_next_siblings(limit=12):
+                if sibling.name in ("h1", "h2", "h3", "h4"):
+                    break
+                parts.append(sibling.get_text(" "))
+            text = normalize(" ".join(parts))
+        result["abstract"] = re.sub(r"^Abstract\s*[:.]?\s*", "", text, flags=re.I)[:8000]
+    abstract_meta = soup.find("meta", attrs={"name": "citation_abstract"})
+    if not result.get("abstract") and abstract_meta:
+        result["abstract"] = normalize(abstract_meta.get("content", ""))[:8000]
+    for name, field_name in (("citation_doi", "doi"), ("citation_publication_date", "published_date")):
+        node = soup.find("meta", attrs={"name": name})
+        if node:
+            result[field_name] = normalize(node.get("content", ""))[:250]
+    import json
+    objects = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}, limit=8):
+        if len(script.get_text()) > 100_000:
+            continue
+        try:
+            value = json.loads(script.get_text())
+        except (ValueError, RecursionError):
+            continue
+        for obj in (value if isinstance(value, list) else [value])[:40]:
+            if isinstance(obj, dict):
+                objects.append(obj)
+                graph = obj.get("@graph")
+                if isinstance(graph, list):
+                    objects.extend(item for item in graph[:40] if isinstance(item, dict))
+    for obj in objects:
+        kinds = obj.get("@type", [])
+        kinds = [kinds] if isinstance(kinds, str) else kinds
+        if not isinstance(kinds, list):
+            continue
+        if "ScholarlyArticle" in kinds and not result.get("abstract") and isinstance(obj.get("abstract"), str):
+            result["abstract"] = normalize(BeautifulSoup(obj["abstract"], "html.parser").get_text(" "))[:8000]
+        if "Recipe" in kinds and isinstance(obj.get("recipeIngredient"), list):
+            ingredients = [normalize(v)[:300] for v in obj["recipeIngredient"][:60] if isinstance(v, str) and normalize(v)]
+            if ingredients:
+                result["recipe"] = {"name": normalize(str(obj.get("name", "Recipe")))[:200], "ingredients": ingredients, "source_url": url}
+        if any(kind in kinds for kind in ("Place", "LocalBusiness", "Restaurant", "CafeOrCoffeeShop")):
+            address = obj.get("address")
+            if isinstance(address, dict):
+                address = ", ".join(str(address[k]) for k in ("streetAddress", "addressLocality", "addressRegion", "postalCode") if address.get(k))
+            if isinstance(address, str) and address.strip() and isinstance(obj.get("name"), str):
+                result.setdefault("places", []).append({"name": normalize(obj["name"])[:200], "address": normalize(address)[:500], "source_url": url})
+    return result
 
 
 def parse_document(resource: Resource) -> Document:
@@ -116,7 +175,8 @@ def parse_document(resource: Resource) -> Document:
         spans = make_spans([(line, "Text", None) for line in text.splitlines() if normalize(line)])
         return Document(resource.url, urlsplit(resource.url).hostname, spans)
     soup = BeautifulSoup(resource.body, "html.parser")
-    title = normalize(soup.title.get_text(" ")) if soup.title else urlsplit(resource.url).hostname
+    title_node=soup.title or soup.find('h1')
+    title = normalize(title_node.get_text(" ")) if title_node else (urlsplit(resource.url).hostname or 'Email edition')
     author_nodes = soup.find_all("meta", attrs={"name": re.compile(r"^(?:author|citation_author|dc\.creator)$", re.I)}, limit=12)
     authors = [node.get("content", "").strip() for node in author_nodes if node.get("content", "").strip()]
     if not authors:
@@ -134,6 +194,7 @@ def parse_document(resource: Resource) -> Document:
         "feed_url": safe_url(urljoin(resource.url, feed.get("href", ""))) if feed else "",
         "publisher": publication_name(soup),
         "format": "html",
+        **source_metadata(soup, resource.url),
     }
     if urlsplit(resource.url).hostname in ("arxiv.org", "www.arxiv.org"):
         paper = re.fullmatch(r"/(?:abs|html)/(\d{4}\.\d{4,5})(?:v\d+)?/?", urlsplit(resource.url).path)
@@ -174,6 +235,9 @@ def parse_document(resource: Resource) -> Document:
     if not chunks:
         chunks = [(line, "Body", None) for line in main.stripped_strings]
     spans = make_spans(chunks)
+    metadata["source_content_hash"] = hashlib.sha256("\n".join(normalize(chunk[0]) for chunk in chunks).encode()).hexdigest()
+    metadata["extraction"] = {"strategy": "section_balanced", "available_characters": sum(len(c[0]) for c in chunks),
+                              "selected_characters": sum(len(s["text"]) for s in spans)}
     if sum(len(s["text"]) for s in spans) < 100:
         raise SourceError("Not enough accessible source text; try a public issue or article rather than the signup page")
     from .visuals import html_figures
@@ -182,18 +246,45 @@ def parse_document(resource: Resource) -> Document:
 
 
 def make_spans(chunks):
-    spans, budget = [], 0
+    candidates, total = [], 0
     for text, section, page in chunks:
         text = normalize(text)
         if len(text) < 15:
             continue
-        # Stable contiguous slices: exact quotes can be checked deterministically.
         for start in range(0, len(text), 1400):
             part = text[start:start + 1400]
-            if budget + len(part) > 18000 or len(spans) >= 50:
-                return spans
-            spans.append({"id": f"s{len(spans) + 1:03d}", "text": part, "section": section, "page": page})
-            budget += len(part)
+            if total + len(part) > 160_000 or len(candidates) >= 400:
+                break
+            candidates.append({"id": f"s{len(candidates) + 1:03d}", "text": part, "section": section, "page": page})
+            total += len(part)
+        if total >= 158_600 or len(candidates) >= 400:
+            break
+    if total <= 18000 and len(candidates) <= 50:
+        return candidates
+    # Preserve later findings/limitations before spending the entire budget on
+    # the introduction. Spread remaining space across sections, not just pages 1–N.
+    def priority(span):
+        section = span["section"].lower()
+        if re.search(r"abstract|conclusion|limitation|result|discussion", section):
+            return 0
+        if re.search(r"method|approach|architecture|experiment|evaluation", section):
+            return 1
+        if re.search(r"reference|bibliograph|acknowledg", section):
+            return 4
+        return 2
+    sections = {}
+    for span in candidates:
+        sections.setdefault(span["section"], []).append(span)
+    ordered = []
+    groups = sorted(sections.values(), key=lambda values: priority(values[0]))
+    for depth in range(max((len(values) for values in groups), default=0)):
+        ordered.extend(values[depth] for values in groups if len(values) > depth)
+    spans, budget = [], 0
+    for span in ordered:
+        if budget + len(span["text"]) <= 18000 and len(spans) < 50:
+            spans.append(span)
+            budget += len(span["text"])
+    spans.sort(key=lambda span: int(span["id"][1:]))
     return spans
 
 
@@ -208,7 +299,7 @@ def parse_pdf(resource):
                 break
             text = page.extract_text() or ""
             chunks.extend((part, f"Page {index + 1}", index + 1) for part in re.split(r"\n\s*\n", text))
-            if sum(len(item[0]) for item in chunks) >= 18000:
+            if sum(len(item[0]) for item in chunks) >= 160_000:
                 break
         spans = make_spans(chunks)
         if sum(len(s["text"]) for s in spans) < 100:
@@ -216,8 +307,12 @@ def parse_pdf(resource):
         title = str((reader.metadata or {}).get("/Title") or urlsplit(resource.url).path.split("/")[-1])
         from .visuals import pdf_figures
         figures, license_url = pdf_figures(resource)
+        all_text = "\n".join(chunk[0] for chunk in chunks)
+        abstract = re.search(r"\bAbstract\s*[:.—-]?\s*(.{80,8000}?)(?=\n\s*(?:1[. ]+)?Introduction\b)", all_text, re.I | re.S)
         return Document(resource.url, title[:250], spans,
-                        metadata={"format": "pdf", "pages_available": len(reader.pages), "pages_examined": min(25, len(reader.pages)), "license_url": license_url},
+                        metadata={"format": "pdf", "pages_available": len(reader.pages), "pages_examined": min(25, len(reader.pages)), "license_url": license_url,
+                                  "abstract": normalize(abstract[1]) if abstract else "",
+                                  "source_content_hash": hashlib.sha256(all_text.encode()).hexdigest()},
                         figures=figures)
     except SourceError:
         raise
@@ -229,11 +324,16 @@ def digest_links(document, limit=3):
     seen, candidates = {document.url}, []
     for link in document.links:
         url, title = link["url"], link["title"]
-        if url in seen or len(title) < 15:
+        description = title + " " + link.get("context", "")
+        if url in seen or len(description.strip()) < 15:
+            continue
+        if re.search(r"^(?:home|about|contact|advertis|sponsor|unsubscribe|preferences|sign.?in|subscribe|forward|share)\b", title, re.I):
+            continue
+        if not urlsplit(url).path.strip("/"):
             continue
         if urlsplit(url).hostname in ("twitter.com", "x.com", "linkedin.com", "facebook.com", "instagram.com"):
             continue
         seen.add(url)
         candidates.append(link)
     # Keep editorial order. Do not infer that every navigation link is an article.
-    return candidates[:limit]
+    return candidates if limit is None else candidates[:limit]

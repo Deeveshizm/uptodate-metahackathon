@@ -11,7 +11,7 @@ struct Account: Codable {
     var aliasScope: String? = nil
 }
 
-struct NewsletterSource: Codable, Identifiable {
+struct NewsletterSource: Codable, Identifiable, Equatable {
     let id: String
     let name: String
     let sender: String
@@ -21,6 +21,7 @@ struct NewsletterSource: Codable, Identifiable {
     let feedUrl: String?
     let subscriptionStatus: String?
     let subscriptionDetail: String?
+    var sourceKind: String? = nil
 
     var subscriptionTitle: String {
         switch subscriptionStatus {
@@ -28,14 +29,30 @@ struct NewsletterSource: Codable, Identifiable {
         case "submitted": "Signup submitted · waiting for email"
         case "confirmation_required": "Confirm your subscription"
         case "email_received": "Publisher email received · waiting for an edition"
-        case "receiving": "Newsletter emails connected"
+        case "receiving": sourceKind == "email" ? "Email newsletter connected" : "Newsletter emails connected"
         case "needs_inbox": "Waiting for your newsletter address"
         case "needs_agent", "manual_action", "failed": "Signup needs attention"
         case "unsubscribe_pending", "unsubscribing": "Publisher unsubscribe pending · new posts stopped"
-        case "unsubscribed": "Unsubscribed"
+        case "unsubscribed": sourceKind == "email" ? "Email updates stopped" : "Unsubscribed"
         default: "Newsletter saved"
         }
     }
+}
+
+struct IncomingNewsletter: Codable, Identifiable {
+    let id: String
+    let sender: String
+    let senderName: String
+    let provider: String?
+    let subject: String
+    let status: String
+    var displayName: String { provider ?? senderName }
+}
+
+struct EmailSourceText: Decodable {
+    let title: String
+    let text: String
+    let author: String
 }
 
 struct NewsletterAdded: Decodable {
@@ -74,6 +91,96 @@ struct Post: Codable, Identifiable {
     let verification: String?
     let visual: PostVisual?
     let tags: [PostTag]?
+    var visuals: [PostVisual]? = nil
+    var paper: PaperSource? = nil
+    var contentAction: ContentAction? = nil
+
+    var gallery: [PostVisual] {
+        var seen = Set<String>()
+        return ((visuals?.isEmpty == false ? visuals : nil) ?? visual.map { [$0] } ?? [])
+            .filter { item in item.assetId.map { seen.insert($0).inserted } ?? false }
+    }
+    var actionKind: String {
+        if contentAction?.kind == "ingredients", !(contentAction?.recipe?.ingredients.isEmpty ?? true) { return "ingredients" }
+        if contentAction?.kind == "places", !(contentAction?.places?.isEmpty ?? true) { return "places" }
+        return "ask_ai"
+    }
+    var actionTitle: String {
+        switch actionKind {
+        case "ingredients": "Add ingredients"
+        case "places": "View places"
+        default: paper?.abstract?.isEmpty == false ? "Ask about this paper" : "Ask AI"
+        }
+    }
+    var aiContext: String {
+        var parts = ["Help me understand this post. Distinguish source claims from your explanation.", title, hook, finding]
+        parts += (analysis?.sections ?? []).map { $0.heading + ": " + $0.text }
+        if let caveat = sourceCaveat { parts.append(caveat) }
+        if let abstract = paper?.abstract, !abstract.isEmpty { parts.append("Original abstract: " + String(abstract.prefix(6000))) }
+        parts += evidence.prefix(6).map { "Source excerpt: " + String($0.quote.prefix(1000)) }
+        parts.append(isEmailSource ? "Source: private newsletter email" : "Original source: " + originalUrl)
+        return parts.joined(separator: "\n\n")
+    }
+    var sourceCaveat: String? {
+        let text = limitations.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text != "Automated summary; check the original source for full context." else { return nil }
+        return text
+    }
+    var isEmailSource: Bool { originalUrl.hasPrefix("email:") }
+}
+
+struct PaperSource: Codable {
+    let url: String?
+    let title: String?
+    let abstract: String?
+}
+
+struct RecipeAction: Codable {
+    let name: String?
+    let ingredients: [String]
+    let sourceUrl: String?
+    var note: String? = nil
+}
+
+struct PlaceAction: Codable, Identifiable {
+    let name: String
+    let address: String?
+    let sourceUrl: String?
+    var mapUrl: String? = nil
+    var id: String { name + (address ?? "") }
+}
+
+struct ContentAction: Codable {
+    let kind: String
+    let recipe: RecipeAction?
+    let places: [PlaceAction]?
+    enum CodingKeys: String, CodingKey { case kind, data }
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try box.decode(String.self, forKey: .kind)
+        recipe = kind == "ingredients" ? try? box.decode(RecipeAction.self, forKey: .data) : nil
+        places = kind == "places" ? try? box.decode([PlaceAction].self, forKey: .data).filter { !$0.name.isEmpty } : nil
+    }
+    func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        try box.encode(kind, forKey: .kind)
+        if let recipe { try box.encode(recipe, forKey: .data) }
+        if let places { try box.encode(places, forKey: .data) }
+    }
+}
+
+struct PostChatReply: Decodable {
+    let answer: String
+    let evidenceIds: [Int]
+    let sourceUrl: String
+    let model: String
+}
+
+struct PostChatTurn: Encodable, Identifiable {
+    let id = UUID()
+    let role: String
+    let text: String
+    enum CodingKeys: CodingKey { case role, text }
 }
 
 struct PostTag: Codable, Identifiable {
@@ -99,6 +206,13 @@ struct PostAnalysis: Codable {
     let problem: String?
     let approach: String?
     let impact: String?
+    var sections: [PostSourceSection]? = nil
+}
+
+struct PostSourceSection: Codable, Identifiable {
+    let heading: String
+    let text: String
+    var id: String { heading + text }
 }
 
 struct DailyFeed: Codable {
@@ -107,6 +221,7 @@ struct DailyFeed: Codable {
     let total: Int
     let unread: Int
     let finite: Bool
+    let nextCursor: String?
 }
 
 struct Job: Codable, Identifiable {
@@ -138,4 +253,5 @@ struct Snapshot: Codable {
     let feed: DailyFeed?
     let bookmarks: [Post]
     let sources: [NewsletterSource]
+    var readFeed: DailyFeed? = nil
 }

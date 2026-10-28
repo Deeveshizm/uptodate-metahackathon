@@ -94,6 +94,18 @@ def recipient_set(message):
     return {address.lower() for _, address in getaddresses(values) if address}
 
 
+def email_channel(sender, subject):
+    # Personal mail can carry both forwarded tests and separate Muse tasks.
+    # Dedicated publisher addresses remain one stream across changing headlines.
+    domain=sender.rsplit('@',1)[-1]
+    if domain not in ('gmail.com','googlemail.com','outlook.com','hotmail.com','yahoo.com','icloud.com','me.com'):
+        return ''
+    title=subject.split(':',1)[0].casefold()
+    title=re.sub(r"\b(?:today|tomorrow|yesterday)(?:['’]s)?\b|\b(?:daily|weekly|edition|pick|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",' ',title)
+    title=re.sub(r'\b\d[\d/.-]*\b',' ',title)
+    return re.sub(r'[^\w]+',' ',title).strip()[:160]
+
+
 def newsletter_payload(message):
     subject = str(message.get("subject") or "Untitled edition")[:300]
     # Confirmation and account-action messages are delivered, never crawled or
@@ -108,10 +120,11 @@ def newsletter_payload(message):
         mail.set_content(message.get("text") or "")
         if message.get("html"):
             mail.add_alternative(message["html"], subtype="html")
-        parsed = parse_newsletter(mail.as_bytes())
+        parsed = parse_newsletter(mail.as_bytes(), require_links=False)
     except (ValueError, TypeError, LookupError, AttributeError):
         return None, "received"
     links = []
+    parsed['image_urls']=[]
     for value in parsed["urls"]:
         url = safe_url(value)
         if not url:
@@ -124,17 +137,20 @@ def newsletter_payload(message):
         if parts.hostname in ("x.com", "twitter.com", "facebook.com", "instagram.com", "linkedin.com"):
             continue
         if re.search(r"\.(png|jpg|jpeg|gif|svg|webp|ico)(?:$|\?)", url, re.I):
+            parsed['image_urls'].append(url)
             continue
         links.append(url)
-    parsed["urls"] = links[:3]
+    parsed["urls"] = links[:50]
+    parsed["links"] = [link for link in parsed.get("links", []) if link["url"] in parsed["urls"]]
+    parsed["html"] = str(message.get("html") or "")[:200000]
     # EmailMessage generates random MIME boundaries. Deduplicate normalized
     # content too, including redeliveries with a different provider message ID.
     parsed["fingerprint"] = hashlib.sha256(json.dumps({key: parsed[key] for key in ("sender", "subject", "text", "urls")}, sort_keys=True).encode()).hexdigest()
-    return (parsed, "queued") if links else (None, "received")
+    return (parsed, "queued") if links or (len(parsed["text"]) >= 160 and len(parsed["text"].split()) >= 25) else (None, "received")
 
 
 def unsubscribe_action(message):
-    """Only server-authenticated publisher headers can supply mail actions."""
+    """Use authenticated publisher instructions, never guess a recipient URL."""
     authentication = message.get("authentication") or {}
     if authentication.get("dmarc") != "pass" and authentication.get("dkim") != "pass":
         return None
@@ -151,6 +167,26 @@ def unsubscribe_action(message):
             continue
         one_click = headers.get("list-unsubscribe-post", "").strip().lower() == "list-unsubscribe=one-click"
         return url, one_click
+    # Some publishers provide only a footer link. Opening it can require a
+    # confirmation page, so it must never become an RFC 8058 POST action.
+    from bs4 import BeautifulSoup
+    candidates = set()
+    soup = BeautifulSoup(str(message.get("html") or ""), "html.parser")
+    for anchor in soup.find_all("a", href=True):
+        if re.search(r"\bunsubscrib", anchor.get_text(" ", strip=True), re.I):
+            candidates.add(anchor["href"])
+    for match in re.finditer(r"(?im)^\s*unsubscribe(?:\s+here)?\s*:?\s*(https://[^\s<>]+)\s*$", str(message.get("text") or "")):
+        candidates.add(match.group(1))
+    valid = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.startswith("https://"):
+            continue
+        try:
+            valid.add(public_url(candidate))
+        except SourceError:
+            continue
+    if len(valid) == 1:
+        return valid.pop(), False
     return None
 
 
@@ -224,6 +260,7 @@ class TemporaryRelay:
             if message.get("id") != message_id or recipient_set(message) != {relay["address"]}:
                 raise ReceivingError("Received message identity or recipient changed; nothing was imported")
             parsed, state = newsletter_payload(message)
+            if parsed:parsed['receiving_message_id']=message_id
             with store.connect() as db:
                 # Recheck ownership after network calls; deletion revokes delivery.
                 live = db.execute("SELECT * FROM test_relay_aliases WHERE address=? AND user_id=?",
@@ -232,14 +269,24 @@ class TemporaryRelay:
                     return result
                 sender = parseaddr(str(message.get("from", "")))[1].lower()
                 sender_domain = sender.rsplit("@", 1)[-1] if "@" in sender else ""
+                channel=email_channel(sender,str(message.get('subject') or ''))
                 sources = db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_alias=? AND expected_sender_domain!='' AND sender LIKE 'newsletter:%'",
                                      (self.owner_id, relay["address"])).fetchall()
                 matches = [source for source in sources if sender_domain == source["expected_sender_domain"] or sender_domain.endswith("." + source["expected_sender_domain"])]
                 matched = matches[0] if len(matches) == 1 else None
                 if not matches:
-                    matched = db.execute("SELECT * FROM sources WHERE user_id=? AND sender=?", (self.owner_id, sender)).fetchone()
+                    matched = db.execute("SELECT * FROM sources WHERE user_id=? AND email_sender=? AND email_topic=?", (self.owner_id,sender,channel)).fetchone()
                 if len(matches) > 1:
                     parsed, state = None, "requires_source_match"
+                if parsed and not matched and len(matches) <= 1:
+                    # A new sender cannot silently become a recurring feed.
+                    display, _ = parseaddr(str(message.get("from", "")))
+                    auth = message.get("authentication") or {}
+                    verified = auth.get("dkim") == "pass" or auth.get("dmarc") == "pass"
+                    provider = "Muse" if verified and any(sender_domain == domain or sender_domain.endswith('.'+domain) for domain in ("muse.ai", "meta.ai")) else None
+                    db.execute("INSERT INTO inbox_candidates(id,user_id,sender,sender_name,provider,subject,payload,channel_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,sender,channel_key) DO UPDATE SET subject=excluded.subject,payload=excluded.payload,updated_at=excluded.updated_at",
+                               (uuid.uuid4().hex,self.owner_id,sender,display or sender_domain,provider,parsed["subject"],json.dumps(parsed),channel,timestamp(),timestamp()))
+                    parsed, state = None, "needs_newsletter_approval"
                 if matched:
                     action = unsubscribe_action(message)
                     if action:
@@ -249,7 +296,7 @@ class TemporaryRelay:
                         parsed, state = None, "ignored_unsubscribed"
                     else:
                         status = "receiving" if parsed else ("confirmation_required" if state == "manual_action" else "email_received")
-                        detail = ("Newsletter email received at your account alias and queued for local generation" if parsed else
+                        detail = ("Newsletter email received at your account alias and queued for source-grounded generation" if parsed else
                                   "Publisher email requires confirmation; open it in Receiving" if state == "manual_action" else
                                   "Publisher email received at your account alias; waiting for a readable newsletter edition")
                         db.execute("UPDATE sources SET subscription_status=?,subscription_detail=? WHERE id=? AND user_id=?",
@@ -264,7 +311,7 @@ class TemporaryRelay:
                         source = matched or db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (self.owner_id, parsed["sender"])).fetchone()
                         source_id = source["id"] if source else uuid.uuid4().hex
                         if not source:
-                            db.execute("INSERT INTO sources(id,user_id,name,sender,subscription_status,subscription_detail,subscription_alias,expected_sender_domain) VALUES(?,?,?,?,'receiving','Email received at the temporary test alias',?,?)",
+                            db.execute("INSERT INTO sources(id,user_id,name,sender,subscription_status,subscription_detail,subscription_alias,expected_sender_domain,source_kind) VALUES(?,?,?,?,'receiving','Email received at the temporary test alias',?,?,'email')",
                                        (source_id, self.owner_id, parsed["source_name"], parsed["sender"], relay["address"], sender_domain))
                         if not matched:
                             action = unsubscribe_action(message)

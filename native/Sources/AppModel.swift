@@ -5,10 +5,14 @@ import Combine
 final class AppModel: ObservableObject {
     @Published var account: Account?
     @Published var feed: DailyFeed?
+    @Published var readFeed: DailyFeed?
+    @Published var loadingOlder = false
+    @Published var loadingReadHistory = false
     @Published var bookmarks: [Post] = []
     @Published var sources: [NewsletterSource] = []
     @Published var review: [Post] = []
     @Published var jobs: [Job] = []
+    @Published var inboxCandidates: [IncomingNewsletter] = []
     @Published var error: String?
     @Published var notice: String?
     @Published var busy = false
@@ -24,7 +28,13 @@ final class AppModel: ObservableObject {
     private var sessionEpoch = 0
     private var lastIdleJobPoll = Date.distantPast
     private var imageCache: [String: Data] = [:]
-    private let base = URL(string: "http://127.0.0.1:8000")!
+    private let base: URL = {
+        #if targetEnvironment(simulator)
+        if let value = ProcessInfo.processInfo.environment["UPTODATE_TEST_API_URL"],
+           let url = URL(string: value), url.scheme == "http", url.host == "127.0.0.1" { return url }
+        #endif
+        return URL(string: "http://127.0.0.1:8000")!
+    }()
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -48,6 +58,7 @@ final class AppModel: ObservableObject {
             feed = snapshot.feed
             bookmarks = snapshot.bookmarks
             sources = snapshot.sources
+            readFeed = snapshot.readFeed
             offline = true
         }
         if token == nil {
@@ -61,14 +72,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func request(_ path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", retryAuth: Bool = true) async throws -> Data {
+    private func request(_ path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", retryAuth: Bool = true, timeout: TimeInterval = 15, query: [URLQueryItem] = []) async throws -> Data {
         let epoch = sessionEpoch
         if let session = authSession, session.expiresAt < Date().timeIntervalSince1970 + 60 {
             try await refreshSession()
         }
-        var request = URLRequest(url: base.appendingPathComponent(path))
+        var endpoint = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        if !query.isEmpty { endpoint.queryItems = query }
+        var request = URLRequest(url: endpoint.url!)
         request.httpMethod = method
-        request.timeoutInterval = 15
+        request.timeoutInterval = timeout
         request.httpBody = body
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -80,7 +93,7 @@ final class AppModel: ObservableObject {
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             if response.statusCode == 401, authSession != nil, retryAuth {
                 if usedToken == token { try await refreshSession() }
-                return try await self.request(path, method: method, body: body, contentType: contentType, retryAuth: false)
+                return try await self.request(path, method: method, body: body, contentType: contentType, retryAuth: false, timeout: timeout, query: query)
             }
             if response.statusCode == 401 { clearLocalSession() }
             throw APIError.response(response.statusCode, object?["detail"] as? String ?? "The request failed")
@@ -88,8 +101,8 @@ final class AppModel: ObservableObject {
         return data
     }
 
-    private func get<T: Decodable>(_ path: String) async throws -> T {
-        try decoder.decode(T.self, from: await request(path))
+    private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+        try decoder.decode(T.self, from: await request(path, query: query))
     }
 
     func restore() async {
@@ -294,20 +307,48 @@ final class AppModel: ObservableObject {
 
     private func reload() async throws {
         let epoch = sessionEpoch
-        async let feed: DailyFeed = get("v1/feed")
+        // Read job states before the feed: a fast background job can otherwise
+        // finish between parallel requests, leaving an empty feed paired with
+        // an already-completed job that polling will never see transition.
+        let jobs: [Job] = try await get("v1/jobs")
+        async let feed: DailyFeed = get("v1/feed", query: feedQuery(read: false))
+        async let readFeed: DailyFeed = get("v1/feed", query: feedQuery(read: true))
         async let bookmarks: [Post] = get("v1/bookmarks")
         async let sources: [NewsletterSource] = get("v1/me/sources")
         async let review: [Post] = get("v1/review")
-        async let jobs: [Job] = get("v1/jobs")
-        let values = try await (feed, bookmarks, sources, review, jobs)
+        async let candidates: [IncomingNewsletter] = get("v1/inbox/candidates")
+        let values = try await (feed, bookmarks, sources, review, candidates, readFeed)
         guard epoch == sessionEpoch else { throw CancellationError() }
         self.feed = values.0; self.bookmarks = values.1; self.sources = values.2
-        self.review = values.3; self.jobs = values.4
+        self.review = values.3; self.jobs = jobs
+        self.inboxCandidates = values.4
+        self.readFeed = values.5
         offline = false
         if let account {
-            let snapshot = Snapshot(account: account, feed: self.feed, bookmarks: self.bookmarks, sources: self.sources)
+            let snapshot = Snapshot(account: account, feed: self.feed, bookmarks: self.bookmarks, sources: self.sources, readFeed: self.readFeed)
             try JSONEncoder().encode(snapshot).write(to: cache, options: [.atomic, .completeFileProtection])
         }
+    }
+
+    private func feedQuery(read: Bool, before: String? = nil) -> [URLQueryItem] {
+        var items = [URLQueryItem(name: "history", value: "true"), URLQueryItem(name: "read_state", value: read ? "read" : "unread")]
+        if let before { items.append(URLQueryItem(name: "before", value: before)) }
+        return items
+    }
+
+    func loadOlderPosts(read: Bool = false) async {
+        guard !offline, !(read ? loadingReadHistory : loadingOlder),
+              let cursor = (read ? readFeed : feed)?.nextCursor else { return }
+        if read { loadingReadHistory = true } else { loadingOlder = true }
+        defer { if read { loadingReadHistory = false } else { loadingOlder = false } }
+        let epoch = sessionEpoch
+        do {
+            let page: DailyFeed = try await get("v1/feed", query: feedQuery(read: read, before: cursor))
+            guard epoch == sessionEpoch, let current = read ? readFeed : feed, current.nextCursor == cursor else { return }
+            let known = Set(current.posts.map(\.id))
+            let merged = DailyFeed(date: page.date, posts: current.posts + page.posts.filter { !known.contains($0.id) }, total: page.total, unread: page.unread, finite: page.finite, nextCursor: page.nextCursor)
+            if read { readFeed = merged } else { feed = merged }
+        } catch { if !isCancellation(error) { self.error = error.localizedDescription } }
     }
 
     // Pull-to-refresh tears down its task when the gesture ends, which surfaces as
@@ -411,6 +452,8 @@ final class AppModel: ObservableObject {
         do {
             if account?.aliasStatus != "active" { account = try await get("v1/me") }
             let updated: [Job] = try await get("v1/jobs")
+            inboxCandidates = try await get("v1/inbox/candidates")
+            sources = try await get("v1/me/sources")
             let discovered = Set(updated.map(\.id)) != Set(jobs.map(\.id))
             let finished = updated.contains { job in
                 !["queued", "processing"].contains(job.status) && jobs.contains(where: { $0.id == job.id && ["queued", "processing"].contains($0.status) })
@@ -489,22 +532,53 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func visualData(_ post: Post) async -> Data? {
-        guard let assetId = post.visual?.assetId else { return nil }
-        if let data = imageCache[assetId] { return data }
+    func visualData(_ post: Post, visual: PostVisual? = nil) async -> Data? {
+        guard let assetId = (visual ?? post.visual)?.assetId, let accountID = account?.id else { return nil }
+        let cacheKey = accountID + "-" + post.id + "-" + assetId
+        if let data = imageCache[cacheKey] { return data }
         guard assetId.allSatisfy({ $0.isHexDigit }) else { return nil }
         let directory = cache.deletingLastPathComponent().appendingPathComponent("images")
-        let path = directory.appendingPathComponent(assetId + ".png")
-        if let data = try? Data(contentsOf: path) { imageCache[assetId] = data; return data }
+        let path = directory.appendingPathComponent(cacheKey + ".png")
+        if let data = try? Data(contentsOf: path) { imageCache[cacheKey] = data; return data }
         guard !offline else { return nil }
         do {
-            let data = try await request("v1/posts/\(post.id)/image")
+            let route = assetId == post.visual?.assetId ? "image" : "images/\(assetId)"
+            let data = try await request("v1/posts/\(post.id)/\(route)")
+            guard account?.id == accountID else { return nil }
             if imageCache.count >= 20 { imageCache.removeAll() }
-            imageCache[assetId] = data
+            imageCache[cacheKey] = data
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: path, options: [.atomic, .completeFileProtection])
             return data
         } catch { return nil }
+    }
+
+    func acceptEmailNewsletter(_ candidate: IncomingNewsletter, name: String) async -> Bool {
+        var accepted = false
+        await perform {
+            let body = try JSONSerialization.data(withJSONObject: ["name": name])
+            _ = try await self.request("v1/inbox/candidates/\(candidate.id)/accept", method: "POST", body: body)
+            try await self.reload(); accepted = true
+        }
+        return accepted
+    }
+
+    func dismissEmailNewsletter(_ candidate: IncomingNewsletter) async {
+        await perform {
+            _ = try await self.request("v1/inbox/candidates/\(candidate.id)/dismiss", method: "POST")
+            try await self.reload()
+        }
+    }
+
+    func sourceEmail(_ post: Post) async throws -> EmailSourceText {
+        try await get("v1/posts/\(post.id)/source")
+    }
+
+    func ask(_ post: Post, question: String, history: [PostChatTurn]) async throws -> PostChatReply {
+        struct Input: Encodable { let question: String; let history: [PostChatTurn] }
+        let bounded = history.suffix(6).map { PostChatTurn(role: $0.role, text: String($0.text.prefix(2000))) }
+        let body = try JSONEncoder().encode(Input(question: question, history: bounded))
+        return try decoder.decode(PostChatReply.self, from: await request("v1/posts/\(post.id)/chat", method: "POST", body: body, timeout: 270))
     }
 
     func retryVisual(_ post: Post) async {
@@ -527,7 +601,7 @@ final class AppModel: ObservableObject {
         sessionEpoch += 1
         refreshTask?.cancel(); refreshTask = nil; authSession = nil
         Session.clear()
-        token = nil; account = nil; feed = nil; bookmarks = []; sources = []; review = []; jobs = []
+        token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []
         imageCache.removeAll()
         let images = cache.deletingLastPathComponent().appendingPathComponent("images")
         try? FileManager.default.removeItem(at: images)

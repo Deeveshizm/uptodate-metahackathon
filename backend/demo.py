@@ -35,3 +35,12 @@ DEMO_POSTS = [
         "original_url": "https://www.onthesnow.com/california/heavenly-mountain-resort/skireport",
     },
 ]
+
+# Source-supported venues from the sample edition, also used for older seeded cards.
+DEMO_PLACES = [
+    [{"name": "Estorya Coffee", "address": "31866 Alvarado Blvd, Union City, CA 94587"}],
+    [{"name": "Cere Tea", "address": "2106 Shattuck Ave, Berkeley, CA"},
+     {"name": "55 Coffee Co. at The Saap Avenue", "address": "4395 Piedmont Ave, Oakland, CA"}],
+    [{"name": "Rize Up", "address": "SoMa, San Francisco, CA"}],
+    [],
+]

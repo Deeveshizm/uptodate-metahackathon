@@ -23,6 +23,12 @@ class FormSignup:
             raise SourceError("A working account relay is required for newsletter signup")
         page = self.fetcher.fetch(url)
         soup = BeautifulSoup(page.body, "html.parser")
+        # 1440's current Next server action requires a reCAPTCHA token; it
+        # cannot be completed by a plain form POST or our isolated browser.
+        if urlsplit(page.url).hostname in ("join1440.com", "www.join1440.com"):
+            return {"status": "manual_action", "detail": "1440 requires human verification on its website. Use Finish signup on publisher website, then paste your copied newsletter address. Incoming mail will connect the subscription."}
+        if soup.select("script[src*=recaptcha], script[src*=hcaptcha], script[src*=turnstile], iframe[src*=recaptcha]"):
+            return {"status": "manual_action", "detail": "The publisher requires a human verification step. Finish signup on its website using your account's newsletter address."}
         forms = []
         for form in soup.find_all("form", limit=20):
             fields = [node for node in form.find_all("input", attrs={"name": True})

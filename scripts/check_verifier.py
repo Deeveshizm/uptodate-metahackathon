@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-from backend.generation import Ollama, Verification, VERIFY_SYSTEM
+from backend.generation import generation_model, Verification, VERIFY_SYSTEM
 from backend.retrieval import SourceError
 
 
@@ -25,7 +25,7 @@ def main():
             "summary": ("The cafe has measured a 50% increase in sales.", False),
         }),
     ]
-    model = Ollama()
+    model = generation_model()
     results = []
     for name, fields in cases:
         payload = {"fields_to_check": list(fields), "evidence_by_field": {

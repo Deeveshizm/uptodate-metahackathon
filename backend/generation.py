@@ -1,9 +1,10 @@
-"""Local model drafting + deterministic evidence checks + a separate verifier."""
+"""Configured text inference, source-grounded drafting and separate verification."""
 import json
 import ipaddress
 import os
 import re
 import threading
+import time
 from dataclasses import replace
 from typing import Literal
 from urllib.parse import urlsplit
@@ -38,8 +39,27 @@ class SummaryText(GroundedText):
     text: str = Field(min_length=100, max_length=1000)
 
 
+class IngredientRecord(StrictModel):
+    text: str = Field(min_length=2, max_length=160)
+    quote: str = Field(min_length=2, max_length=400)
+    span_id: str
+
+
+class SourceSection(StrictModel):
+    heading: str = Field(min_length=1, max_length=60)
+    body: GroundedText
+
+
+class PlaceRecord(StrictModel):
+    name: str = Field(min_length=2,max_length=200)
+    address: str = Field(default='',max_length=400)
+    quote: str = Field(min_length=2,max_length=650)
+    span_id: str
+    map_index: int | None = Field(default=None,ge=0,le=19)
+
+
 class Draft(StrictModel):
-    content_type: Literal["paper", "news", "release", "repository", "opinion", "article"]
+    content_type: Literal["paper", "recipe", "places", "news", "release", "repository", "opinion", "article"]
     title: str = Field(min_length=5, max_length=130)
     hook: GroundedText
     summary: SummaryText
@@ -48,22 +68,26 @@ class Draft(StrictModel):
     finding: GroundedText | None
     impact: GroundedText | None
     limitations: GroundedText | None
+    ingredients: list[IngredientRecord] = Field(default_factory=list, max_length=40)
+    sections: list[SourceSection] = Field(default_factory=list, max_length=3)
+    places: list[PlaceRecord] = Field(default_factory=list,max_length=12)
 
 
 class Verdict(StrictModel):
-    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations"]
+    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "detail_1", "detail_2", "detail_3"]
     reason: str = Field(max_length=400)
     supported: bool
 
 
 class Verification(StrictModel):
-    verdicts: list[Verdict] = Field(min_length=3, max_length=8)
+    verdicts: list[Verdict] = Field(min_length=3, max_length=12)
 
 
 BLOCKS = ("hook", "summary", "problem", "approach", "finding", "impact", "limitations")
 
 
 class Ollama:
+    provider = "ollama"
     def __init__(self):
         self.url = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
         parts = urlsplit(self.url)
@@ -78,6 +102,7 @@ class Ollama:
             raise SourceError("OLLAMA_URL must be loopback or an explicitly trusted Tailscale IP on port 11434; use the server root, not /v1")
         self.model = os.environ.get("OLLAMA_MODEL", "llama3:8b")
         self.last_usage = {}
+        self.usage_history = []
 
     def status(self):
         try:
@@ -92,6 +117,8 @@ class Ollama:
                     "local": self.local, "transport": "loopback" if self.local else "tailscale"}
 
     def complete(self, schema, system, payload):
+        self.last_usage = {}
+        started = time.monotonic()
         output_schema = schema.model_json_schema()
         if schema is EvidenceSelection:
             output_schema["properties"]["span_ids"]["items"]["enum"] = [span["id"] for span in payload["spans"]]
@@ -111,9 +138,12 @@ class Ollama:
                 response = client.post(self.url + "/api/chat", json=request)
                 response.raise_for_status()
                 data = response.json()
+            self.last_usage = {key: data.get(key) for key in ("model", "prompt_eval_count", "eval_count", "total_duration")}
+            self.usage_history.append({"stage": schema.__name__, "input_tokens": data.get("prompt_eval_count", 0) or 0,
+                                       "output_tokens": data.get("eval_count", 0) or 0,
+                                       "seconds": round(time.monotonic() - started, 3), "estimated_cost_usd": 0})
             if not data.get("done") or data.get("done_reason") == "length":
                 raise SourceError("Local model output was incomplete; shorten the source or use a larger output budget")
-            self.last_usage = {key: data.get(key) for key in ("model", "prompt_eval_count", "eval_count", "total_duration")}
             return schema.model_validate_json(data["message"]["content"])
         except httpx.HTTPStatusError as exc:
             raise SourceError(f"Ollama returned HTTP {exc.response.status_code}; check that the configured model is installed") from exc
@@ -125,6 +155,107 @@ class Ollama:
             raise SourceError("Local model returned an invalid structured response") from exc
 
 
+class MetaModel:
+    """Fixed-origin Meta Standard inference. No tools, redirects or hidden retries."""
+    provider = "meta"
+    PRICES = {"muse-spark-1.3": (1.25, 4.25), "muse-spark-1.2": (1.25, 4.25),
+              "muse-spark-1.1": (1.25, 4.25), "muse-wonder-1.0": (4.0, 20.0)}
+
+    def __init__(self, transport=None):
+        self.model = os.environ.get("META_MODEL", "muse-spark-1.3")
+        if self.model not in self.PRICES:
+            raise SourceError("Choose a supported Meta Standard model; Contributor mode is disabled for newsletter content")
+        self.key, self.transport = os.environ.get("MODEL_API_KEY", "").strip(), transport
+        self.reasoning = os.environ.get("META_REASONING_EFFORT", "low")
+        if self.reasoning not in ("minimal", "low", "medium"):
+            raise SourceError("META_REASONING_EFFORT must be minimal, low, or medium")
+        self.last_usage, self.usage_history = {}, []
+        self.budget = None
+
+    def status(self):
+        result = {"provider": self.provider, "model": self.model, "local": False, "transport": "https",
+                  "mode": "standard", "ready": False, "available_models": []}
+        if not self.key:
+            return {**result, "detail": "Save MODEL_API_KEY in the ignored backend settings"}
+        try:
+            with httpx.Client(timeout=5, trust_env=False, transport=self.transport) as client:
+                response = client.get("https://api.meta.ai/v1/models", headers={"Authorization": "Bearer " + self.key})
+                response.raise_for_status()
+                models = [entry["id"] for entry in response.json()["data"] if entry.get("id") in self.PRICES]
+            return {**result, "ready": self.model in models, "available_models": models}
+        except (httpx.HTTPError, KeyError, ValueError, TypeError):
+            return {**result, "detail": "Meta is unavailable or the key does not have access"}
+
+    def complete(self, schema, system, payload):
+        self.last_usage = {}
+        if not self.key:
+            raise SourceError("Meta inference needs MODEL_API_KEY in the ignored backend settings; use GENERATION_PROVIDER=ollama for local testing")
+        output = schema.model_json_schema()
+        if schema is EvidenceSelection:
+            output["properties"]["span_ids"]["items"]["enum"] = [s["id"] for s in payload["spans"]]
+        elif schema is Draft:
+            output["$defs"]["Citation"]["properties"]["span_id"]["enum"] = [s["id"] for s in payload["spans"]]
+        request = {"model": self.model, "stream": False, "temperature": 0,
+                   "reasoning_effort": self.reasoning, "max_tokens": 5000,
+                   "messages": [{"role": "system", "content": system + "\nOutput JSON schema:\n" + json.dumps(output)},
+                                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                   "response_format": {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": output}}}
+        if len(json.dumps(request).encode()) > 100_000:
+            raise SourceError("Evidence exceeds the model-call budget; shorten the selected passages")
+        rates = self.PRICES[self.model]
+        input_bound = len(json.dumps(request, ensure_ascii=False).encode()) + 8192
+        reservation = self.budget.reserve((input_bound * rates[0] + request["max_tokens"] * rates[1]) / 1_000_000) if self.budget else None
+        started = time.monotonic()
+        try:
+            with httpx.Client(timeout=httpx.Timeout(240, connect=10), trust_env=False, transport=self.transport) as client:
+                response = client.post("https://api.meta.ai/v1/chat/completions", json=request,
+                                       headers={"Authorization": "Bearer " + self.key})
+            if not response.is_success:
+                if reservation and response.status_code in (400, 401, 402, 403, 404, 422, 429):
+                    self.budget.settle(reservation, 0)
+                detail = {401: "Check the backend Meta API key", 402: "Check Meta credits and billing",
+                          403: "The Meta key cannot access this model", 429: "Meta rate limit reached; retry later"}.get(response.status_code, "Meta inference is temporarily unavailable")
+                raise SourceError(detail)
+            data = response.json()
+            usage = data["usage"]
+            inputs, outputs = usage["prompt_tokens"], usage["completion_tokens"]
+            if not isinstance(inputs, int) or not isinstance(outputs, int) or min(inputs, outputs) < 0:
+                raise ValueError("Invalid usage")
+            self.last_usage = {"model": self.model, **usage}
+            cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+            if not isinstance(cached, int) or not 0 <= cached <= inputs:
+                raise ValueError("Invalid cached usage")
+            cost = ((inputs - cached) * rates[0] + cached * (0.20 if self.model == "muse-wonder-1.0" else 0.15) + outputs * rates[1]) / 1_000_000
+            if reservation:
+                self.budget.settle(reservation, cost)
+            self.usage_history.append({"stage": schema.__name__, "input_tokens": inputs, "output_tokens": outputs,
+                                       "reasoning_tokens": usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0),
+                                       "cached_input_tokens": cached,
+                                       "seconds": round(time.monotonic() - started, 3),
+                                       "estimated_cost_usd": cost})
+            choice = data["choices"][0]
+            if choice.get("finish_reason") != "stop":
+                raise SourceError("Meta output was incomplete; no automatic request retry was made")
+            return schema.model_validate_json(choice["message"]["content"])
+        except httpx.HTTPError:
+            raise SourceError("Meta inference timed out or could not connect; no automatic retry was made") from None
+        except (KeyError, IndexError, ValueError, TypeError, ValidationError):
+            raise SourceError("Meta returned an invalid structured result or usage record") from None
+
+
+def generation_model():
+    provider = os.environ.get("GENERATION_PROVIDER", "meta")
+    if provider == "meta":
+        return MetaModel()
+    if provider == "ollama":
+        return Ollama()
+    raise SourceError("GENERATION_PROVIDER must be meta or ollama")
+
+
+def engine_generation(value):
+    return value.startswith(("ollama:", "meta:"))
+
+
 def numbers(text):
     return set(re.findall(r"(?<!\w)\d+(?:[.,]\d+)*(?:%|x)?", text))
 
@@ -132,8 +263,10 @@ def numbers(text):
 def check_evidence(draft: Draft, document: Document):
     spans = {span["id"]: normalize(span["text"]) for span in document.spans}
     errors, evidence = [], []
-    for field in BLOCKS:
-        block = getattr(draft, field)
+    blocks = {field: getattr(draft, field) for field in BLOCKS}
+    blocks.update({f"detail_{index}": section.body.model_copy(update={"text": section.heading + ": " + section.body.text})
+                   for index, section in enumerate(draft.sections, 1)})
+    for field, block in blocks.items():
         if block is None:
             continue
         quotes = []
@@ -153,7 +286,7 @@ def check_evidence(draft: Draft, document: Document):
         errors.append("title: numerical claim is missing from cited evidence")
     if normalize(draft.summary.text).lower() == normalize(draft.hook.text).lower():
         errors.append("summary: the post body must add source-backed detail beyond the hook")
-    if sum(len(block.text.split()) for field in BLOCKS if (block := getattr(draft, field)) is not None) > 240:
+    if sum(len(block.text.split()) for block in blocks.values() if block is not None) > 240:
         errors.append("post: keep the complete post under 240 words")
     if errors:
         raise SourceError("; ".join(errors))
@@ -225,7 +358,7 @@ prove a paraphrase. Unsupported extrapolation must be false. Omitted null fields
 
 
 def generate(document: Document, model=None, stage=lambda _: None):
-    model = model or Ollama()
+    model = model or generation_model()
     if not document.spans:
         raise SourceError("No source evidence is available")
     feedback = ""
@@ -282,5 +415,5 @@ def generate(document: Document, model=None, stage=lambda _: None):
         "analysis": {"content_type": draft.content_type, **{field: block.text if (block := getattr(draft, field)) else None for field in BLOCKS},
                      "verification": verdict.model_dump(), "selected_span_ids": ids,
                      "model": model.model, "usage": model.last_usage},
-        "generation": f"ollama:{model.model}", "verification": "machine_checked",
+        "generation": f"{getattr(model, 'provider', 'ollama')}:{model.model}", "verification": "machine_checked",
     }

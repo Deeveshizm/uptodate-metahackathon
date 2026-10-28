@@ -6,10 +6,12 @@ import re
 import time
 import uuid
 import warnings
+import hashlib
+from dataclasses import replace
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 from bs4 import BeautifulSoup
@@ -17,9 +19,10 @@ from PIL import Image
 from pydantic import Field
 
 from .documents import content_root, primary_source_urls
-from .generation import MODEL_LOCK, Ollama, StrictModel
+from .generation import MODEL_LOCK, generation_model, StrictModel
 from .pipeline import safe_url
 from .retrieval import SourceError
+from .artifacts import GenerationPending
 
 
 def reusable_license(url):
@@ -34,10 +37,14 @@ def html_figures(resource, document_license):
     main = content_root(soup)
     figures, seen = [], set()
     for image in main.find_all(["img", "object", "embed", "svg"], limit=50):
+        ancestry = list(image.parents)
+        attributes = " ".join(str(node.get("class", "")) + " " + str(node.get("id", "")) for node in [image, *ancestry[:6]])
+        if any(node.name in ("nav", "header", "footer", "aside", "form") for node in ancestry) or re.search(r"(?:^|[\W_])(?:ad|ads|advertisement|sponsored|sponsor|promo|related|recommendations|subscribe|avatar|logo|wordmark)(?:$|[\W_])", attributes, re.I):
+            continue
         inline_svg = image.name == "svg"
         if image.name in ("object", "embed") and not image.find_parent("figure"):
             continue
-        raw = image.get("data-src") or image.get("data") or image.get("src", "")
+        raw = image.get("data-src") or image.get("data-lazy-src") or image.get("nitro-lazy-src") or image.get("data") or image.get("src", "")
         url = resource.url + "#" + str(image.find_parent("figure").get("id", "figure")) if inline_svg and image.find_parent("figure") else safe_url(urljoin(resource.url, raw))
         if not url or url in seen or re.search(r"logo|avatar|tracking|pixel|favicon|badge", url, re.I):
             continue
@@ -45,8 +52,20 @@ def html_figures(resource, document_license):
         figure = image.find_parent("figure")
         caption_node = figure.find("figcaption") if figure else None
         caption = caption_node.get_text(" ", strip=True) if caption_node else image.get("alt", "")
+        uncaptioned_photo = False
         if len(caption) < 15:
-            continue
+            # Editorial photos often have empty alt text (notably Substack).
+            # Require a substantial image inside article content, rejecting
+            # avatars, wordmarks and narrow decorative separators by dimensions.
+            try:
+                width, height = int(image.get("width", 0)), int(image.get("height", 0))
+            except (ValueError, TypeError):
+                width, height = 0, 0
+            if image.name != "img" or min(width, height) < 300 or max(width, height) / min(width, height) > 3:
+                continue
+            title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
+            caption = "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article")
+            uncaptioned_photo = True
         license_node = figure.find("a", rel=lambda x: x and "license" in x) if figure else None
         license_url = safe_url(urljoin(resource.url, license_node.get("href", ""))) if license_node else document_license
         # A page-wide license does not override a third-party credit or exception.
@@ -54,9 +73,23 @@ def html_figures(resource, document_license):
             license_url = ""
         candidate = {"id": f"html-{len(figures) + 1}", "url": url, "caption": caption[:1000],
                      "license_url": license_url, "page": None}
+        heading=image.find_previous(['h2','h3'])
+        if heading:candidate['section']=heading.get_text(' ',strip=True)
+        if uncaptioned_photo:
+            candidate["selection_basis"] = "article_photo_dimensions"
+            candidate["caption_origin"] = "article_title"
         if inline_svg:
             candidate["svg_data"] = str(image).encode()
         figures.append(candidate)
+    if not figures:
+        hero = soup.find("meta", attrs={"property": "og:image"})
+        kind = soup.find("meta", attrs={"property": "og:type"})
+        if hero and (main.name == "article" or (kind and kind.get("content") == "article")):
+            url = safe_url(urljoin(resource.url, hero.get("content", "")))
+            if url and not re.search(r"logo|avatar|tracking|pixel|favicon|wordmark|badge", url, re.I):
+                title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
+                figures.append({"id": "article-hero", "url": url, "caption": "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article"),
+                                "license_url": document_license, "page": None, "selection_basis": "article_hero_metadata", "caption_origin": "article_title"})
     return figures
 
 
@@ -152,10 +185,10 @@ def rank_figures(document, draft):
         # Keep rights metadata for review, independently of visual selection.
         caption = figure["caption"]
         overlap = len(words(caption) & context)
-        if overlap < 2:
+        if overlap < 2 and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
             continue
         methodological = bool(re.search(r"architectur|method|framework|pipeline|schematic|overview|diagram", caption, re.I))
-        eligible.append((overlap + 3 * methodological, figure))
+        eligible.append((overlap + 3 * methodological + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0), figure))
     return [figure for _, figure in sorted(eligible, key=lambda item: item[0], reverse=True)]
 
 
@@ -203,7 +236,7 @@ class ComfyIllustrator:
         # do not ask the diffusion model to lay out the article itself.
         with MODEL_LOCK:
             stage("planning_fallback_visual")
-            model = model or Ollama()
+            model = model or generation_model()
             analysis = draft.get("analysis") or {}
             verified_post = {key: analysis[key] for key in
                              ("content_type", "hook", "summary", "problem", "approach", "finding", "impact", "limitations")
@@ -221,6 +254,8 @@ class ComfyIllustrator:
                 raise SourceError("Illustration scene needs revision; it must describe a short wordless metaphor, not a technical figure")
             prompt = ("Minimal wordless " + ("process" if brief.visual_type == "process" else "editorial") + " illustration. " + brief.scene.rstrip(".") +
                       ". A single uncluttered composition, generous empty background. " + style + ".")
+            history = getattr(model, "usage_history", [])
+            self.last_usage = history if isinstance(history, list) else []
             stage("generating_fallback_visual")
             return prompt, self._generate(prompt)
 
@@ -322,7 +357,7 @@ def source_visual(document, draft, fetcher, allow_pdf=True):
             rights_review = not reusable_license(license_url)
             return {"kind": "source", "status": "ready", "caption": candidate["caption"],
                     "source_url": document.url, "image_source_url": candidate["url"],
-                    "attribution": document.metadata.get("author") or document.title,
+                    "attribution": ("Photo linked in source email · " + (urlsplit(candidate['url']).hostname or 'source')) if document.metadata.get('format')=='email' else document.metadata.get("author") or document.title,
                     "license_url": license_url, "page": candidate.get("page"),
                     "license_name": document.metadata.get("license_name", "") if license_url == document.metadata.get("license_url") else "",
                     "rights_status": "needs_review" if rights_review else "recognized_reuse_license",
@@ -345,7 +380,7 @@ def source_visual(document, draft, fetcher, allow_pdf=True):
     return None
 
 
-def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None):
+def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None, text_model=None, budget=None, photo_search=None):
     # Prefer the paper/original linked by a secondary article before using its
     # own hero image. No recursive discovery, signup, or arbitrary site crawl.
     checks = []
@@ -366,6 +401,11 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
     if selected:
         visual, data = selected
         return {**visual, "source_role": "article", "primary_source_checks": checks}, data
+    venues = linked_venue_gallery(document, draft, fetcher, stage)
+    if not venues:
+        venues = searched_venue_gallery(document,draft,fetcher,stage,photo_search)
+    if venues:
+        return venues[0]
     style = os.environ.get("POST_IMAGE_STYLE", "Restrained editorial illustration, off-white background, dark ink, muted blue and green palette, uncluttered composition")
     # CLIP-based workflows need the subject before the longer exclusions.
     prompt = ("Editorial illustration of " + draft["title"] + ". " + draft["finding"] +
@@ -374,13 +414,123 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
               "Only show relationships supported by the supplied context. No charts, numerical results, "
               "measured evidence, invented research architecture, logos, text, or labels.")
     try:
+        planner = None
         if illustrator is None:
-            prompt, image = ComfyIllustrator().illustrate(draft, style, stage)
+            provider = os.environ.get("IMAGE_GENERATION_PROVIDER", "meta")
+            if provider == "meta":
+                from .image_generation import MuseImageIllustrator
+                planner = MuseImageIllustrator(budget=budget or getattr(text_model, "budget", None))
+                prompt, image = planner.illustrate(draft, style, stage)
+            elif provider == "comfyui":
+                planner = ComfyIllustrator()
+                prompt, image = planner.illustrate(draft, style, stage, model=text_model)
+            else:
+                raise SourceError("IMAGE_GENERATION_PROVIDER must be meta or comfyui")
         else:
             stage("generating_fallback_visual")
             image = illustrator.generate(prompt)
         return {"kind": "generated", "status": "ready", "caption": "AI-generated editorial illustration · not a source figure",
-                "attribution": "Generated locally", "prompt": prompt}, decode_image(image)
+                "attribution": "Generated with Muse Image" if getattr(planner, "model", None) == "muse-image-1.0" else "Generated locally",
+                "prompt": prompt, "planning_usage": getattr(planner, "last_usage", [])}, decode_image(image)
     except SourceError as exc:
         return {"kind": "pending", "status": "needs_image_generator", "caption": "Illustration pending",
                 "detail": str(exc), "prompt": prompt}, None
+
+
+def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, pages=None):
+    """Check explicit venue websites/verified photo pages, without rewriting email content."""
+    places=draft.get('analysis',{}).get('action',{}).get('data',[])
+    if draft.get('analysis',{}).get('action',{}).get('kind')!='places' or not places:return []
+    from .email_content import map_link
+    from .documents import Document,normalize
+    urls=pages if pages is not None else [link['url'] for link in document.links if not map_link(link['url'])]
+    urls=list(dict.fromkeys(url for url in urls if safe_url(url) and not re.search(r'unsubscribe|confirm|activate|login|sign.?in',url,re.I)))[:4 if pages is not None else 2]
+    for url in urls:
+        stage('checking_venue_website_photos')
+        try:
+            resource=fetcher.fetch(url)
+            if 'html' not in resource.content_type:continue
+            soup=BeautifulSoup(resource.body,'html.parser')
+            text=normalize(soup.get_text(' ',strip=True)).casefold()
+            matching=[]
+            for place in places:
+                name=normalize(place['name']).casefold().removeprefix('the ')
+                street=normalize(place.get('address','').split(',')[0]).casefold()
+                if name in text and (not street or street in text):matching.append(place)
+            if not matching:continue
+            figures=[]
+            hero=soup.find('meta',attrs={'property':'og:image'})
+            candidates=[{'url':hero.get('content',''),'alt':''}] if hero else []
+            candidates.extend({'url':node.get('data-src') or node.get('data-lazy-src') or node.get('nitro-lazy-src') or node.get('src',''),
+                               'alt':node.get('alt','')} for node in soup.find_all('img',limit=50)
+                              if not any(p.name in ('nav','footer','aside') for p in node.parents))
+            seen=set()
+            for candidate in candidates:
+                image_url=safe_url(urljoin(resource.url,candidate['url']))
+                parts=urlsplit(image_url or '')
+                identity=urlunsplit((parts.scheme,parts.netloc,parts.path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
+                if not image_url or identity in seen or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                seen.add(identity)
+                figures.append({'id':'venue-photo-'+str(len(figures)), 'url':image_url,'caption':matching[0]['name']+' · photo from '+resource.url,
+                                'license_url':'','page':None,'selection_basis':'venue_website_photo'})
+            title=soup.title.get_text(' ',strip=True) if soup.title else matching[0]['name']
+            source=Document(resource.url,title,[],metadata={'author':title},figures=figures)
+            selected=[];seen_images=set()
+            for figure in figures[:6]:
+                value=source_visual(Document(source.url,source.title,[],metadata=source.metadata,figures=[figure]),draft,fetcher,allow_pdf=False)
+                if value:
+                    visual,image=value
+                    identity=hashlib.sha256(image).hexdigest()
+                    if identity not in seen_images:
+                        selected.append(({**visual,'source_role':'venue_website','photo_source_page':resource.url},image));seen_images.add(identity)
+                if len(selected)>=limit:return selected
+            if selected:return selected
+        except SourceError:
+            continue
+    return []
+
+
+def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4):
+    action=draft.get('analysis',{}).get('action',{})
+    if not photo_search or action.get('kind')!='places':return []
+    stage('searching_real_venue_photos')
+    try:
+        pages=photo_search(action['data'])
+    except GenerationPending:
+        raise
+    except SourceError:
+        return []
+    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=pages)
+
+
+def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, photo_search=None):
+    """Ordered source figures only. Never generate filler images for a gallery."""
+    sources = [document]
+    for url in primary_visual_urls(document):
+        try:
+            from .documents import parse_document
+            sources.insert(0, parse_document(fetcher.fetch(url)))
+        except SourceError:
+            continue
+    for source in sources:
+        selected, seen = [], set()
+        for figure in rank_figures(source, draft)[:8]:
+            stage("selecting_source_visual")
+            value = source_visual(replace(source, figures=[figure], metadata={k: v for k, v in source.metadata.items() if k != "pdf_url"}), draft, fetcher, allow_pdf=False)
+            if value:
+                visual, image = value
+                identity = hashlib.sha256(image).hexdigest()
+                if identity not in seen:
+                    selected.append(({**visual, "source_role": "primary" if source.url != document.url else "article"}, image))
+                    seen.add(identity)
+            if len(selected) >= limit:
+                break
+        if selected:
+            return selected
+        # HTML papers with vector figures may expose the usable rendition only
+        # in their linked PDF. Check that before any generated fallback.
+        fallback = source_visual(source, draft, fetcher) if source.metadata.get('pdf_url') else None
+        if fallback:
+            return [fallback]
+    venues=linked_venue_gallery(document,draft,fetcher,stage,limit)
+    return venues or searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit)

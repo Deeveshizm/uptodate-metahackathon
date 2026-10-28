@@ -13,22 +13,25 @@ from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .demo import DEMO_LIMITS, DEMO_POSTS, DEMO_SENDER, DEMO_SIGNUP, DEMO_SOURCE_NAME, DEMO_SUBJECT
+from .demo import DEMO_LIMITS, DEMO_POSTS, DEMO_PLACES, DEMO_SENDER, DEMO_SIGNUP, DEMO_SOURCE_NAME, DEMO_SUBJECT
 from .pipeline import make_drafts, parse_newsletter, safe_url
 from .store import Store
-from .generation import Ollama
+from .generation import generation_model, engine_generation
 from .retrieval import SourceError, public_url
 from .source_engine import SourceEngine
 from .auth import SupabaseAuth
 from .receiving import ReceivingError, TemporaryRelay
 from .signup import FormSignup
 from .subscriptions import Subscriptions
+from .post_chat import ChatInput, answer_post
+from .budgets import JobBudget
+from .source_identity import newsletter_identity
 
 
 def uid():
@@ -71,7 +74,11 @@ class Approval(BaseModel):
     rights: Literal["private", "public"] = "private"
 
 
-def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None, auth_provider=None, test_relay=None, receiving_poll=True):
+class EmailNewsletterInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None, auth_provider=None, test_relay=None, receiving_poll=True, processing_poll=True):
     store = Store(db_path or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3")))
     engine = SourceEngine(store, source_fetcher, generator, subscription_agent, illustrator)
     if subscription_agent is None and os.environ.get("NEWSLETTER_SIGNUP_MODE", "") in ("form", "browser"):
@@ -114,6 +121,14 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         while True:
             await asyncio.to_thread(receive_mail)
             await asyncio.sleep(30)
+
+    async def poll_pending_work():
+        while True:
+            with store.connect() as db:
+                pending = [row["id"] for row in db.execute("SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 20")]
+            for job_id in pending:
+                await asyncio.to_thread(process_job, job_id)
+            await asyncio.sleep(2)
 
     def process_job(job_id):
         with store.connect() as db:
@@ -159,14 +174,23 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             # posts and public permission gates; promote prior valid local drafts.
             for post in db.execute("SELECT id FROM posts WHERE status='review' AND rights='private'").fetchall():
                 engine.publish_ready(db, post["id"])
-            db.execute("UPDATE jobs SET status='queued' WHERE status='processing'")
-            pending = [r["id"] for r in db.execute("SELECT id FROM jobs WHERE status='queued'")]
+            db.execute("UPDATE jobs SET status='failed',error='Answer interrupted; ask again from the post' WHERE status='processing' AND kind='ask_ai'")
+            db.execute("UPDATE jobs SET status='queued' WHERE status='processing' AND kind!='ask_ai'")
+            db.execute("UPDATE generation_artifacts SET lease_until=0 WHERE status='processing'")
+            # Cheap offline imports can recover immediately; model/network work
+            # resumes in the worker so it cannot block API startup.
+            pending = [r["id"] for r in db.execute("SELECT id FROM jobs WHERE status='queued' AND kind='email' LIMIT 20")]
         for job_id in pending:
             process_job(job_id)
         poller = asyncio.create_task(poll_mail()) if relay and relay.reader and receiving_poll else None
+        worker = asyncio.create_task(poll_pending_work()) if processing_poll else None
         try:
             yield
         finally:
+            if worker:
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
             if poller:
                 poller.cancel()
                 with suppress(asyncio.CancelledError):
@@ -229,20 +253,27 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def post_json(db, row, user):
         source = db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
         analysis, visual = json.loads(row["analysis"]), json.loads(row["visual"])
+        if row["is_demo"] and not analysis.get("action"):
+            for sample, places in zip(DEMO_POSTS, DEMO_PLACES):
+                if sample["original_url"] == row["original_url"] and places:
+                    analysis["action"] = {"kind": "places", "data": places}
         tags = []
         if row["generation"] == "extractive":
             tags.append({"code": "original_analysis_pending", "label": "Original analysis pending", "detail": "Imported excerpt from the newsletter; original-source analysis is not complete."})
-        elif row["verification"] == "machine_checked":
+        elif row["verification"] in ("machine_checked", "source_preserved"):
             if visual.get("status") != "ready":
-                tags.append({"code": "image_pending", "label": "Image pending", "detail": visual.get("detail", "Source visual is still being prepared.")})
+                failed = visual.get("status") == "failed"
+                tags.append({"code": "image_failed" if failed else "image_pending", "label": "Image unavailable" if failed else "Image pending", "detail": visual.get("detail", "Source visual is still being prepared.")})
             if not analysis.get("provenance"):
                 tags.append({"code": "source_update_pending", "label": "Source update pending", "detail": "This earlier post has not yet been regenerated with original-source provenance."})
         return {
             **{k: row[k] for k in ("id", "title", "hook", "finding", "limitations", "original_url", "status", "rights", "generation", "published_date", "verification")},
-            "analysis": analysis, "visual": visual, "tags": tags,
+            "analysis": analysis, "visual": visual, "visuals": analysis.get("visuals", [visual] if visual.get("asset_id") else []),
+            "paper": analysis.get("source"), "content_action": analysis.get("action"), "tags": tags,
             "publication": analysis.get("publication", {}),
             "is_demo": bool(row["is_demo"]), "source": dict(source),
             "author": source["name"], "newsletter_name": source["name"], "newsletter_url": source["url"],
+            "discovered_via": [dict(item) for item in db.execute("SELECT s.id,s.name,s.url FROM post_sources ps JOIN sources s ON s.id=ps.source_id WHERE ps.post_id=? AND ps.user_id=? AND s.user_id=?", (row["id"], user["id"], user["id"]))],
             "evidence": json.loads(row["evidence"]),
             "bookmarked": bool(db.execute("SELECT 1 FROM bookmarks WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
             "read": bool(db.execute("SELECT 1 FROM reads WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
@@ -250,7 +281,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "mode": "local-prototype", "generation": "ollama", "email_import": True}
+        return {"status": "ok", "mode": "local-prototype", "generation": os.environ.get("GENERATION_PROVIDER", "meta"), "email_import": True}
 
     @app.get("/v1/auth/config")
     def auth_configuration():
@@ -259,7 +290,9 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @app.get("/v1/engine")
     def engine_status(user=Depends(current_user)):
-        return {**Ollama().status(), "signup_agent_configured": engine.subscription_agent is not None,
+        return {**generation_model().status(), "signup_agent_configured": engine.subscription_agent is not None,
+                "image_generation": {"provider": os.environ.get("IMAGE_GENERATION_PROVIDER", "meta"),
+                                     "model": "muse-image-1.0" if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "local-workflow"},
                 "receiving_alias_ready": bool(user["alias"]) and user.get("alias_status") == "active"}
 
     def validate_source_url(value):
@@ -271,18 +304,24 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     @app.post("/v1/newsletters", status_code=202)
     def add_newsletter(body: NewsletterInput, background: BackgroundTasks, user=Depends(current_user)):
         url = validate_source_url(body.url)
-        identity = "newsletter:" + hashlib.sha256(url.encode()).hexdigest()
+        identity = newsletter_identity(url)
         with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             source = db.execute("SELECT * FROM sources WHERE user_id=? AND sender=?", (user["id"], identity)).fetchone()
             if source:
                 existing = db.execute("SELECT id,status FROM jobs WHERE source_id=? AND kind='newsletter' ORDER BY created_at DESC LIMIT 1", (source["id"],)).fetchone()
-                return {"source_id": source["id"], "job_id": existing["id"] if existing else None,
-                        "status": source["subscription_status"], "duplicate": True, "post_generation": "automatic"}
-            source_id, job_id = uid(), uid()
-            db.execute("INSERT INTO sources(id,user_id,name,sender,url,signup_url,subscription_status) VALUES(?,?,?,?,?,?,'queued')",
+                result = {"source_id": source["id"], "job_id": existing["id"] if existing else None,
+                          "status": source["subscription_status"], "duplicate": True, "post_generation": "automatic"}
+            else:
+                source_id, job_id = uid(), uid()
+                db.execute("INSERT INTO sources(id,user_id,name,sender,url,signup_url,subscription_status) VALUES(?,?,?,?,?,?,'queued')",
                        (source_id, user["id"], urlsplit(url).hostname, identity, url, url))
-            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
                        (job_id, user["id"], source_id, identity, "Add newsletter by link", body.model_dump_json(), now()))
+        if source:
+            if source["subscription_status"] == "unsubscribed" and body.auto_subscribe:
+                return {**result, **subscribe_source(source["id"], background, user)}
+            return result
         background.add_task(process_job, job_id)
         return {"source_id": source_id, "job_id": job_id, "status": "queued", "duplicate": False, "post_generation": "automatic"}
 
@@ -294,6 +333,9 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone()
             if not source:
                 raise HTTPException(404, "Newsletter not found")
+            if source["source_kind"] == "email":
+                db.execute("UPDATE sources SET subscription_status='receiving',muted=0,subscription_detail='New email editions will create posts again' WHERE id=?",(source_id,))
+                return {"status":"receiving","source_id":source_id}
             if source["subscription_status"] in ("submitted", "confirmation_required", "email_received", "receiving", "submitting"):
                 raise HTTPException(409, "Signup was already submitted; check confirmation or incoming mail")
             url = validate_source_url(source["signup_url"] or source["url"])
@@ -308,7 +350,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             else:
                 db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'subscription')",
                            (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
-            db.execute("UPDATE sources SET subscription_status='queued',subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
+            db.execute("UPDATE sources SET subscription_status='queued',muted=0,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
         background.add_task(process_job, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
@@ -355,8 +397,21 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def regenerate_post(post_id: str, background: BackgroundTasks, user=Depends(current_user)):
         with store.connect() as db:
             post = get_post(db, user, post_id)
-            if post["rights"] != "private" or post["status"] == "rejected" or not post["generation"].startswith("ollama:"):
+            if post["rights"] != "private" or post["status"] == "rejected" or not (engine_generation(post["generation"]) or post['generation']=='source:preserved-email'):
                 raise HTTPException(409, "Only active private source-engine posts can be regenerated")
+            email_payload=None
+            if post['original_url'].startswith('email:'):
+                saved=db.execute('SELECT * FROM documents WHERE job_id=? AND user_id=? AND url=? ORDER BY created_at DESC LIMIT 1',(post['job_id'],user['id'],post['original_url'])).fetchone()
+                if not saved:raise HTTPException(409,'Original email content is unavailable')
+                metadata=json.loads(saved['metadata'])
+                email_payload={'fingerprint':post['original_url'].removeprefix('email:').split('#')[0],
+                               'subject':metadata.get('email_subject',saved['title']),'text':metadata.get('email_text',''),
+                               'sender':'','source_name':metadata.get('author',''),'links':metadata.get('_links',[]),
+                               'urls':[link['url'] for link in metadata.get('_links',[])],
+                               'image_urls':[figure['url'] for figure in metadata.get('_figures',[]) if figure.get('url')],
+                               'email_images_pending':metadata.get('email_images_pending',False),
+                               'replace_post_id':post_id,'target_url':post['original_url']}
+                if not email_payload['text']:raise HTTPException(409,'Original email text is unavailable')
             analysis = json.loads(post["analysis"])
             url = analysis.get("provenance", {}).get("newsletter_issue_url") or post["original_url"]
             identity = "regenerate:" + post_id
@@ -364,12 +419,13 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if existing and existing["status"] in ("queued", "processing"):
                 return {"job_id": existing["id"], "status": existing["status"], "duplicate": True}
             job_id = existing["id"] if existing else uid()
-            payload = json.dumps({"url": url, "mode": "article", "replace_post_id": post_id})
+            payload = json.dumps(email_payload or {"url": url, "mode": "article", "replace_post_id": post_id})
+            kind='received_email' if email_payload else 'generation'
             if existing:
-                db.execute("UPDATE jobs SET status='queued',stage='queued',payload=?,error=NULL,result='{}' WHERE id=?", (payload, job_id))
+                db.execute("UPDATE jobs SET status='queued',stage='queued',payload=?,kind=?,error=NULL,result='{}' WHERE id=?", (payload,kind,job_id))
             else:
-                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'generation')",
-                           (job_id, user["id"], post["source_id"], identity, "Regenerate from original source", payload, now()))
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,?)",
+                           (job_id, user["id"], post["source_id"], identity, "Regenerate from original source", payload, now(),kind))
         background.add_task(process_job, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
@@ -448,6 +504,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             auth.delete(user["id"])
         with store.connect() as db:
             db.execute("DELETE FROM users WHERE id=?", (user["id"],))
+            db.execute("DELETE FROM generation_artifacts WHERE scope=?", ("user:" + user["id"],))
 
     @app.post("/v1/dev/demo")
     def seed_demo(user=Depends(current_user)):
@@ -508,6 +565,57 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM sources WHERE user_id=? ORDER BY name", (user["id"],))]
 
+    @app.get("/v1/inbox/candidates")
+    def inbox_candidates(user=Depends(current_user)):
+        with store.connect() as db:
+            rows=db.execute("SELECT id,sender,sender_name,provider,subject,status FROM inbox_candidates WHERE user_id=? AND status IN ('pending','dismissed') ORDER BY updated_at DESC LIMIT 20",(user["id"],)).fetchall()
+            return [dict(row) for row in rows]
+
+    @app.post("/v1/inbox/candidates/{candidate_id}/dismiss", status_code=204)
+    def dismiss_email_candidate(candidate_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            if not db.execute("UPDATE inbox_candidates SET status='dismissed' WHERE id=? AND user_id=? AND status!='accepted'",(candidate_id,user["id"])).rowcount:
+                raise HTTPException(404,"Email suggestion not found")
+
+    @app.post("/v1/inbox/candidates/{candidate_id}/accept", status_code=202)
+    def accept_email_candidate(candidate_id: str, body: EmailNewsletterInput, background: BackgroundTasks, user=Depends(current_user)):
+        name=body.name.strip()
+        if not name or any(ord(char)<32 for char in name):
+            raise HTTPException(422,"Enter a newsletter name")
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            candidate=db.execute("SELECT * FROM inbox_candidates WHERE id=? AND user_id=?",(candidate_id,user["id"])).fetchone()
+            if not candidate:raise HTTPException(404,"Email suggestion not found")
+            source=db.execute("SELECT * FROM sources WHERE user_id=? AND email_sender=? AND email_topic=?",(user["id"],candidate["sender"],candidate['channel_key'])).fetchone()
+            if candidate["status"]=='accepted':
+                return {"source_id":source["id"] if source else None,"status":"already_added"}
+            parsed=json.loads(candidate["payload"])
+            source_id=source["id"] if source else uid()
+            if not source:
+                identity='email:'+hashlib.sha256((candidate['sender']+'|'+candidate['channel_key']).encode()).hexdigest()
+                db.execute("INSERT INTO sources(id,user_id,name,sender,subscription_status,subscription_detail,subscription_alias,expected_sender_domain,source_kind,email_sender,email_topic) VALUES(?,?,?,?,'receiving','Email newsletter connected by you',?,?,'email',?,?)",
+                           (source_id,user["id"],name,identity,user["alias"],candidate["sender"].rsplit('@',1)[-1],candidate['sender'],candidate['channel_key']))
+            else:
+                db.execute("UPDATE sources SET name=?,source_kind='email',subscription_status='receiving',subscription_detail='Email newsletter connected by you' WHERE id=?",(name,source_id))
+            fingerprint='received-email:'+parsed['fingerprint']
+            existing=db.execute("SELECT * FROM jobs WHERE user_id=? AND fingerprint=?",(user["id"],fingerprint)).fetchone()
+            job_id=existing['id'] if existing else uid()
+            if not existing:
+                db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'received_email')",(job_id,user["id"],source_id,fingerprint,parsed['subject'],json.dumps(parsed),now()))
+            elif existing['status'] in ('failed','cancelled'):
+                db.execute("UPDATE jobs SET source_id=?,status='queued',stage='queued',payload=?,error=NULL,result='{}' WHERE id=? AND user_id=?",(source_id,json.dumps(parsed),job_id,user['id']))
+            elif existing['status']=='processing':
+                raise HTTPException(409,'This edition is being processed; try again when it finishes')
+            else:
+                db.execute("UPDATE jobs SET source_id=? WHERE id=? AND user_id=?",(source_id,job_id,user['id']))
+                db.execute("UPDATE posts SET source_id=? WHERE job_id=? AND user_id=?",(source_id,job_id,user['id']))
+                db.execute("INSERT OR IGNORE INTO post_sources(post_id,source_id,user_id) SELECT id,?,user_id FROM posts WHERE job_id=? AND user_id=?",(source_id,job_id,user['id']))
+            db.execute("UPDATE inbox_candidates SET status='accepted',payload='{}' WHERE id=? AND user_id=?",(candidate_id,user["id"]))
+            if parsed.get('receiving_message_id'):
+                db.execute("UPDATE test_relay_receipts SET state='queued',job_id=? WHERE message_id=? AND user_id=?",(job_id,parsed['receiving_message_id'],user['id']))
+        background.add_task(process_job,job_id)
+        return {"source_id":source_id,"job_id":job_id,"status":"queued"}
+
     @app.patch("/v1/me/sources/{source_id}")
     def patch_source(source_id: str, body: SourcePatch, user=Depends(current_user)):
         with store.connect() as db:
@@ -539,6 +647,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             row = get_post(db, user, post_id)
             if body.rights == "public":
+                if row["original_url"].startswith("email:"):
+                    raise HTTPException(409, "Posts based on private email editions cannot be published publicly")
                 source = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()
                 if not source["signup_url"]:
                     raise HTTPException(422, "Set the publication signup URL before public approval")
@@ -562,14 +672,34 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 db.execute("UPDATE jobs SET status='completed' WHERE id=?", (row["job_id"],))
 
     @app.get("/v1/feed")
-    def feed(day: date | None = None, user=Depends(current_user)):
+    def feed(day: date | None = None, history: bool = False,
+             read_state: Literal['all','unread','read'] = 'all',
+             limit: int = Query(50,ge=1,le=100), before: str | None = Query(None,max_length=128),
+             user=Depends(current_user)):
         edition_date = day.isoformat() if day else local_day(user)
         with store.connect() as db:
-            rows = db.execute("""SELECT p.* FROM posts p JOIN sources s ON s.id=p.source_id
-                WHERE p.user_id=? AND p.status='approved' AND p.published_date=? AND s.muted=0
-                ORDER BY p.created_at DESC,p.id DESC""", (user["id"], edition_date)).fetchall()
+            conditions = ["p.user_id=?", "p.status='approved'", "p.published_date<=?" if history else "p.published_date=?"]
+            params = [user['id'],edition_date]
+            if read_state != 'read':
+                conditions.append("""(s.muted=0 OR EXISTS(
+                    SELECT 1 FROM post_sources ps JOIN sources other ON other.id=ps.source_id
+                    WHERE ps.post_id=p.id AND ps.user_id=p.user_id AND other.user_id=p.user_id AND other.muted=0))""")
+            read_clause = "EXISTS(SELECT 1 FROM reads r WHERE r.user_id=p.user_id AND r.post_id=p.id)"
+            if read_state != 'all':conditions.append(read_clause if read_state=='read' else 'NOT '+read_clause)
+            base_sql = ' FROM posts p JOIN sources s ON s.id=p.source_id WHERE '+' AND '.join(conditions)
+            totals=db.execute('SELECT COUNT(*),COALESCE(SUM(NOT '+read_clause+'),0)'+base_sql,params).fetchone()
+            page_sql=base_sql
+            page_params=list(params)
+            if before:
+                cursor=db.execute("SELECT published_date,created_at,id FROM posts WHERE id=? AND user_id=? AND status='approved'",(before,user['id'])).fetchone()
+                if not cursor:raise HTTPException(404,'Feed cursor not found')
+                page_sql+=' AND (p.published_date,p.created_at,p.id)<(?,?,?)'
+                page_params.extend(tuple(cursor))
+            rows=db.execute('SELECT p.*'+page_sql+' ORDER BY p.published_date DESC,p.created_at DESC,p.id DESC LIMIT ?',page_params+[limit+1]).fetchall()
+            next_cursor=rows[limit-1]['id'] if len(rows)>limit else None
+            rows=rows[:limit]
             posts = [post_json(db, row, user) for row in rows]
-        return {"date": edition_date, "posts": posts, "total": len(posts), "unread": sum(not p["read"] for p in posts), "finite": True}
+        return {"date": edition_date, "posts": posts, "total": totals[0], "unread": totals[1], "finite": True,'next_cursor':next_cursor}
 
     @app.get("/v1/bookmarks")
     def bookmarks(user=Depends(current_user)):
@@ -582,6 +712,16 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             return post_json(db, get_post(db, user, post_id), user)
 
+    @app.get("/v1/posts/{post_id}/source")
+    def post_source(post_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            post=get_post(db,user,post_id)
+            if not post['original_url'].startswith('email:'):raise HTTPException(404,'This post links to a public original source')
+            document=db.execute('SELECT title,metadata,spans FROM documents WHERE job_id=? AND user_id=? AND url=? ORDER BY created_at DESC LIMIT 1',(post['job_id'],user['id'],post['original_url'])).fetchone()
+            if not document:raise HTTPException(404,'Source email is unavailable')
+            metadata=json.loads(document['metadata'])
+            return {'title':metadata.get('email_subject',document['title']),'text':metadata.get('email_text') or '\n\n'.join(span['text'] for span in json.loads(document['spans'])),'author':metadata.get('author','')}
+
     @app.get("/v1/posts/{post_id}/image")
     def post_image(post_id: str, user=Depends(current_user)):
         with store.connect() as db:
@@ -591,11 +731,55 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 raise HTTPException(404, "Post has no ready visual")
             return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
+    @app.post("/v1/posts/{post_id}/chat")
+    def post_chat(post_id: str, body: ChatInput, user=Depends(current_user)):
+        from .retrieval import SourceError
+        job_id = uid()
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = dict(get_post(db, user, post_id))
+            # Permit one concurrent question and ten questions/minute per account.
+            recent = db.execute("SELECT status,created_at FROM jobs WHERE user_id=? AND kind='ask_ai' ORDER BY created_at DESC LIMIT 10", (user["id"],)).fetchall()
+            stamp = datetime.now(timezone.utc)
+            if any(item["status"] == "processing" and (stamp - datetime.fromisoformat(item["created_at"])).total_seconds() < 300 for item in recent) or (len(recent) == 10 and (stamp - datetime.fromisoformat(recent[-1]["created_at"])).total_seconds() < 60):
+                raise HTTPException(429, "Wait for your previous answer before asking again")
+            db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,created_at,kind) VALUES(?,?,?,?,?,'processing',?,'ask_ai')",
+                       (job_id, user["id"], row["source_id"], job_id, "Ask AI", now()))
+        try:
+            model = generation_model()
+            model.budget = JobBudget(store, job_id)
+            result = answer_post(row, body, model)
+            with store.connect() as db:
+                get_post(db, user, post_id)
+                db.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
+            return result
+        except SourceError as exc:
+            with store.connect() as db:
+                db.execute("UPDATE jobs SET status='failed',error=? WHERE id=?", (str(exc), job_id))
+            raise HTTPException(503, str(exc)) from None
+        finally:
+            with store.connect() as db:
+                db.execute("UPDATE jobs SET status='failed',error='Answer interrupted; please retry' WHERE id=? AND status='processing'", (job_id,))
+
+    @app.get("/v1/posts/{post_id}/images/{asset_id}")
+    def gallery_image(post_id: str, asset_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            post = get_post(db, user, post_id)
+            visuals = json.loads(post["analysis"]).get("visuals", [])
+            if not any(visual.get("asset_id") == asset_id for visual in visuals):
+                raise HTTPException(404, "Image not found")
+            asset = db.execute("SELECT image,content_type FROM gallery_assets WHERE id=? AND artifact_key=?", (asset_id, post["artifact_key"])).fetchone()
+            if not asset and json.loads(post["visual"]).get("asset_id") == asset_id:
+                asset = db.execute("SELECT image,content_type FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
+            if not asset:
+                raise HTTPException(404, "Image not found")
+            return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
     @app.post("/v1/posts/{post_id}/image/retry", status_code=202)
     def retry_visual(post_id: str, background: BackgroundTasks, user=Depends(current_user)):
         with store.connect() as db:
             post = get_post(db, user, post_id)
-            if post["status"] == "rejected" or not post["generation"].startswith("ollama:"):
+            if post["status"] == "rejected" or not engine_generation(post["generation"]):
                 raise HTTPException(409, "Visual generation is only available for active source-engine posts")
             visual = json.loads(post["visual"])
             if visual.get("kind") == "source" and visual.get("status") == "ready":
@@ -643,6 +827,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def share(post_id: str, request: Request, user=Depends(current_user)):
         with store.connect() as db:
             row = published_post(db, user, post_id)
+            if row['original_url'].startswith('email:'):raise HTTPException(409,'This original source is a private email, not a public link')
             signup = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()["signup_url"]
             if row["rights"] != "public" or not signup:
                 return {"url": row["original_url"], "mode": "original-source", "local_only": False}
