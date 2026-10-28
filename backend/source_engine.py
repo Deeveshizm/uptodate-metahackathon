@@ -174,6 +174,10 @@ class SourceEngine:
             self.process(generation_job_id)
 
     def save_document(self, job, document):
+        metadata = copy.deepcopy(document.metadata)
+        metadata['_links'] = document.links
+        metadata['_figures'] = [{key: value for key, value in figure.items() if not isinstance(value, bytes)}
+                                for figure in document.figures if not figure.get('image_data') and not figure.get('svg_data')]
         with self.store.connect() as db:
             # Retrying a failed job reuses source evidence instead of duplicating it.
             existing = db.execute("SELECT id FROM documents WHERE job_id=? AND url=? AND content_hash=?",
@@ -181,7 +185,20 @@ class SourceEngine:
             if not existing:
                 db.execute("INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?)",
                            (uuid.uuid4().hex, job["user_id"], job["id"], document.url, document.title,
-                            document.content_hash, json.dumps(document.spans), json.dumps(document.metadata), timestamp()))
+                            document.content_hash, json.dumps(document.spans), json.dumps(metadata), timestamp()))
+            else:
+                db.execute('UPDATE documents SET metadata=? WHERE id=?', (json.dumps(metadata), existing['id']))
+
+    def saved_visual_document(self, post, user_id):
+        with self.store.connect() as db:
+            saved = db.execute('SELECT * FROM documents WHERE job_id=? AND user_id=? AND url=? ORDER BY created_at DESC LIMIT 1',
+                               (post['job_id'], user_id, post['original_url'])).fetchone()
+        if not saved:
+            return None
+        metadata = json.loads(saved['metadata'])
+        metadata['source_content_hash'] = saved['content_hash']
+        return Document(saved['url'], saved['title'], json.loads(saved['spans']),
+                        metadata.get('_links', []), metadata, metadata.get('_figures', []))
 
     def original_document(self, job, document):
         urls = primary_source_urls(document)
@@ -227,20 +244,26 @@ class SourceEngine:
             raise SourceError("Post no longer exists")
         self.stage(job["id"], "fetching_source_visuals")
         if post["original_url"].startswith('email:'):
-            with self.store.connect() as db:
-                saved=db.execute('SELECT * FROM documents WHERE job_id=? AND user_id=? AND url=? ORDER BY created_at DESC LIMIT 1',(post['job_id'],job['user_id'],post['original_url'])).fetchone()
-            if not saved:raise SourceError('Original email content is unavailable')
-            metadata=json.loads(saved['metadata'])
-            document=Document(saved['url'],saved['title'],json.loads(saved['spans']),metadata.get('_links',[]),metadata,metadata.get('_figures',[]))
-            if metadata.get('email_images_pending'):raise SourceError('This email includes an embedded source image; attachment import is not available yet')
+            document = self.saved_visual_document(post, job['user_id'])
+            if not document:raise SourceError('Original email content is unavailable')
+            if document.metadata.get('email_images_pending'):raise SourceError('This email includes an embedded source image; attachment import is not available yet')
         else:
-            document = parse_document(self.fetcher.fetch(post["original_url"]))
+            try:
+                document = parse_document(self.fetcher.fetch(post["original_url"]))
+                self.save_document({'id': post['job_id'], 'user_id': job['user_id']}, document)
+            except SourceError:
+                document = self.saved_visual_document(post, job['user_id'])
+                if not document:
+                    raise
+                self.stage(job['id'], 'using_saved_source_visuals')
         draft = dict(post)
         draft["analysis"] = json.loads(post["analysis"])
         draft["evidence"] = json.loads(post["evidence"])
-        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=self.photo_lookup(job))
+        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=None if payload.get('source_only') else self.photo_lookup(job))
         if original_gallery:
             visual,image=original_gallery[0]
+        elif payload.get('source_only'):
+            raise SourceError('No usable source image could be retrieved; illustration was not requested')
         elif post["artifact_key"] and not self.custom_generator:
             with self.store.connect() as db:
                 parent = db.execute("SELECT content_hash,scope FROM generation_artifacts WHERE cache_key=?", (post["artifact_key"],)).fetchone()

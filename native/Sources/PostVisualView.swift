@@ -41,13 +41,9 @@ struct PostVisualView: View {
             }
             if post.gallery.indices.contains(selection) {
                 let visual = post.gallery[selection]
-                Text(visual.kind == "source" ? "SOURCE VISUAL" : "AI-GENERATED ILLUSTRATION")
-                    .font(.caption2.bold()).foregroundStyle(.secondary).padding(.horizontal, inset)
-                if let caption = visual.caption {
-                    Text(caption).font(.caption).foregroundStyle(.secondary).lineLimit(3).padding(.horizontal, inset)
-                }
-                if let attribution = visual.attribution {
-                    Text(attribution).font(.caption2).foregroundStyle(.secondary).lineLimit(2).padding(.horizontal, inset)
+                if visual.kind == "generated" {
+                    Text("AI illustration")
+                        .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, inset)
                 }
             }
         }
@@ -67,6 +63,7 @@ private struct VisualPage: View {
                 image.resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle()).onTapGesture { zooming = true }
                     .accessibilityLabel(visual.caption ?? "Post image")
+                    .accessibilityHint("Enlarge image and view credits")
                     .accessibilityAddTraits(.isButton).accessibilityAction { zooming = true }
             } else if !finished {
                 ProgressView("Loading source visual").frame(maxWidth: .infinity, minHeight: 180)
@@ -77,7 +74,7 @@ private struct VisualPage: View {
         }
         .task(id: visual.assetId) { finished = false; data = await model.visualData(post, visual: visual); finished = true }
         .sheet(isPresented: $zooming) {
-            if let data { VisualZoom(data: data, caption: visual.caption ?? "") }
+            if let data { VisualZoom(data: data, visual: visual) }
         }
     }
 }
@@ -95,11 +92,11 @@ private func platformImage(_ data: Data) -> Image? {
 private struct VisualZoom: View {
     @Environment(\.dismiss) private var dismiss
     let data: Data
-    let caption: String
+    let visual: PostVisual
     @State private var scale = 1.0
     var body: some View {
         VStack {
-            HStack { Text("Source / illustration").font(.headline); Spacer(); Button("Done") { dismiss() } }.padding()
+            HStack { Text(visual.kind == "generated" ? "AI illustration" : "Image").font(.headline); Spacer(); Button("Done") { dismiss() } }.padding()
             GeometryReader { geometry in
                 ScrollView([.horizontal, .vertical]) {
                     if let image = platformImage(data) {
@@ -107,7 +104,15 @@ private struct VisualZoom: View {
                     }
                 }
             }
-            ScrollView { Text(caption).font(.caption).padding(.horizontal) }.frame(maxHeight: 140)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let caption = visual.caption { Text(caption) }
+                    if let attribution = visual.attribution { Text(attribution).foregroundStyle(.secondary) }
+                    if let value = visual.sourceUrl, let url = URL(string: value), ["http", "https"].contains(url.scheme ?? "") {
+                        Link("Image source", destination: url)
+                    }
+                }.font(.caption).padding(.horizontal).frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(maxHeight: 140)
             Slider(value: $scale, in: 1...4).accessibilityLabel("Image zoom").padding()
         }.frame(minWidth: 320, minHeight: 450)
     }

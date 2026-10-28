@@ -2,7 +2,7 @@ import SwiftUI
 
 // Keep the provisional visual identity here so it is easy to replace later.
 enum FeedStyle {
-    static let wordmark = "UpToDate"
+    static let wordmark = "uptodate"
     static let feedWidth: CGFloat = 620
     static let gutter: CGFloat = 20
     static let ring = LinearGradient(colors: [.orange, .pink, .purple], startPoint: .bottomLeading, endPoint: .topTrailing)
@@ -170,13 +170,17 @@ struct FeedPostCard: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 14) {
                 VStack(alignment: .leading, spacing: 9) {
-                    Text(post.isDemo ? "SAMPLE EDITION" : "FROM YOUR NEWSLETTERS")
-                        .font(.system(size: 9, weight: .semibold)).tracking(1.5).foregroundStyle(.secondary)
-                    Text(post.title).font(.system(size: 24, weight: .semibold)).tracking(-0.7)
+                    HStack {
+                        Text(post.isDemo ? "Sample · \(post.source.name)" : post.source.name)
+                            .font(.caption.weight(.medium)).lineLimit(1)
+                        Spacer()
+                        Text(post.publishedDate ?? "Today").font(.caption2)
+                    }.foregroundStyle(.secondary)
+                    Text(post.title).font(.title2.weight(.semibold)).tracking(-0.4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
-            }.padding(.horizontal, 20).padding(.top, 10).padding(.bottom, 22)
+            }.padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 16)
 
             if !post.gallery.isEmpty {
                 PostVisualView(post: post, inset: 16)
@@ -195,39 +199,30 @@ struct FeedPostCard: View {
                 }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
             }
 
-            HStack(spacing: 20) {
-                Spacer()
-                Button { Task { await model.bookmark(post) } } label: {
-                    Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark").font(.system(size: 24, weight: .regular))
-                }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post").disabled(model.busy || model.offline)
-            }.buttonStyle(.plain).foregroundStyle(.primary).padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 11)
-
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: post.isDemo ? "circle.dotted" : "checkmark.seal").font(.system(size: 10))
-                    Text(post.isDemo ? "Seeded sample · not independently verified" : post.verification == "source_preserved" ? "Original newsletter content" : post.verification == "machine_checked" ? "Source linked · machine-checked" : "Imported newsletter excerpt").font(.system(size: 11, weight: .semibold))
-                }
                 ForEach(post.tags ?? []) { tag in
                     Label(tag.label, systemImage: "clock")
                         .font(.system(size: 10, weight: .medium)).foregroundStyle(.orange)
                         .padding(.horizontal, 8).padding(.vertical, 4)
                         .background(.orange.opacity(0.08), in: Capsule())
                 }
-                Group {
-                    Text(post.source.name).fontWeight(.semibold)
-                    + Text("  " + post.finding)
-                }.font(.system(size: 13)).lineSpacing(3).lineLimit(expanded ? nil : 2)
-                if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.system(size: 13)).lineSpacing(3) }
-                Button(expanded ? "Read less" : "Read more") { expanded.toggle() }.font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                Text(post.finding).font(.subheadline).lineSpacing(4).lineLimit(expanded ? nil : 4)
+                if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
                 HStack {
-                    Text(post.publishedDate ?? "Today").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Button(expanded ? "Read less" : "Read more") { expanded.toggle() }
                     Spacer()
-                    if post.read { Label("Read", systemImage: "checkmark").font(.system(size: 10)).foregroundStyle(.secondary) }
-                }
-                NavigationLink("Open full post") { PostDetail(post: post) }
-                    .font(.system(size: 12, weight: .medium)).accessibilityIdentifier("post.open")
-                PostContextActionView(post: post).padding(.top, 10).padding(.bottom, 8)
-            }.padding(.horizontal, 16)
+                    NavigationLink("View post") { PostDetail(post: post) }.accessibilityIdentifier("post.open")
+                }.font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                HStack {
+                    PostContextActionView(post: post)
+                    Spacer()
+                    Button { Task { await model.bookmark(post) } } label: {
+                        Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
+                            .font(.system(size: 20)).frame(width: 44, height: 44)
+                    }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post")
+                        .disabled(model.busy || model.offline)
+                }.buttonStyle(.plain).foregroundStyle(.primary).padding(.top, 2)
+            }.padding(.horizontal, 16).padding(.top, 12)
         }
     }
 }

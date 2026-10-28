@@ -25,7 +25,7 @@ struct AuthView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text(FeedStyle.wordmark).font(.system(size: 38, weight: .semibold, design: .serif).italic())
+                Text(FeedStyle.wordmark).font(.system(size: 38, weight: .semibold))
                 if model.authConfiguration?.mode == "local" {
                     Text("Local development mode").font(.title2)
                     Text("Start a prototype account to test imports and local generation. Verified accounts require Supabase configuration.")

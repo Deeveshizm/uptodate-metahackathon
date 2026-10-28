@@ -111,7 +111,7 @@ def source_metadata(soup, url):
     robots = soup.find("meta", attrs={"name": re.compile(r"^(?:robots|googlebot)$", re.I)})
     if robots and re.search(r"\bnoindex\b", robots.get("content", ""), re.I):
         result["private"] = True
-    abstract = soup.select_one('.ltx_abstract, section.abstract, blockquote.abstract, #abstract')
+    abstract = soup.select_one('.ltx_abstract, section.abstract, blockquote.abstract, div.abstract, #abstract, #Abs1, #enc-abstract')
     if abstract:
         text = normalize(abstract.get_text(" "))
         if abstract.name in ("h1", "h2", "h3", "h4"):
@@ -308,7 +308,7 @@ def parse_pdf(resource):
         from .visuals import pdf_figures
         figures, license_url = pdf_figures(resource)
         all_text = "\n".join(chunk[0] for chunk in chunks)
-        abstract = re.search(r"\bAbstract\s*[:.—-]?\s*(.{80,8000}?)(?=\n\s*(?:1[. ]+)?Introduction\b)", all_text, re.I | re.S)
+        abstract = re.search(r"\bAbstract\s*[:.—-]?\s*(.{80,8000}?)(?=\n\s*(?:(?:1|I)[.\s]+)?Introduction\b|\n\s*(?:Keywords|Index terms)\s*[:.—-])", all_text, re.I | re.S)
         return Document(resource.url, title[:250], spans,
                         metadata={"format": "pdf", "pages_available": len(reader.pages), "pages_examined": min(25, len(reader.pages)), "license_url": license_url,
                                   "abstract": normalize(abstract[1]) if abstract else "",

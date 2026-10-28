@@ -127,12 +127,17 @@ struct Post: Codable, Identifiable {
         return text
     }
     var isEmailSource: Bool { originalUrl.hasPrefix("email:") }
+    var isResearchPaper: Bool {
+        paper?.doi?.isEmpty == false || paper?.abstract?.isEmpty == false ||
+            ["arxiv.org", "www.arxiv.org"].contains(URL(string: originalUrl)?.host ?? "")
+    }
 }
 
 struct PaperSource: Codable {
     let url: String?
     let title: String?
     let abstract: String?
+    var doi: String? = nil
 }
 
 struct RecipeAction: Codable {

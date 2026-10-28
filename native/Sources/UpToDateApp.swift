@@ -53,7 +53,7 @@ struct RootView: View {
                             .accessibilityLabel("Open menu")
                         Spacer()
                         Button { selection = 0 } label: {
-                            Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold, design: .serif).italic())
+                            Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold))
                         }.buttonStyle(.plain).accessibilityLabel("Home")
                         Spacer()
                         if model.busy { ProgressView().controlSize(.small) }
@@ -308,6 +308,7 @@ struct PostDetail: View {
     let post: Post
     @State private var share: ShareResult?
     @State private var sourceEmail = false
+    @State private var abstractExpanded = true
 
     private var current: Post {
         model.feed?.posts.first(where: { $0.id == post.id }) ?? model.readFeed?.posts.first(where: { $0.id == post.id }) ?? model.bookmarks.first(where: { $0.id == post.id }) ?? post
@@ -316,9 +317,9 @@ struct PostDetail: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text(current.isDemo ? "SAMPLE EDITION · SUMMARIZED FROM A NEWSLETTER" : current.verification == "source_preserved" ? "ORIGINAL NEWSLETTER CONTENT" : current.verification == "machine_checked" ? "MACHINE-CHECKED SOURCE SUMMARY" : "IMPORTED NEWSLETTER EXCERPT").font(.caption).foregroundStyle(.secondary)
-                Text(current.title).font(.title.bold())
-                Text(current.hook).font(.title3)
+                if current.isDemo { Text("Sample edition").font(.caption).foregroundStyle(.secondary) }
+                Text(current.title).font(.title2.bold())
+                if !current.hook.isEmpty { Text(current.hook).font(.subheadline).foregroundStyle(.secondary) }
                 ForEach(current.tags ?? []) { tag in
                     Label(tag.label, systemImage: "clock").font(.caption).foregroundStyle(.orange)
                     if let detail = tag.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
@@ -327,15 +328,18 @@ struct PostDetail: View {
                 else if ["needs_image_generator", "failed"].contains(current.visual?.status ?? "") {
                     Button("Retry image") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
                 }
-                Text(current.finding).textSelection(.enabled)
+                Text(current.finding).lineSpacing(5).textSelection(.enabled)
                 ForEach(current.analysis?.sections ?? []) { section in
                     Text(section.heading).font(.headline)
                     Text(section.text).textSelection(.enabled)
                 }
                 if let abstract = current.paper?.abstract, !abstract.isEmpty {
-                    DisclosureGroup("Original abstract") {
+                    DisclosureGroup("Abstract", isExpanded: $abstractExpanded) {
                         Text(abstract).textSelection(.enabled).padding(.top, 8)
                     }.accessibilityIdentifier("post.abstract")
+                } else if current.isResearchPaper {
+                    Text("The abstract is unavailable. Open the paper to read it.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
                 Text("From \(current.source.name)").font(.caption)
@@ -346,10 +350,9 @@ struct PostDetail: View {
                 }
                 Divider()
                 HStack {
-                    Button(current.bookmarked ? "Unsave" : "Bookmark") { Task { await model.bookmark(current) } }
                     Button(current.read ? "Read ✓" : "Mark read") { Task { await model.markRead(current) } }.disabled(current.read).accessibilityIdentifier("post.markRead")
                     if !current.isEmailSource { Button("Share") { Task { share = await model.share(current) } } }
-                }.buttonStyle(.bordered).disabled(model.busy || model.offline)
+                }.buttonStyle(.borderless).font(.footnote).disabled(model.busy || model.offline)
                 DisclosureGroup("Evidence and provenance") {
                     ForEach(Array(current.evidence.enumerated()), id: \.offset) { _, evidence in
                         VStack(alignment: .leading, spacing: 8) {
@@ -358,7 +361,15 @@ struct PostDetail: View {
                         }.padding(.vertical, 8)
                     }
                 }
-                PostContextActionView(post: current)
+                HStack {
+                    PostContextActionView(post: current)
+                    Spacer()
+                    Button { Task { await model.bookmark(current) } } label: {
+                        Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
+                            .font(.system(size: 20)).frame(width: 44, height: 44)
+                    }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
+                        .disabled(model.busy || model.offline)
+                }.buttonStyle(.plain)
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 24)
                 .padding(.bottom, 80)
                 .frame(maxWidth: FeedStyle.feedWidth, alignment: .leading).frame(maxWidth: .infinity)

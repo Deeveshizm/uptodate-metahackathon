@@ -16,13 +16,15 @@ struct PostContextActionView: View {
     }
     var body: some View {
         Button { showing = true } label: {
-            Label(post.actionTitle, systemImage: symbol)
-                .font(.system(size: 13, weight: .semibold))
-                .padding(.horizontal, 16).padding(.vertical, 11)
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 42, height: 30)
                 .foregroundStyle(.primary)
                 .background(.primary.opacity(0.07), in: Capsule())
                 .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-        }.buttonStyle(.plain).accessibilityIdentifier("post.contextAction")
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
         .sheet(isPresented: $showing) {
             switch post.actionKind {
             case "ingredients": IngredientsSheet(post: post)

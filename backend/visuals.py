@@ -81,15 +81,14 @@ def html_figures(resource, document_license):
         if inline_svg:
             candidate["svg_data"] = str(image).encode()
         figures.append(candidate)
-    if not figures:
-        hero = soup.find("meta", attrs={"property": "og:image"})
-        kind = soup.find("meta", attrs={"property": "og:type"})
-        if hero and (main.name == "article" or (kind and kind.get("content") == "article")):
-            url = safe_url(urljoin(resource.url, hero.get("content", "")))
-            if url and not re.search(r"logo|avatar|tracking|pixel|favicon|wordmark|badge", url, re.I):
-                title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
-                figures.append({"id": "article-hero", "url": url, "caption": "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article"),
-                                "license_url": document_license, "page": None, "selection_basis": "article_hero_metadata", "caption_origin": "article_title"})
+    hero = soup.find("meta", attrs={"property": "og:image"})
+    kind = soup.find("meta", attrs={"property": "og:type"})
+    if hero and (main.name == "article" or (kind and kind.get("content") == "article")):
+        url = safe_url(urljoin(resource.url, hero.get("content", "")))
+        if url and url not in {figure['url'] for figure in figures} and not re.search(r"logo|avatar|tracking|pixel|favicon|wordmark|badge", url, re.I):
+            title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
+            figures.append({"id": "article-hero", "url": url, "caption": "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article"),
+                            "license_url": document_license, "page": None, "selection_basis": "article_hero_metadata", "caption_origin": "article_title"})
     return figures
 
 

@@ -78,6 +78,10 @@ class EmailNewsletterInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
+class VisualRetryInput(BaseModel):
+    source_only: bool = False
+
+
 def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None, auth_provider=None, test_relay=None, receiving_poll=True, processing_poll=True):
     store = Store(db_path or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3")))
     engine = SourceEngine(store, source_fetcher, generator, subscription_agent, illustrator)
@@ -253,6 +257,25 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def post_json(db, row, user):
         source = db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
         analysis, visual = json.loads(row["analysis"]), json.loads(row["visual"])
+        paper = analysis.get('source') or {}
+        if not paper.get('abstract') and (analysis.get('content_type') == 'paper' or
+                urlsplit(row['original_url']).hostname in ('arxiv.org', 'www.arxiv.org') or paper.get('doi')):
+            revision = paper.get('revision_hash')
+            if not revision and row['artifact_key']:
+                artifact = db.execute('SELECT content_hash FROM generation_artifacts WHERE cache_key=?', (row['artifact_key'],)).fetchone()
+                revision = artifact['content_hash'] if artifact else None
+            query = 'SELECT title,metadata,content_hash FROM documents WHERE user_id=? AND job_id=? AND url=?'
+            params = [user['id'], row['job_id'], row['original_url']]
+            if revision:
+                query += ' AND content_hash=?'
+                params.append(revision)
+            saved = db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
+            metadata = json.loads(saved['metadata']) if saved else {}
+            if metadata.get('abstract'):
+                paper = {'url': row['original_url'], 'title': saved['title'], 'authors': metadata.get('author', ''),
+                         'doi': metadata.get('doi', ''), **paper, 'abstract': metadata['abstract'],
+                         'revision_hash': saved['content_hash']}
+                analysis['source'] = paper
         if row["is_demo"] and not analysis.get("action"):
             for sample, places in zip(DEMO_POSTS, DEMO_PLACES):
                 if sample["original_url"] == row["original_url"] and places:
@@ -776,10 +799,10 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
     @app.post("/v1/posts/{post_id}/image/retry", status_code=202)
-    def retry_visual(post_id: str, background: BackgroundTasks, user=Depends(current_user)):
+    def retry_visual(post_id: str, background: BackgroundTasks, body: VisualRetryInput | None = None, user=Depends(current_user)):
         with store.connect() as db:
             post = get_post(db, user, post_id)
-            if post["status"] == "rejected" or not engine_generation(post["generation"]):
+            if post["status"] == "rejected" or not (engine_generation(post["generation"]) or post['generation']=='source:preserved-email'):
                 raise HTTPException(409, "Visual generation is only available for active source-engine posts")
             visual = json.loads(post["visual"])
             if visual.get("kind") == "source" and visual.get("status") == "ready":
@@ -790,7 +813,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             # A stable per-post visual job provides idempotent retries.
             existing = db.execute("SELECT id FROM jobs WHERE user_id=? AND fingerprint=?", (user["id"], "visual:" + post_id)).fetchone()
             job_id = existing["id"] if existing else uid()
-            payload = json.dumps({"post_id": post_id})
+            payload = json.dumps({"post_id": post_id, "source_only": bool(body and body.source_only)})
             if existing:
                 db.execute("UPDATE jobs SET status='queued',payload=?,error=NULL WHERE id=?", (payload, job_id))
             else:
