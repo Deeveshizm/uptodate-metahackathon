@@ -1,5 +1,7 @@
 .PHONY: api api-local api-comfy api-tailnet comfy browser-install test build-ios app smoke model engine-test
 
+API_URL ?= https://uptodate-api-spx7xuvzfq-uk.a.run.app
+
 COMFYUI_DIR ?= $(abspath ../ComfyUI)
 TAILNET_OLLAMA_HOST ?=
 TAILNET_OLLAMA_MODEL ?= llama3.1:8b
@@ -26,10 +28,10 @@ test:
 	.venv/bin/python -m pytest -q
 
 build-ios:
-	xcodebuild -quiet -project native/UpToDate.xcodeproj -scheme UpToDate -destination 'generic/platform=iOS Simulator' -derivedDataPath native/DerivedData CODE_SIGNING_ALLOWED=NO build
+	xcodebuild -quiet -project native/UpToDate.xcodeproj -scheme UpToDate -destination 'generic/platform=iOS Simulator' -derivedDataPath native/DerivedData CODE_SIGNING_ALLOWED=NO UPTODATE_API_URL="$(API_URL)" build
 
 app:
-	xcodebuild -quiet -project native/UpToDate.xcodeproj -scheme UpToDate -destination 'platform=macOS' -derivedDataPath native/DerivedData build
+	xcodebuild -quiet -project native/UpToDate.xcodeproj -scheme UpToDate -destination 'platform=macOS' -derivedDataPath native/DerivedData UPTODATE_API_URL="$(API_URL)" build
 	open native/DerivedData/Build/Products/Debug/UpToDate.app
 
 smoke:

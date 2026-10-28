@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -83,7 +83,16 @@ class VisualRetryInput(BaseModel):
 
 
 def create_app(db_path: str | None = None, source_fetcher=None, generator=None, subscription_agent=None, illustrator=None, auth_provider=None, test_relay=None, receiving_poll=True, processing_poll=True):
-    store = Store(db_path or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3")))
+    cloud = os.environ.get('UPTODATE_ENV') == 'cloud'
+    database = db_path or (os.environ.get('DATABASE_URL') if cloud else None) or os.environ.get("NEWSLETTER_DB", str(Path(__file__).resolve().parents[1] / "data/prototype.sqlite3"))
+    if cloud and (not database.startswith(('postgres://', 'postgresql://')) or os.environ.get('AUTH_MODE') != 'supabase'):
+        raise ValueError('Cloud deployment requires PostgreSQL and verified Supabase authentication')
+    store = Store(database)
+    dispatcher = None
+    if cloud:
+        from .cloud_tasks import CloudDispatcher
+        dispatcher = CloudDispatcher(store)
+        receiving_poll = processing_poll = False
     engine = SourceEngine(store, source_fetcher, generator, subscription_agent, illustrator)
     if subscription_agent is None and os.environ.get("NEWSLETTER_SIGNUP_MODE", "") in ("form", "browser"):
         from .browser_signup import BrowserSignup
@@ -118,7 +127,10 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             jobs = [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='received_email' AND status='queued'", (relay.owner_id,))]
             jobs += [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='newsletter' AND fingerprint LIKE 'relay-ready-signup:%' AND status='queued'", (relay.owner_id,))]
         for job_id in jobs:
-            process_job(job_id)
+            if not dispatcher:
+                process_job(job_id)
+        if dispatcher:
+            dispatcher.safe_dispatch()
         return result
 
     async def poll_mail():
@@ -172,6 +184,11 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @asynccontextmanager
     async def lifespan(app):
+        if cloud:
+            # Containers are disposable and can overlap. Never reset another
+            # worker's claims or start local polling on a cloud replica.
+            yield
+            return
         # One local process only. Recover interrupted jobs after restart.
         with store.connect() as db:
             # The user opted into an automatic PRIVATE feed. Preserve rejected
@@ -204,8 +221,60 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     app.state.store = store
     app.state.engine = engine
     app.state.test_relay = relay
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver", "[::1]"])
+    app.state.process_job = process_job
+    app.state.receive_mail = receive_mail
+    app.state.dispatcher = dispatcher
+    hosts = ['*.run.app'] if cloud else ["localhost", "127.0.0.1", "testserver", "[::1]"]
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     bearer = HTTPBearer(auto_error=False)
+
+    @app.exception_handler(SourceError)
+    async def unavailable_source(_request, exc):
+        return JSONResponse(status_code=503, content={'detail': str(exc)})
+
+    def schedule_job(background, job_id):
+        if dispatcher:
+            # The database trigger has already recorded delivery atomically.
+            # This call only wakes dispatch; the scheduler covers process loss.
+            background.add_task(dispatcher.safe_dispatch)
+        else:
+            background.add_task(process_job, job_id)
+
+    def worker_identity(request: Request):
+        if not cloud or os.environ.get('CLOUD_RUN_ROLE') != 'worker':
+            raise HTTPException(404, 'Not found')
+        from google.auth.transport.requests import Request as GoogleRequest
+        from google.oauth2 import id_token
+        value = request.headers.get('authorization', '')
+        if not value.startswith('Bearer '):
+            raise HTTPException(401, 'Worker authentication required')
+        try:
+            claims = id_token.verify_oauth2_token(value[7:], GoogleRequest(), audience=dispatcher.worker)
+            if claims.get('email') != dispatcher.identity or claims.get('email_verified') is not True:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(403, 'Worker identity is not authorized') from None
+
+    @app.post('/internal/jobs/{job_id}', dependencies=[Depends(worker_identity)])
+    def cloud_job(job_id: str):
+        return {'status': dispatcher.execute(job_id, process_job)}
+
+    @app.post('/internal/receiving', dependencies=[Depends(worker_identity)])
+    def cloud_receiving():
+        from .cloud_tasks import service_lease
+        with service_lease(store, 'receiving') as acquired:
+            if not acquired:
+                return {'status': 'already_running'}
+            receive_mail()
+        return {'status': 'checked'}
+
+    @app.post('/internal/maintenance', dependencies=[Depends(worker_identity)])
+    def cloud_maintenance():
+        dispatcher.recover()
+        dispatcher.safe_dispatch()
+        cloud_receiving()
+        engine.assets.collect()
+        return {'status': 'checked'}
 
     def remember_verified_user(profile):
         # Local content is keyed by verified UUID; the main email is never used
@@ -304,7 +373,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "mode": "local-prototype", "generation": os.environ.get("GENERATION_PROVIDER", "meta"), "email_import": True}
+        return {"status": "ok", "mode": "hosted" if cloud else "local-prototype", "generation": os.environ.get("GENERATION_PROVIDER", "meta"), "email_import": True}
 
     @app.get("/v1/auth/config")
     def auth_configuration():
@@ -345,7 +414,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if source["subscription_status"] == "unsubscribed" and body.auto_subscribe:
                 return {**result, **subscribe_source(source["id"], background, user)}
             return result
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"source_id": source_id, "job_id": job_id, "status": "queued", "duplicate": False, "post_generation": "automatic"}
 
     @app.post("/v1/me/sources/{source_id}/subscribe", status_code=202)
@@ -374,7 +443,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'subscription')",
                            (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
             db.execute("UPDATE sources SET subscription_status='queued',muted=0,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
     @app.post("/v1/me/sources/{source_id}/unsubscribe")
@@ -413,7 +482,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             job_id = uid()
             db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'generation')",
                        (job_id, user["id"], source_id, identity, "Generate from " + urlsplit(url).hostname, body.model_dump_json(), now()))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
     @app.post("/v1/posts/{post_id}/regenerate", status_code=202)
@@ -449,7 +518,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             else:
                 db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,?)",
                            (job_id, user["id"], post["source_id"], identity, "Regenerate from original source", payload, now(),kind))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
     @app.post("/v1/jobs/{job_id}/retry", status_code=202)
@@ -461,7 +530,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if job["status"] != "failed" or not job["payload"]:
                 raise HTTPException(409, "Only failed source jobs with a retained request can be retried")
             db.execute("UPDATE jobs SET status='queued',stage='queued',error=NULL WHERE id=?", (job_id,))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued"}
 
     @app.post("/v1/dev/accounts", status_code=201)
@@ -502,7 +571,10 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         require_test_relay(user)
         if not relay.reader:
             raise HTTPException(503, "Save RESEND_API_KEY in the ignored backend settings file")
-        background.add_task(receive_mail)
+        if dispatcher:
+            background.add_task(dispatcher.enqueue_receiving)
+        else:
+            background.add_task(receive_mail)
         return {"status": "queued"}
 
     @app.patch("/v1/me")
@@ -574,7 +646,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             job_id = uid()
             db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at) VALUES(?,?,?,?,?,'queued',?,?)",
                        (job_id, user["id"], source_id, parsed["fingerprint"], parsed["subject"], json.dumps(parsed), now()))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
     @app.get("/v1/jobs")
@@ -636,7 +708,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             db.execute("UPDATE inbox_candidates SET status='accepted',payload='{}' WHERE id=? AND user_id=?",(candidate_id,user["id"]))
             if parsed.get('receiving_message_id'):
                 db.execute("UPDATE test_relay_receipts SET state='queued',job_id=? WHERE message_id=? AND user_id=?",(job_id,parsed['receiving_message_id'],user['id']))
-        background.add_task(process_job,job_id)
+        schedule_job(background,job_id)
         return {"source_id":source_id,"job_id":job_id,"status":"queued"}
 
     @app.patch("/v1/me/sources/{source_id}")
@@ -710,7 +782,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             read_clause = "EXISTS(SELECT 1 FROM reads r WHERE r.user_id=p.user_id AND r.post_id=p.id)"
             if read_state != 'all':conditions.append(read_clause if read_state=='read' else 'NOT '+read_clause)
             base_sql = ' FROM posts p JOIN sources s ON s.id=p.source_id WHERE '+' AND '.join(conditions)
-            totals=db.execute('SELECT COUNT(*),COALESCE(SUM(NOT '+read_clause+'),0)'+base_sql,params).fetchone()
+            totals=db.execute('SELECT COUNT(*),COALESCE(SUM(CASE WHEN NOT '+read_clause+' THEN 1 ELSE 0 END),0)'+base_sql,params).fetchone()
             page_sql=base_sql
             page_params=list(params)
             if before:
@@ -749,10 +821,10 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def post_image(post_id: str, user=Depends(current_user)):
         with store.connect() as db:
             get_post(db, user, post_id)
-            asset = db.execute("SELECT image,content_type FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
+            asset = db.execute("SELECT * FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
             if not asset:
                 raise HTTPException(404, "Post has no ready visual")
-            return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+            return Response(engine.assets.read(asset), media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
     @app.post("/v1/posts/{post_id}/chat")
     def post_chat(post_id: str, body: ChatInput, user=Depends(current_user)):
@@ -791,12 +863,12 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             visuals = json.loads(post["analysis"]).get("visuals", [])
             if not any(visual.get("asset_id") == asset_id for visual in visuals):
                 raise HTTPException(404, "Image not found")
-            asset = db.execute("SELECT image,content_type FROM gallery_assets WHERE id=? AND artifact_key=?", (asset_id, post["artifact_key"])).fetchone()
+            asset = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (asset_id, post["artifact_key"])).fetchone()
             if not asset and json.loads(post["visual"]).get("asset_id") == asset_id:
-                asset = db.execute("SELECT image,content_type FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
+                asset = db.execute("SELECT * FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
             if not asset:
                 raise HTTPException(404, "Image not found")
-            return Response(asset["image"], media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+            return Response(engine.assets.read(asset), media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
     @app.post("/v1/posts/{post_id}/image/retry", status_code=202)
     def retry_visual(post_id: str, background: BackgroundTasks, body: VisualRetryInput | None = None, user=Depends(current_user)):
@@ -819,7 +891,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             else:
                 db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'visual')",
                            (job_id, user["id"], post["source_id"], "visual:" + post_id, "Prepare post visual", payload, now()))
-        background.add_task(process_job, job_id)
+        schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued"}
 
     def published_post(db, user, post_id):

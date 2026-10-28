@@ -21,6 +21,7 @@ from .email_content import email_documents, use_email_body
 from .email_adaptation import preserve_short_email
 from .retrieval import PublicFetcher, SourceError
 from .visuals import choose_visual, source_gallery
+from .assets import AssetStore
 
 
 def timestamp():
@@ -30,6 +31,7 @@ def timestamp():
 class SourceEngine:
     def __init__(self, store, fetcher=None, generator=None, subscription_agent=None, illustrator=None):
         self.store = store
+        self.assets = AssetStore(store)
         self.fetcher = fetcher or PublicFetcher()
         self.generator = generator or generate_post
         self.artifacts = Artifacts(store)
@@ -170,7 +172,7 @@ class SourceEngine:
             db.execute("UPDATE jobs SET status='completed',stage='completed',result=?,payload=NULL WHERE id=?",
                        (json.dumps({"subscription_status": status, "detail": detail, "content_discovery": content,
                                     "generation_job_id": generation_job_id}), job["id"]))
-        if generation_job_id:
+        if generation_job_id and os.environ.get('UPTODATE_ENV') != 'cloud':
             self.process(generation_job_id)
 
     def save_document(self, job, document):
@@ -281,16 +283,15 @@ class SourceEngine:
                     raise SourceError(visual["detail"])
                 visual["asset_id"] = hashlib.sha256((post["artifact_key"] + hashlib.sha256(image).hexdigest()).encode()).hexdigest()
                 with self.store.connect() as db:
-                    db.execute("INSERT OR IGNORE INTO gallery_assets(id,artifact_key,image,content_type) VALUES(?,?,?,'image/png')",
-                               (visual["asset_id"], post["artifact_key"], image))
+                    self.assets.save_gallery(db, visual["asset_id"], post["artifact_key"], image)
                 return visual
             image_variant = "muse-image-1.0-low-v1" if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "comfyui"
             _, visual, reused = self.artifacts.obtain(document, job["user_id"], "visual:" + image_variant + ":" + post["artifact_key"], produce_visual)
             with self.store.connect() as db:
-                stored = db.execute("SELECT image FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()
+                stored = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()
             if not stored:
                 raise SourceError("The visual is no longer available")
-            image = stored["image"]
+            image = self.assets.read(stored)
         else:
             visual, image = choose_visual(document, draft, self.fetcher, self.illustrator,
                                           stage=lambda value: self.stage(job["id"], value), budget=JobBudget(self.store, job["id"]),photo_search=self.photo_lookup(job))
@@ -298,10 +299,8 @@ class SourceEngine:
             if image:
                 visual.setdefault("asset_id", uuid.uuid4().hex)
                 if post["artifact_key"]:
-                    db.execute("INSERT OR IGNORE INTO gallery_assets(id,artifact_key,image,content_type) VALUES(?,?,?,'image/png')",
-                               (visual["asset_id"], post["artifact_key"], image))
-                db.execute("INSERT INTO post_assets VALUES(?,?,?,?) ON CONFLICT(post_id) DO UPDATE SET id=excluded.id,image=excluded.image,content_type=excluded.content_type",
-                           (hashlib.sha256((post["id"] + visual["asset_id"]).encode()).hexdigest(), post["id"], image, "image/png"))
+                    self.assets.save_gallery(db, visual["asset_id"], post["artifact_key"], image)
+                self.assets.save_post(db, hashlib.sha256((post["id"] + visual["asset_id"]).encode()).hexdigest(), post["id"], image)
                 draft["analysis"]["visuals"] = [visual]
             else:
                 visual["status"] = "failed"
@@ -443,11 +442,9 @@ class SourceEngine:
                         db.execute("UPDATE posts SET artifact_key=? WHERE id=?", (artifact_key, post_id))
                     db.execute("INSERT OR IGNORE INTO post_sources(post_id,source_id,user_id) VALUES(?,?,?)", (post_id, job["source_id"], job["user_id"]))
                     for metadata, data in gallery:
-                        db.execute("INSERT OR IGNORE INTO gallery_assets(id,artifact_key,image,content_type) VALUES(?,?,?,'image/png')",
-                                   (metadata["asset_id"], artifact_key, data))
+                        self.assets.save_gallery(db, metadata["asset_id"], artifact_key, data)
                     if image:
-                        db.execute("INSERT INTO post_assets VALUES(?,?,?,?) ON CONFLICT(post_id) DO UPDATE SET id=excluded.id,image=excluded.image,content_type=excluded.content_type",
-                                   (hashlib.sha256((post_id + visual["asset_id"]).encode()).hexdigest(), post_id, image, "image/png"))
+                        self.assets.save_post(db, hashlib.sha256((post_id + visual["asset_id"]).encode()).hexdigest(), post_id, image)
                     published = self.publish_ready(db, post_id)
                     if image is None and not payload.get("replace_post_id") and not self.custom_generator and not document.metadata.get('email_images_pending'):
                         fingerprint = "visual:" + post_id

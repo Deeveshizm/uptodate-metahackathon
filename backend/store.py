@@ -130,6 +130,12 @@ ADDITIONS = {
 
 
 class Store:
+    def __new__(cls, path: str):
+        if str(path).startswith(('postgres://', 'postgresql://')):
+            from .postgres_store import PostgresStore
+            return PostgresStore(path)
+        return super().__new__(cls)
+
     def __init__(self, path: str):
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!requirements-cloud.txt
+!backend/
+!backend/**
+**/__pycache__/
+**/*.pyc
+**/.env*

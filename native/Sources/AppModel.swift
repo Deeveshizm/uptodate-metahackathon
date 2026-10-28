@@ -33,6 +33,8 @@ final class AppModel: ObservableObject {
         if let value = ProcessInfo.processInfo.environment["UPTODATE_TEST_API_URL"],
            let url = URL(string: value), url.scheme == "http", url.host == "127.0.0.1" { return url }
         #endif
+        if let value = Bundle.main.object(forInfoDictionaryKey: "UpToDateAPIURL") as? String,
+           let url = BackendConfiguration.validatedURL(value) { return url }
         return URL(string: "http://127.0.0.1:8000")!
     }()
     private let decoder: JSONDecoder = {

@@ -1,13 +1,14 @@
 [project]
 name = "newsletter-prototype"
 version = "0.1.0"
-description = "Local newsletter-to-knowledge-feed prototype"
+description = "Newsletter-to-knowledge feed with hosted and local backends"
 requires-python = ">=3.11"
 dependencies = ["fastapi", "uvicorn", "python-multipart", "httpx", "beautifulsoup4", "pypdf", "pillow", "pymupdf"]
 
 [project.optional-dependencies]
 test = ["pytest", "httpx"]
 browser = ["playwright>=1.48"]
+cloud = ["psycopg[binary]>=3.2,<4", "google-cloud-tasks>=2.16,<3", "google-auth>=2.30,<3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
