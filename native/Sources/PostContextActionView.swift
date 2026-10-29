@@ -6,27 +6,68 @@ import UIKit
 
 struct PostContextActionView: View {
     let post: Post
+    var isFeed = false
     @State private var showing = false
-    @State private var sourceEmail = false
+    @State private var sharing = false
     private var sourceURL: URL? {
         guard !post.isEmailSource, let url = URL(string: post.originalUrl),
               ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
               url.host != nil, url.user == nil, url.password == nil else { return nil }
-        return url
+        return PostLinkAction(kind: "github", label: "Original repository", url: url.absoluteString).repositoryURL ?? url
     }
-    private var websites: [(place: PlaceAction, url: URL)] {
-        guard post.actionKind == "places" else { return [] }
-        return (post.contentAction?.places ?? []).compactMap { place in
-            guard let value = place.websiteUrl, let url = URL(string: value),
-                  ["https", "http"].contains(url.scheme ?? ""), url.host != nil,
-                  url.user == nil, url.password == nil else { return nil }
-            return (place, url)
+    private var sourceIsGitHub: Bool {
+        guard let url = sourceURL else { return false }
+        return PostLinkAction(kind: "github", label: "Repository", url: url.absoluteString).repositoryURL != nil
+    }
+    private var links: [PostLinkAction] {
+        var values = post.linkActions ?? []
+        if sourceIsGitHub, let url = sourceURL {
+            values.insert(PostLinkAction(kind: "github", label: "Original repository", url: url.absoluteString), at: 0)
+        }
+        for place in post.contentAction?.places ?? [] {
+            if let website = place.websiteUrl {
+                values.append(PostLinkAction(kind: "website", label: place.name, url: website))
+            }
+        }
+        return PostLinkAction.consolidated(values).filter { item in
+            guard let url = item.destination else { return false }
+            let key = url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if !sourceIsGitHub, item.kind != "map", key == sourceURL?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) { return false }
+            return true
         }
     }
-    private func pill(_ symbol: String) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 15, weight: .medium))
-            .frame(width: 42, height: 30)
+    private var locations: [PlaceAction] {
+        let extra = links.filter { $0.kind == "map" }.map {
+            PlaceAction(name: $0.name ?? $0.label, address: $0.address, sourceUrl: post.originalUrl,
+                        mapUrl: $0.url, identityKnown: $0.name != nil || $0.address != nil)
+        }
+        var urls = Set<String>(), addresses = Set<String>()
+        return ((post.contentAction?.places ?? []) + extra).filter { place in
+            let address = (place.address ?? "").lowercased()
+            if !address.isEmpty, addresses.contains(address) { return false }
+            if let url = place.mapUrl, urls.contains(url) { return false }
+            if !address.isEmpty { addresses.insert(address) }
+            if let url = place.mapUrl { urls.insert(url) }
+            return true
+        }
+    }
+    private var githubMark: Image {
+        #if SWIFT_PACKAGE
+        return Image("GitHubMark", bundle: .module)
+        #else
+        return Image("GitHubMark")
+        #endif
+    }
+    private func pill(_ symbol: String, gitHub: Bool = false) -> some View {
+        Group {
+            if gitHub {
+                githubMark.resizable().renderingMode(.template).scaledToFit()
+                    .frame(width: 14, height: 14)
+            } else {
+                Image(systemName: symbol).font(.system(size: 13, weight: .medium))
+            }
+        }
+            .frame(width: 34, height: 24)
             .foregroundStyle(.primary)
             .background(.primary.opacity(0.07), in: Capsule())
             .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
@@ -61,47 +102,47 @@ struct PostContextActionView: View {
         }
     }
     var body: some View {
-        HStack(spacing: 6) {
-            if websites.count == 1, let website = websites.first {
-                Link(destination: website.url) { pill("globe") }
-                    .accessibilityLabel("Visit \(website.place.name) website")
-                    .accessibilityIdentifier("post.website")
-            } else if websites.count > 1 {
-                Menu {
-                    ForEach(websites, id: \.place.id) { website in
-                        Link(website.place.name, destination: website.url)
-                    }
-                } label: { pill("globe") }
-                    .accessibilityLabel("Venue websites")
-                    .accessibilityIdentifier("post.website")
-            } else if post.actionKind != "places" {
-                if let url = sourceURL {
+        HStack(spacing: 2) {
+            if isFeed {
+                feedSourceControl
+                linkControl("phone")
+            } else {
+                if let url = sourceURL, !sourceIsGitHub {
                     Link(destination: url) { pill("link") }
                         .accessibilityLabel("Open original source")
                         .accessibilityIdentifier("post.sourceLink")
-                } else if post.isEmailSource {
-                    Button { sourceEmail = true } label: { pill("envelope") }
-                        .accessibilityLabel("Read source email")
-                        .accessibilityIdentifier("post.sourceEmail")
+                }
+                ForEach(["website", "github", "phone"], id: \.self) { kind in
+                    linkControl(kind)
+                }
+                if post.actionKind != "places", !locations.isEmpty {
+                    Menu { locationOptions } label: { pill("mappin.and.ellipse") }
+                        .menuOrder(.fixed).accessibilityLabel("Locations")
+                        .accessibilityIdentifier("post.locations")
                 }
             }
             if post.actionKind == "places" {
-                Menu {
-                    let places = post.contentAction?.places ?? []
-                    if places.count == 1, let place = places.first {
-                        Section(place.name) { mapOptions(for: place) }
-                    } else {
-                        ForEach(places) { place in
-                            Menu(place.name) { mapOptions(for: place) }
-                        }
-                    }
-                } label: { pill(symbol) }
+                Menu { locationOptions } label: { pill(symbol) }
                     .menuOrder(.fixed)
                     .accessibilityLabel("Open location in Maps")
                     .accessibilityIdentifier("post.contextAction")
-            } else {
+            } else if post.actionKind == "ingredients" {
                 Button { showing = true } label: { pill(symbol) }
                     .accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
+            } else {
+                Menu {
+                    Button { showing = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
+                        .accessibilityIdentifier("post.ai.biggie")
+                    #if os(iOS)
+                    Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                        .accessibilityIdentifier("post.ai.openIn")
+                    #else
+                    ShareLink(item: post.aiContext) { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                    #endif
+                } label: { pill(symbol) }
+                    .menuOrder(.fixed)
+                    .accessibilityLabel(post.actionTitle)
+                    .accessibilityIdentifier("post.contextAction")
             }
         }.buttonStyle(.plain)
         .sheet(isPresented: $showing) {
@@ -110,7 +151,61 @@ struct PostContextActionView: View {
             default: PostChatSheet(post: post)
             }
         }
-        .sheet(isPresented: $sourceEmail) { SourceEmailSheet(post: post) }
+        #if os(iOS)
+        .sheet(isPresented: $sharing) {
+            PostAIShareSheet(context: post.aiContext)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationCornerRadius(28)
+        }
+        #endif
+    }
+    @ViewBuilder private func linkControl(_ kind: String) -> some View {
+        let actions = links.filter { $0.kind == kind }
+        if actions.count == 1, let action = actions.first, let url = action.destination {
+            Link(destination: url) { pill(action.symbol, gitHub: action.isGitHub) }
+                .accessibilityLabel(action.label)
+                .accessibilityIdentifier("post.\(kind)")
+        } else if actions.count > 1, let first = actions.first {
+            Menu {
+                ForEach(actions) { action in
+                    if let url = action.destination { Link(action.label, destination: url) }
+                }
+            } label: { pill(first.symbol, gitHub: first.isGitHub) }
+                .accessibilityLabel(kind == "phone" ? "Phone numbers" : kind == "github" ? "GitHub repositories" : "Websites")
+                .accessibilityIdentifier("post.\(kind)")
+        }
+    }
+    @ViewBuilder private var feedSourceControl: some View {
+        if let url = sourceURL {
+            Link(destination: url) { pill("link", gitHub: sourceIsGitHub) }
+                .accessibilityLabel(post.isResearchPaper ? "Open paper" : "Open original source")
+                .accessibilityIdentifier("post.sourceLink")
+        } else {
+            let websites = links.filter { $0.kind == "website" }
+            if websites.count == 1, let action = websites.first, let url = action.destination {
+                Link(destination: url) { pill("globe") }
+                    .accessibilityLabel(action.label)
+                    .accessibilityIdentifier("post.website")
+            } else if websites.count > 1 {
+                Menu {
+                    ForEach(websites) { action in
+                        if let url = action.destination { Link(action.label, destination: url) }
+                    }
+                } label: { pill("globe") }
+                    .accessibilityLabel("Websites")
+                    .accessibilityIdentifier("post.website")
+            }
+        }
+    }
+    @ViewBuilder private var locationOptions: some View {
+        if locations.count == 1, let place = locations.first {
+            Section(place.name) { mapOptions(for: place) }
+        } else {
+            ForEach(locations) { place in
+                Menu(place.name) { mapOptions(for: place) }
+            }
+        }
     }
 }
 
@@ -195,59 +290,122 @@ private struct PostChatSheet: View {
     @State private var error: String?
     @State private var sharing = false
     @State private var task: Task<Void, Never>?
+    @FocusState private var questionFocused: Bool
+    #if os(iOS)
+    @State private var detent: PresentationDetent = .medium
+    #endif
+    private var canSend: Bool {
+        !sending && !model.offline && !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    private var sharedContext: String {
+        let draft = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        return draft.isEmpty ? post.aiContext : post.aiContext + "\n\nMy question: " + draft
+    }
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            Text(post.title).font(.headline)
-                            Text("Ask about the source material available for this post. Answers may be incomplete; check the original source.").font(.caption).foregroundStyle(.secondary)
-                            #if os(iOS)
-                            Button { sharing = true } label: { Label("Choose another AI app…", systemImage: "square.and.arrow.up") }
-                                .accessibilityIdentifier("post.chat.share")
-                            Text("The sharing sheet shows compatible installed apps. If your AI app is missing, copy the context there and paste it into that app.")
-                                .font(.caption).foregroundStyle(.secondary)
-                            #else
-                            ShareLink(item: post.aiContext) { Label("Share post context", systemImage: "square.and.arrow.up") }
-                            #endif
-                            Divider()
-                            Text("Ask in UpToDate").font(.subheadline.bold())
-                            ForEach(turns) { turn in
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(turn.role == "user" ? "You" : "UpToDate · Spark").font(.caption.bold()).foregroundStyle(.secondary)
-                                    Text(turn.text).textSelection(.enabled)
-                                }.frame(maxWidth: .infinity, alignment: .leading).id(turn.id)
-                            }
-                            if sending { ProgressView("Reading this post’s sources…") }
-                            if let error { Text(error).foregroundStyle(.red).font(.callout) }
-                            if !post.isEmailSource, let url = URL(string: post.originalUrl) { Link("Open original source", destination: url) }
-                        }.padding()
-                    }.onChange(of: turns.count) { _, _ in
-                        if let last = turns.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(turns) { turn in
+                            BiggieMessageBubble(turn: turn).id(turn.id)
+                        }
+                        if sending { BiggieThinkingBubble().id("replyStatus") }
+                        if let error { Text(error).foregroundStyle(.red).font(.callout).id("replyError") }
                     }
+                    .padding(.horizontal, 20).padding(.vertical, 16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Divider()
-                HStack(alignment: .bottom) {
-                    TextField("Ask about this post", text: $question, axis: .vertical).lineLimit(1...4)
-                        .textFieldStyle(.roundedBorder).accessibilityIdentifier("post.chat.question")
-                        .onChange(of: question) { _, value in if value.count > 1000 { question = String(value.prefix(1000)) } }
-                    Button { send() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                        .disabled(sending || model.offline || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .accessibilityLabel("Send question").accessibilityIdentifier("post.chat.send")
-                }.padding()
-            }.navigationTitle("Ask AI")
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-        }.frame(minWidth: 320, minHeight: 480)
-            .onDisappear { task?.cancel() }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: turns.count) { _, _ in
+                    if let last = turns.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                }
+                .onChange(of: sending) { _, value in
+                    if value { withAnimation { proxy.scrollTo("replyStatus", anchor: .bottom) } }
+                }
+                .onChange(of: error) { _, value in
+                    if value != nil { withAnimation { proxy.scrollTo("replyError", anchor: .bottom) } }
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+            .navigationTitle("Biggie")
             #if os(iOS)
-            .sheet(isPresented: $sharing) { PostAIShareSheet(context: post.aiContext) }
+            .navigationBarTitleDisplayMode(.inline)
             #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: { Image(systemName: "xmark").font(.subheadline.weight(.medium)) }
+                        .foregroundStyle(.secondary).accessibilityLabel("Close Ask AI")
+                }
+            }
+        }
+        .onDisappear { task?.cancel() }
+        #if os(iOS)
+        .presentationDetents([.medium, .large], selection: $detent)
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(28)
+        .onChange(of: questionFocused) { _, focused in
+            if focused { detent = .large }
+        }
+        .sheet(isPresented: $sharing) {
+            PostAIShareSheet(context: sharedContext)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationCornerRadius(28)
+        }
+        #else
+        .frame(minWidth: 360, minHeight: 420)
+        #endif
+    }
+
+    private var composer: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            Menu {
+                #if os(iOS)
+                Button {
+                    questionFocused = false
+                    sharing = true
+                } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                    .accessibilityIdentifier("post.chat.share")
+                #else
+                ShareLink(item: sharedContext) { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                #endif
+                Button { questionFocused = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
+                    .accessibilityIdentifier("post.chat.biggie")
+            } label: {
+                Image(systemName: "link").font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(.primary).frame(width: 44, height: 44)
+                    .background(.primary.opacity(0.07), in: Circle())
+                    .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+            }
+            .menuOrder(.fixed)
+            .accessibilityLabel("Post source and AI options")
+            .accessibilityIdentifier("post.chat.source")
+
+            TextField("Ask about this post", text: $question, axis: .vertical)
+                .lineLimit(1...3).textFieldStyle(.plain).focused($questionFocused)
+                .padding(.horizontal, 18).padding(.vertical, 12)
+                .frame(minHeight: 44)
+                .background(.primary.opacity(0.05), in: Capsule())
+                .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+                .accessibilityIdentifier("post.chat.question")
+                .onChange(of: question) { _, value in if value.count > 1000 { question = String(value.prefix(1000)) } }
+
+            Button { send() } label: {
+                Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white).frame(width: 44, height: 44)
+                    .background(Color.blue, in: Circle())
+            }
+            .opacity(canSend ? 1 : 0.45).disabled(!canSend)
+            .accessibilityLabel("Send to Biggie").accessibilityIdentifier("post.chat.send")
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 12)
+        .background(.background)
     }
 
     private func send() {
         let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
+        guard canSend else { return }
         let history = Array(turns.suffix(6))
         turns.append(PostChatTurn(role: "user", text: text)); question = ""; sending = true; error = nil
         task = Task {
@@ -268,11 +426,70 @@ private struct PostChatSheet: View {
     }
 }
 
+private struct BiggieMessageBubble: View {
+    let turn: PostChatTurn
+    private var outgoing: Bool { turn.role == "user" }
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 0) {
+            if outgoing { Spacer(minLength: 52) }
+            VStack(alignment: outgoing ? .trailing : .leading, spacing: 4) {
+                Text(turn.text)
+                    .font(.body).textSelection(.enabled)
+                    .padding(.horizontal, 16).padding(.vertical, 12)
+                    .foregroundStyle(outgoing ? Color.white : Color.primary)
+                    .background {
+                        UnevenRoundedRectangle(topLeadingRadius: 20,
+                                               bottomLeadingRadius: outgoing ? 20 : 5,
+                                               bottomTrailingRadius: outgoing ? 5 : 20,
+                                               topTrailingRadius: 20)
+                            .fill(outgoing ? Color(red: 0.02, green: 0.36, blue: 0.82) : Color.gray.opacity(0.22))
+                    }
+                    .accessibilityLabel((outgoing ? "You: " : "Biggie: ") + turn.text)
+                Text(outgoing ? "you" : "Biggie")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .accessibilityHidden(true)
+            }
+            if !outgoing { Spacer(minLength: 52) }
+        }
+        .frame(maxWidth: .infinity, alignment: outgoing ? .trailing : .leading)
+    }
+}
+
+private struct BiggieThinkingBubble: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { timeline in
+            HStack(spacing: 5) {
+                ForEach(0..<3) { index in
+                    let phase = (timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2 - Double(index) * 0.15 + 1).truncatingRemainder(dividingBy: 1)
+                    let bounce = reduceMotion ? 0 : max(0, sin(phase * 2 * .pi))
+                    Circle().fill(Color.secondary).frame(width: 7, height: 7)
+                        .offset(y: -5 * bounce)
+                }
+            }
+            .padding(.horizontal, 17).padding(.vertical, 18)
+            .background(Color.gray.opacity(0.22), in: UnevenRoundedRectangle(topLeadingRadius: 20,
+                        bottomLeadingRadius: 5, bottomTrailingRadius: 20, topTrailingRadius: 20))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Biggie is thinking")
+        .accessibilityIdentifier("post.chat.thinking")
+    }
+}
+
 #if os(iOS)
 private struct PostAIShareSheet: UIViewControllerRepresentable {
     let context: String
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [self.context], applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: [self.context], applicationActivities: nil)
+        controller.excludedActivityTypes = [.postToFacebook, .postToTwitter, .postToWeibo, .message, .mail,
+                                          .print, .assignToContact, .saveToCameraRoll, .addToReadingList,
+                                          .postToFlickr, .postToVimeo, .postToTencentWeibo, .airDrop]
+        return controller
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

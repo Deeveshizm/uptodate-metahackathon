@@ -326,6 +326,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def post_json(db, row, user):
         source = db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
         analysis, visual = json.loads(row["analysis"]), json.loads(row["visual"])
+        saved = None
         paper = analysis.get('source') or {}
         if not paper.get('abstract') and (analysis.get('content_type') == 'paper' or
                 urlsplit(row['original_url']).hostname in ('arxiv.org', 'www.arxiv.org') or paper.get('doi')):
@@ -333,7 +334,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if not revision and row['artifact_key']:
                 artifact = db.execute('SELECT content_hash FROM generation_artifacts WHERE cache_key=?', (row['artifact_key'],)).fetchone()
                 revision = artifact['content_hash'] if artifact else None
-            query = 'SELECT title,metadata,content_hash FROM documents WHERE user_id=? AND job_id=? AND url=?'
+            query = 'SELECT url,title,metadata,content_hash,spans FROM documents WHERE user_id=? AND job_id=? AND url=?'
             params = [user['id'], row['job_id'], row['original_url']]
             if revision:
                 query += ' AND content_hash=?'
@@ -359,15 +360,36 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if not analysis.get("provenance"):
                 tags.append({"code": "source_update_pending", "label": "Source update pending", "detail": "This earlier post has not yet been regenerated with original-source provenance."})
         visible={k: row[k] for k in ("id", "title", "hook", "finding", "limitations", "original_url", "status", "rights", "generation", "published_date", "verification")}
-        if (analysis.get('action') or {}).get('kind')=='places':
-            from .locations import place_prose
-            for key in ('hook','finding','limitations'):visible[key]=place_prose(visible[key])
-            if isinstance(analysis.get('summary'),str):analysis['summary']=place_prose(analysis['summary'])
-            analysis['sections']=[{**section,'text':place_prose(section['text'])} for section in analysis.get('sections',[])]
+        from .post_actions import action_prose, source_actions
+        links = analysis.get('link_actions')
+        if links is None:
+            if saved is None:
+                query = 'SELECT url,title,metadata,content_hash,spans FROM documents WHERE user_id=? AND job_id=? AND url=?'
+                params = [user['id'], row['job_id'], row['original_url']]
+                revision = paper.get('revision_hash')
+                if revision:
+                    query += ' AND content_hash=?'
+                    params.append(revision)
+                saved = db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
+            document = None
+            if saved:
+                from .documents import Document
+                metadata = json.loads(saved['metadata'])
+                document = Document(saved['url'], saved['title'], json.loads(saved['spans']), metadata.get('_links', []), metadata)
+            links = source_actions(document, analysis, [visible[key] for key in ('hook', 'finding', 'limitations')])
+        analysis['link_actions'] = links
+        for key in ('title', 'hook', 'finding', 'limitations'):
+            visible[key] = action_prose(visible[key], links)
+        visible['title'] = visible['title'] or 'Update from ' + source['name']
+        for key in ('summary', 'problem', 'approach', 'finding', 'impact', 'limitations'):
+            if isinstance(analysis.get(key), str):
+                analysis[key] = action_prose(analysis[key], links)
+        analysis['sections'] = [{**section, 'text': action_prose(section['text'], links)} for section in analysis.get('sections', [])]
         return {
             **visible,
             "analysis": analysis, "visual": visual, "visuals": analysis.get("visuals", [visual] if visual.get("asset_id") else []),
             "paper": analysis.get("source"), "content_action": analysis.get("action"), "tags": tags,
+            "link_actions": links,
             "publication": analysis.get("publication", {}),
             "is_demo": bool(row["is_demo"]), "source": dict(source),
             "author": source["name"], "newsletter_name": source["name"], "newsletter_url": source["url"],

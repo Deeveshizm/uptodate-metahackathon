@@ -94,6 +94,7 @@ struct Post: Codable, Identifiable {
     var visuals: [PostVisual]? = nil
     var paper: PaperSource? = nil
     var contentAction: ContentAction? = nil
+    var linkActions: [PostLinkAction]? = nil
 
     var gallery: [PostVisual] {
         var seen = Set<String>()
@@ -130,6 +131,62 @@ struct Post: Codable, Identifiable {
     var isResearchPaper: Bool {
         paper?.doi?.isEmpty == false || paper?.abstract?.isEmpty == false ||
             ["arxiv.org", "www.arxiv.org"].contains(URL(string: originalUrl)?.host ?? "")
+    }
+}
+
+struct PostLinkAction: Codable, Identifiable {
+    let kind: String
+    let label: String
+    let url: String
+    var name: String? = nil
+    var address: String? = nil
+    var id: String { kind + ":" + url }
+    var destination: URL? {
+        if kind == "phone" {
+            guard url.range(of: #"^tel:\+?[0-9]{7,15}$"#, options: .regularExpression) != nil else { return nil }
+            return URL(string: url)
+        }
+        guard ["website", "github", "map"].contains(kind), let value = URL(string: url),
+              ["https", "http"].contains(value.scheme?.lowercased() ?? ""), value.host != nil,
+              value.user == nil, value.password == nil else { return nil }
+        return value
+    }
+    var symbol: String {
+        switch kind {
+        case "phone": "phone"
+        case "github": "chevron.left.forwardslash.chevron.right"
+        case "map": "mappin.and.ellipse"
+        default: "globe"
+        }
+    }
+    var isGitHub: Bool {
+        ["website", "github"].contains(kind) && ["github.com", "www.github.com"].contains(destination?.host?.lowercased() ?? "")
+    }
+    var repositoryURL: URL? {
+        guard isGitHub, let destination else { return nil }
+        let parts = destination.path.split(separator: "/").map(String.init)
+        guard parts.count >= 2,
+              !["features", "topics", "settings", "orgs", "users", "login", "signup", "search", "explore", "sponsors", "marketplace"].contains(parts[0].lowercased()) else { return nil }
+        let repo = parts[1].lowercased().hasSuffix(".git") ? String(parts[1].dropLast(4)) : parts[1]
+        guard !repo.isEmpty else { return nil }
+        var components = URLComponents(string: "https://github.com")!
+        components.path = "/" + parts[0] + "/" + repo
+        return components.url
+    }
+    private var groupingKey: String {
+        if let repositoryURL { return "github:" + repositoryURL.absoluteString.lowercased() }
+        return kind + ":" + (destination?.absoluteString ?? url).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+    static func consolidated(_ actions: [PostLinkAction]) -> [PostLinkAction] {
+        var seen = Set<String>()
+        return actions.compactMap { action in
+            guard action.destination != nil, seen.insert(action.groupingKey).inserted else { return nil }
+            if action.isGitHub {
+                guard let root = action.repositoryURL else { return nil }
+                return PostLinkAction(kind: "github", label: String(root.path.dropFirst()), url: root.absoluteString)
+            }
+            return action
+        }
     }
 }
 

@@ -152,6 +152,8 @@ struct RootView: View {
 struct FeedView: View {
     @EnvironmentObject private var model: AppModel
     @State private var sourceFilter: String?
+    @State private var selectedPost: Post?
+    @State private var showingPost = false
     private var needsNewsletterPrompt: Bool {
         (model.readFeed?.total ?? 0) == 0 && (model.feed?.posts ?? []).allSatisfy { $0.isDemo }
     }
@@ -195,7 +197,10 @@ struct FeedView: View {
                 }
                 LazyVStack(spacing: 0) {
                     ForEach(Array((model.feed?.posts ?? []).filter { sourceFilter == nil || $0.source.id == sourceFilter }.enumerated()), id: \.element.id) { index, post in
-                        FeedPostCard(post: post, index: index)
+                        FeedPostCard(post: post, index: index) {
+                            selectedPost = post
+                            showingPost = true
+                        }
                         Divider().padding(.top, 14)
                     }
                 }
@@ -216,6 +221,9 @@ struct FeedView: View {
         #endif
         .toolbar(.hidden)
         .refreshable { await model.refresh() }
+        .navigationDestination(isPresented: $showingPost) {
+            if let selectedPost { PostDetail(post: selectedPost) }
+        }
     }
 }
 
@@ -307,7 +315,6 @@ struct PostDetail: View {
     @EnvironmentObject private var model: AppModel
     let post: Post
     @State private var share: ShareResult?
-    @State private var sourceEmail = false
     @State private var abstractExpanded = true
 
     private var current: Post {
@@ -324,11 +331,13 @@ struct PostDetail: View {
                     Label(tag.label, systemImage: "clock").font(.caption).foregroundStyle(.orange)
                     if let detail = tag.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
                 }
-                if !current.gallery.isEmpty { PostVisualView(post: current) }
-                else if ["needs_image_generator", "failed"].contains(current.visual?.status ?? "") {
-                    Button("Retry image") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
+                VStack(alignment: .leading, spacing: 6) {
+                    if !current.gallery.isEmpty { PostVisualView(post: current) }
+                    else if ["needs_image_generator", "failed"].contains(current.visual?.status ?? "") {
+                        Button("Retry image") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
+                    }
+                    Text(current.finding).lineSpacing(5).textSelection(.enabled)
                 }
-                Text(current.finding).lineSpacing(5).textSelection(.enabled)
                 ForEach(current.analysis?.sections ?? []) { section in
                     Text(section.heading).font(.headline)
                     Text(section.text).textSelection(.enabled)
@@ -343,11 +352,6 @@ struct PostDetail: View {
                 }
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
                 Text("From \(current.source.name)").font(.caption)
-                if current.isEmailSource {
-                    Button("Read source email") { sourceEmail = true }.accessibilityIdentifier("post.sourceEmail")
-                } else if let url = URL(string: current.originalUrl) {
-                    Link("Open original source", destination: url)
-                }
                 Divider()
                 HStack {
                     Button(current.read ? "Read ✓" : "Mark read") { Task { await model.markRead(current) } }.disabled(current.read).accessibilityIdentifier("post.markRead")
@@ -360,13 +364,25 @@ struct PostDetail: View {
                             Text(evidence.quote).textSelection(.enabled)
                         }.padding(.vertical, 8)
                     }
+                    ForEach(Array(current.gallery.enumerated()), id: \.offset) { index, visual in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Image \(index + 1)").font(.caption.bold())
+                            if let attribution = visual.attribution, !attribution.isEmpty {
+                                Text(attribution).font(.caption).foregroundStyle(.secondary)
+                            }
+                            if let value = visual.sourceUrl, let url = URL(string: value),
+                               ["http", "https"].contains(url.scheme ?? ""), url.user == nil, url.password == nil {
+                                Link("Image source", destination: url).font(.caption)
+                            }
+                        }.padding(.vertical, 8)
+                    }
                 }
                 HStack {
                     PostContextActionView(post: current)
                     Spacer()
                     Button { Task { await model.bookmark(current) } } label: {
                         Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
-                            .font(.system(size: 20)).frame(width: 44, height: 44)
+                            .font(.system(size: 16)).frame(width: 44, height: 44)
                     }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
                         .disabled(model.busy || model.offline)
                 }.buttonStyle(.plain)
@@ -376,7 +392,6 @@ struct PostDetail: View {
         }
         .background(.background)
         .navigationTitle("Post")
-        .sheet(isPresented: $sourceEmail) { SourceEmailSheet(post: current) }
         .sheet(item: $share) { result in
             VStack(alignment: .leading, spacing: 18) {
                 Text(result.mode == "public-preview" ? "Share preview" : "Share original source").font(.title2.bold())

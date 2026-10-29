@@ -164,6 +164,7 @@ struct FeedPostCard: View {
     @EnvironmentObject private var model: AppModel
     let post: Post
     let index: Int
+    let openPost: () -> Void
     @State private var expanded = false
 
     var body: some View {
@@ -181,11 +182,14 @@ struct FeedPostCard: View {
                 }
                 Spacer()
             }.padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 16)
+                .contentShape(Rectangle()).onTapGesture(perform: openPost)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Open full post")
 
             if !post.gallery.isEmpty {
-                PostVisualView(post: post, inset: 16)
+                PostVisualView(post: post, inset: 16, onSelect: openPost)
             } else if ["machine_checked", "source_preserved"].contains(post.verification ?? "") {
-                NavigationLink { PostDetail(post: post) } label: {
+                Button(action: openPost) {
                     VStack(spacing: 12) {
                         Image(systemName: "photo").font(.system(size: 34, weight: .light))
                         Text(post.visual?.status == "failed" ? "Image unavailable" : "Image is being prepared").font(.callout)
@@ -194,35 +198,52 @@ struct FeedPostCard: View {
                         .background(.secondary.opacity(0.05))
                 }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
             } else {
-                NavigationLink { PostDetail(post: post) } label: {
+                Button(action: openPost) {
                     EditorialCover(post: post, index: index)
                 }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(post.tags ?? []) { tag in
-                    Label(tag.label, systemImage: "clock")
-                        .font(.system(size: 10, weight: .medium)).foregroundStyle(.orange)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(.orange.opacity(0.08), in: Capsule())
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(post.tags ?? []) { tag in
+                        Label(tag.label, systemImage: "clock")
+                            .font(.system(size: 10, weight: .medium)).foregroundStyle(.orange)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(.orange.opacity(0.08), in: Capsule())
+                    }
+                    Text(post.finding).font(.subheadline).lineSpacing(4).lineLimit(expanded ? nil : 4)
+                    if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
                 }
-                Text(post.finding).font(.subheadline).lineSpacing(4).lineLimit(expanded ? nil : 4)
-                if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle()).onTapGesture(perform: openPost)
+                .accessibilityAction(named: "Open full post", openPost)
                 HStack {
-                    Button(expanded ? "Read less" : "Read more") { expanded.toggle() }
                     Spacer()
-                    NavigationLink("View post") { PostDetail(post: post) }.accessibilityIdentifier("post.open")
-                }.font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                    } label: {
+                        Text(expanded ? "Read less" : "Read more")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6).padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityIdentifier("post.readMore")
+                }
                 HStack {
-                    PostContextActionView(post: post)
+                    PostContextActionView(post: post, isFeed: true)
                     Spacer()
                     Button { Task { await model.bookmark(post) } } label: {
                         Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
-                            .font(.system(size: 20)).frame(width: 44, height: 44)
+                            .font(.system(size: 16)).frame(width: 44, height: 44)
                     }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post")
                         .disabled(model.busy || model.offline)
                 }.buttonStyle(.plain).foregroundStyle(.primary).padding(.top, 2)
-            }.padding(.horizontal, 16).padding(.top, 12)
+            }.padding(.horizontal, 16).padding(.top, 6)
+        }
+        .background {
+            // Catch blank areas without giving controls a parent tap gesture.
+            Color.clear.contentShape(Rectangle()).onTapGesture(perform: openPost)
+                .accessibilityHidden(true)
         }
     }
 }

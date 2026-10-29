@@ -391,6 +391,8 @@ class SourceEngine:
                     return self.generator(document,model=configured,stage=lambda stage:self.stage(job['id'],stage))
                 artifact_key, cached, reused = self.artifacts.obtain(document, job["user_id"], variant,produce_draft)
                 draft = copy.deepcopy(cached)
+                from .post_actions import source_actions
+                draft['analysis']['link_actions'] = source_actions(document, draft['analysis'])
                 draft["analysis"]["cache"] = {"reused": reused, "new_inference_cost_usd": 0 if reused else draft["analysis"].get("usage", {}).get("estimated_cost_usd", 0)}
                 draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] == "received_email" else root.url, "secondary_url": secondary.url,
                                                     "original_url": document.url, "content_author": document.metadata.get("author", "")}

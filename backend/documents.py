@@ -161,6 +161,8 @@ def source_metadata(soup, url):
                 address = ", ".join(str(address[k]) for k in ("streetAddress", "addressLocality", "addressRegion", "postalCode") if address.get(k))
             if isinstance(address, str) and address.strip() and isinstance(obj.get("name"), str):
                 result.setdefault("places", []).append({"name": normalize(obj["name"])[:200], "address": normalize(address)[:500], "source_url": url})
+            if isinstance(obj.get('telephone'), str):
+                result.setdefault('contact_links', []).append({'url': 'tel:' + obj['telephone'], 'context': ''})
     return result
 
 
@@ -196,6 +198,11 @@ def parse_document(resource: Resource) -> Document:
         "format": "html",
         **source_metadata(soup, resource.url),
     }
+    metadata.setdefault('contact_links', []).extend([
+        {'url': anchor['href'], 'context': normalize((anchor.find_parent(['p', 'li']) or anchor).get_text(' ', strip=True))[:500]}
+        for anchor in soup.find_all('a', href=re.compile(r'^tel:', re.I), limit=30)
+        if not anchor.find_parent(['footer', 'nav', 'aside'])
+    ])
     if urlsplit(resource.url).hostname in ("arxiv.org", "www.arxiv.org"):
         paper = re.fullmatch(r"/(?:abs|html)/(\d{4}\.\d{4,5})(?:v\d+)?/?", urlsplit(resource.url).path)
         if paper:
