@@ -102,6 +102,36 @@ struct PublisherSignupSheet: View {
     }
 }
 
+struct PublisherUnsubscribeSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let source: NewsletterSource
+    let url: URL
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                #if os(iOS)
+                PublisherBrowser(url: url, onDone: { dismiss() })
+                #else
+                Link("Open unsubscribe page", destination: url)
+                Spacer()
+                #endif
+                Text("Complete the publisher's unsubscribe steps, then confirm below.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+                Button("I've unsubscribed") {
+                    Task { if await model.confirmUnsubscribe(source) { dismiss() } }
+                }
+                .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                .disabled(model.busy || model.offline)
+                .accessibilityIdentifier("newsletter.confirmUnsubscribe")
+                .padding(.bottom, 12)
+            }
+            .navigationTitle("Unsubscribe")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+        }
+    }
+}
+
 #if os(iOS)
 private struct PublisherBrowser: UIViewControllerRepresentable {
     let url: URL

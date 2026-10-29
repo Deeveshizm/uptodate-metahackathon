@@ -30,80 +30,36 @@ struct RootView: View {
     @EnvironmentObject private var model: AppModel
     @State private var importing = false
     @State private var selection = 0
+    @State private var navigationMinimized = false
+    @State private var scrollTracker = NavigationScrollTracker()
 
     var body: some View {
         Group {
             if model.account == nil {
                 AuthView()
             } else {
-                VStack(spacing: 0) {
-                    HStack(spacing: 18) {
-                        Menu {
-                            // Mirrors the bottom navigation bar, in the same order.
-                            Section {
-                                Button("Home", systemImage: "house") { selection = 0 }
-                                Button("Saved", systemImage: "bookmark") { selection = 1 }
-                                Button("Manage", systemImage: "newspaper") { selection = 2 }
-                                Button("Read", systemImage: "checkmark.circle") { selection = 4 }
-                            }
-                            Section {
-                                Button("Profile", systemImage: "person.crop.circle") { selection = 3 }
-                            }
-                        } label: { Image(systemName: "line.3.horizontal").font(.system(size: 25, weight: .regular)).frame(width: 36, height: 36) }
-                            .accessibilityLabel("Open menu")
-                        Spacer()
-                        Button { selection = 0 } label: {
-                            Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold))
-                        }.buttonStyle(.plain).accessibilityLabel("Home")
-                        Spacer()
-                        if model.busy { ProgressView().controlSize(.small) }
-                        Button { selection = 3 } label: {
-                            SourceAvatar(name: "Your profile", size: 34, symbol: "person")
-                                .overlay(alignment: .topTrailing) {
-                                    if !model.review.isEmpty { Circle().fill(.pink).frame(width: 7, height: 7).offset(x: 4, y: -3) }
-                                }
-                        }.accessibilityLabel("Open your profile")
-                    }.padding(.horizontal, 18).padding(.vertical, 10).foregroundStyle(.primary)
-                    Divider()
-                    if model.offline {
-                        HStack {
-                            Image(systemName: "wifi.slash")
-                            Text("Cached edition · backend unavailable")
-                            Spacer()
-                            Button("Retry") { Task { await model.refresh() } }
-                        }.font(.caption).padding(10).background(.orange.opacity(0.1))
+                Group {
+                    switch selection {
+                    case 1: NavigationStack { LibraryView() }
+                    case 2: NavigationStack { ManageView(importEmail: { importing = true }) }
+                    case 3: NavigationStack { SourcesView() }
+                    case 4: NavigationStack { ReadPostsView() }
+                    default: NavigationStack { FeedView() }
                     }
-                    if let notice = model.notice {
-                        HStack {
-                            Text(notice).font(.caption)
-                            Spacer()
-                            Button { model.notice = nil } label: { Image(systemName: "xmark") }
-                                .accessibilityLabel("Dismiss notice")
-                        }.padding(10).background(.secondary.opacity(0.08))
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                .environment(\.appScrollHeader, AnyView(scrollHeader))
+                .environment(\.navigationScrollHandler, { offset in
+                    if let minimized = scrollTracker.update(offset), minimized != navigationMinimized {
+                        navigationMinimized = minimized
                     }
-                    Group {
-                        switch selection {
-                        case 1: NavigationStack { LibraryView() }
-                        case 2: NavigationStack { ManageView(importEmail: { importing = true }) }
-                        case 3: NavigationStack { SourcesView() }
-                        case 4: NavigationStack { ReadPostsView() }
-                        default: NavigationStack { FeedView() }
-                        }
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                })
+                .overlay(alignment: .bottom) {
+                    FloatingBottomNavigation(selection: $selection, minimized: navigationMinimized)
+                        .padding(.bottom, 8)
                 }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    VStack(spacing: 0) {
-                        Divider()
-                        HStack {
-                            tab("house", selected: "house.fill", label: "Home", index: 0)
-                            Spacer()
-                            tab("bookmark", selected: "bookmark.fill", label: "Saved", index: 1)
-                            Spacer()
-                            tab("newspaper", selected: "newspaper.fill", label: "Manage", index: 2)
-                            Spacer()
-                            tab("person.crop.circle", selected: "person.crop.circle.fill", label: "Profile", index: 3)
-                        }.padding(.horizontal, 34).padding(.top, 12).padding(.bottom, 8)
-                    }.background(.background)
+                .onChange(of: selection) { _, _ in
+                    scrollTracker.reset()
+                    navigationMinimized = false
                 }
             }
         }
@@ -138,14 +94,53 @@ struct RootView: View {
         }
     }
 
-    private func tab(_ symbol: String, selected: String, label: String, index: Int) -> some View {
-        Button { selection = index } label: {
-            VStack(spacing: 5) {
-                Image(systemName: selection == index ? selected : symbol).font(.system(size: 23, weight: .regular))
-                Text(label).font(.system(size: 9, weight: selection == index ? .semibold : .regular))
-            }.frame(width: 48, height: 40).foregroundStyle(.primary)
-        }.buttonStyle(.plain).accessibilityLabel(label)
-            .accessibilityAddTraits(selection == index ? .isSelected : [])
+    private var scrollHeader: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 18) {
+                Menu {
+                    // Mirrors the bottom navigation bar, in the same order.
+                    Section {
+                        Button("Home", systemImage: "house") { selection = 0 }
+                        Button("Saved", systemImage: "bookmark") { selection = 1 }
+                        Button("Manage", systemImage: "newspaper") { selection = 2 }
+                        Button("Read", systemImage: "checkmark.circle") { selection = 4 }
+                    }
+                    Section {
+                        Button("Profile", systemImage: "person.crop.circle") { selection = 3 }
+                    }
+                } label: { Image(systemName: "line.3.horizontal").font(.system(size: 25, weight: .regular)).frame(width: 36, height: 36) }
+                    .accessibilityLabel("Open menu")
+                Spacer()
+                Button { selection = 0 } label: {
+                    Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold))
+                }.buttonStyle(.plain).accessibilityLabel("Home")
+                Spacer()
+                if model.busy { ProgressView().controlSize(.small) }
+                Button { selection = 3 } label: {
+                    SourceAvatar(name: "Your profile", size: 34, symbol: "person")
+                        .overlay(alignment: .topTrailing) {
+                            if !model.review.isEmpty { Circle().fill(.pink).frame(width: 7, height: 7).offset(x: 4, y: -3) }
+                        }
+                }.accessibilityLabel("Open your profile")
+            }.padding(.horizontal, 18).padding(.vertical, 10).foregroundStyle(.primary)
+            Divider()
+            if model.offline {
+                HStack {
+                    Image(systemName: "wifi.slash")
+                    Text("Cached edition · backend unavailable")
+                    Spacer()
+                    Button("Retry") { Task { await model.refresh() } }
+                }.font(.caption).padding(10).background(.orange.opacity(0.1))
+            }
+            if let notice = model.notice {
+                HStack {
+                    Text(notice).font(.caption)
+                    Spacer()
+                    Button { model.notice = nil } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Dismiss notice")
+                }.padding(10).background(.secondary.opacity(0.08))
+            }
+        }.frame(maxWidth: FeedStyle.feedWidth).frame(maxWidth: .infinity)
     }
 }
 
@@ -162,7 +157,7 @@ struct FeedView: View {
         return model.sources.contains { !demoSourceIDs.contains($0.id) }
     }
     var body: some View {
-        ScrollView {
+        AppScrollView {
             VStack(spacing: 0) {
                 HStack {
                     Menu {
@@ -322,7 +317,7 @@ struct PostDetail: View {
     }
 
     var body: some View {
-        ScrollView {
+        AppScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 if current.isDemo { Text("Sample edition").font(.caption).foregroundStyle(.secondary) }
                 Text(current.title).font(.title2.bold())
@@ -353,39 +348,33 @@ struct PostDetail: View {
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
                 Text("From \(current.source.name)").font(.caption)
                 Divider()
-                HStack {
-                    Button(current.read ? "Read ✓" : "Mark read") { Task { await model.markRead(current) } }.disabled(current.read).accessibilityIdentifier("post.markRead")
-                    if !current.isEmailSource { Button("Share") { Task { share = await model.share(current) } } }
-                }.buttonStyle(.borderless).font(.footnote).disabled(model.busy || model.offline)
-                DisclosureGroup("Evidence and provenance") {
-                    ForEach(Array(current.evidence.enumerated()), id: \.offset) { _, evidence in
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(evidence.source).font(.caption.bold())
-                            Text(evidence.quote).textSelection(.enabled)
-                        }.padding(.vertical, 8)
-                    }
-                    ForEach(Array(current.gallery.enumerated()), id: \.offset) { index, visual in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Image \(index + 1)").font(.caption.bold())
-                            if let attribution = visual.attribution, !attribution.isEmpty {
-                                Text(attribution).font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 2) {
+                        Button { Task { await model.markRead(current) } } label: {
+                            Image(systemName: current.read ? "checkmark.circle.fill" : "checkmark")
+                                .modifier(PostActionPill())
+                        }
+                        .disabled(current.read)
+                        .accessibilityLabel(current.read ? "Marked as read" : "Mark as read")
+                        .accessibilityIdentifier("post.markRead")
+                        if !current.isEmailSource {
+                            Button { Task { share = await model.share(current) } } label: {
+                                Image(systemName: "square.and.arrow.up").modifier(PostActionPill())
                             }
-                            if let value = visual.sourceUrl, let url = URL(string: value),
-                               ["http", "https"].contains(url.scheme ?? ""), url.user == nil, url.password == nil {
-                                Link("Image source", destination: url).font(.caption)
-                            }
-                        }.padding(.vertical, 8)
-                    }
+                            .accessibilityLabel("Share original source")
+                            .accessibilityIdentifier("post.share")
+                        }
+                    }.buttonStyle(.plain).disabled(model.busy || model.offline)
+                    HStack {
+                        PostContextActionView(post: current)
+                        Spacer()
+                        Button { Task { await model.bookmark(current) } } label: {
+                            Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
+                                .font(.system(size: 16)).frame(width: 44, height: 44)
+                        }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
+                            .disabled(model.busy || model.offline)
+                    }.buttonStyle(.plain)
                 }
-                HStack {
-                    PostContextActionView(post: current)
-                    Spacer()
-                    Button { Task { await model.bookmark(current) } } label: {
-                        Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
-                            .font(.system(size: 16)).frame(width: 44, height: 44)
-                    }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
-                        .disabled(model.busy || model.offline)
-                }.buttonStyle(.plain)
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 24)
                 .padding(.bottom, 80)
                 .frame(maxWidth: FeedStyle.feedWidth, alignment: .leading).frame(maxWidth: .infinity)
@@ -411,33 +400,123 @@ struct PostDetail: View {
 struct ManageView: View {
     @EnvironmentObject private var model: AppModel
     @State private var addingLink = false
+    @State private var pendingUnsubscribe: NewsletterSource?
+    @State private var confirmingUnsubscribe = false
+    @State private var handoff: NewsletterUnsubscribeHandoff?
+    @State private var options: NewsletterSource?
     var importEmail: () -> Void
 
+    private var subscribed: [NewsletterSource] { model.sources.filter { !$0.isUnsubscribed } }
+    private var newsletters: [NewsletterSource] { subscribed.filter { !$0.isCustom } }
+    private var custom: [NewsletterSource] { subscribed.filter { $0.isCustom } }
+    private var unsubscribed: [NewsletterSource] { model.sources.filter { $0.isUnsubscribed } }
+
     var body: some View {
-        PageScroll {
-            PageHeader(title: "Your newsletters", trailing: "\(model.sources.count) sources")
-            InfoRow("Manage your subscriptions and choose which newsletters appear in your feed.")
-            ActionRow(title: "Add newsletter", disabled: model.busy || model.offline) { addingLink = true }
-            RowDivider()
-            ActionRow(title: "Import newsletter .eml", disabled: model.busy || model.offline) { importEmail() }
-            if !model.inboxCandidates.isEmpty {
-                SectionHeader("Detected email newsletters")
-                ForEach(model.inboxCandidates) { candidate in EmailNewsletterPrompt(candidate: candidate) }
-            }
-            SectionHeader("Newsletters")
-            if model.sources.isEmpty {
-                InfoRow("Add a newsletter link or import an email to get started.")
-            } else {
-                ForEach(model.sources) { source in
-                    SourceEditor(source: source)
-                    RowDivider()
+        AppSourceList {
+            VStack(spacing: 0) {
+                PageHeader(title: "Your newsletters", trailing: "\(subscribed.count) subscribed")
+                HStack(alignment: .top, spacing: 28) {
+                    topAction("Add newsletter", symbol: "plus") { addingLink = true }
+                    topAction("Import .eml", symbol: "square.and.arrow.down", action: importEmail)
+                }.frame(maxWidth: .infinity).padding(.vertical, 18)
+                ForEach(model.inboxCandidates.filter { $0.status == "pending" }) { candidate in
+                    EmailNewsletterPrompt(candidate: candidate)
                 }
+            }.listRowInsets(EdgeInsets()).listRowSeparator(.hidden).listRowBackground(Color.clear)
+
+            Section {
+                subsection("Newsletters")
+                if newsletters.isEmpty { emptyRow("No newsletter subscriptions yet.") }
+                ForEach(newsletters) { source in subscriptionRow(source) }
+                subsection("Custom")
+                if custom.isEmpty { emptyRow("Muse, Claude, and personal newsletters appear here.") }
+                ForEach(custom) { source in subscriptionRow(source) }
+            } header: { Text("Subscribed").font(.headline) }
+
+            Section {
+                if unsubscribed.isEmpty { emptyRow("No unsubscribed newsletters.") }
+                ForEach(unsubscribed) { source in
+                    HStack {
+                        Text(source.displayName).font(.body)
+                        Spacer()
+                        Button("Resubscribe") { Task { await model.retrySubscription(source) } }
+                            .font(.caption.weight(.medium)).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                            .disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
+                            .accessibilityIdentifier("newsletter.resubscribe")
+                    }.listRowBackground(Color.clear)
+                }
+            } header: { Text("Unsubscribed").font(.headline) }
+              footer: { Text("Available to resubscribe for 30 days. Existing posts are kept.").font(.caption) }
+        }
+        .toolbar(.hidden).refreshable { await model.refresh() }
+        .sheet(isPresented: $addingLink) { SourceLinkView() }
+        .sheet(item: $handoff) { value in PublisherUnsubscribeSheet(source: value.source, url: value.url) }
+        .sheet(item: $options) { source in
+            NavigationStack {
+                ScrollView { SourceEditor(source: model.sources.first { $0.id == source.id } ?? source) }
+                    .navigationTitle(source.displayName)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { options = nil } } }
             }
         }
-        .toolbar(.hidden)
-        .refreshable { await model.refresh() }
-        .sheet(isPresented: $addingLink) { SourceLinkView() }
+        .confirmationDialog("Unsubscribe from \(pendingUnsubscribe?.displayName ?? "this newsletter")?",
+                            isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
+            Button("Unsubscribe", role: .destructive) {
+                guard let source = pendingUnsubscribe else { return }
+                Task {
+                    if let url = await model.unsubscribe(source) { handoff = NewsletterUnsubscribeHandoff(source: source, url: url) }
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(pendingUnsubscribe?.isCustom == true
+                 ? "Stop creating posts from these emails. Disable the sending task in Muse, Claude, or the sending app to stop delivery. Existing posts are kept."
+                 : "Stop new posts and unsubscribe at the publisher. A confirmation page will open if needed. Existing posts are kept.")
+        }
     }
+
+    private func topAction(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: symbol).font(.system(size: 23, weight: .medium))
+                    .frame(width: 60, height: 60)
+                    .background(.primary.opacity(0.07), in: Circle())
+                    .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+                Text(title).font(.system(size: 12, weight: .medium))
+            }.frame(width: 112).foregroundStyle(.primary)
+        }.buttonStyle(.plain).disabled(model.busy || model.offline)
+    }
+    private func subsection(_ title: String) -> some View {
+        Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            .listRowSeparator(.hidden).listRowBackground(Color.clear)
+    }
+    private func emptyRow(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+            .listRowSeparator(.hidden).listRowBackground(Color.clear)
+    }
+    private func askToUnsubscribe(_ source: NewsletterSource) {
+        pendingUnsubscribe = source
+        confirmingUnsubscribe = true
+    }
+    private func subscriptionRow(_ source: NewsletterSource) -> some View {
+        Toggle(source.displayName, isOn: Binding(get: { source.muted == 0 }, set: { shown in
+            Task { await model.updateSource(source, muted: !shown) }
+        }))
+        .toggleStyle(.switch).disabled(model.busy || model.offline)
+        .accessibilityHint("Show or hide this newsletter in Home. Swipe left to unsubscribe.")
+        .accessibilityAction(named: "Unsubscribe") { askToUnsubscribe(source) }
+        .listRowBackground(Color.clear)
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button { askToUnsubscribe(source) } label: { Label("Unsubscribe", systemImage: "minus.circle") }
+                .tint(.red).disabled(model.busy || model.offline)
+        }
+        .contextMenu { Button("Subscription options") { options = source } }
+    }
+}
+
+struct NewsletterUnsubscribeHandoff: Identifiable {
+    let source: NewsletterSource
+    let url: URL
+    var id: String { source.id }
 }
 
 struct SourceLinkView: View {
@@ -445,7 +524,7 @@ struct SourceLinkView: View {
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         NavigationStack {
-            PageScroll {
+            PageScroll(showsHeader: false) {
                 SectionHeader("Newsletter link")
                 NewsletterLinkForm(onAdded: { dismiss() })
                     .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 16)
@@ -559,7 +638,7 @@ struct SourceEditor: View {
     @Environment(\.openURL) private var openURL
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(source.name).font(.system(size: 17, weight: .semibold)).tracking(-0.3)
+            Text(source.displayName).font(.system(size: 17, weight: .semibold)).tracking(-0.3)
             if let status = source.subscriptionStatus, status != "not_requested" {
                 Text(source.subscriptionTitle).font(.system(size: 11)).foregroundStyle(.secondary)
                 if let detail = source.subscriptionDetail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary) }
@@ -569,7 +648,7 @@ struct SourceEditor: View {
                     Task { await model.updateSource(source, muted: !shown) }
                 })).font(.system(size: 15)).disabled(model.busy || model.offline)
             }
-            if source.sourceKind != "email" {
+            if !source.isCustom {
             VStack(alignment: .leading, spacing: 7) {
                 TextField("Publication signup URL", text: $signup)
                     .textFieldStyle(.plain).font(.system(size: 14))
@@ -587,7 +666,7 @@ struct SourceEditor: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if ["manual_action", "failed", "needs_agent", "needs_inbox", "unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") {
-                if source.sourceKind != "email", !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
+                if !source.isCustom, !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
                     Button("Finish signup on publisher website") {
                         if let url = URL(string: source.signupUrl), ["https", "http"].contains(url.scheme ?? "") {
                             copyText(model.account?.alias ?? "")
@@ -596,11 +675,11 @@ struct SourceEditor: View {
                         }
                     }.font(.system(size: 14)).accessibilityIdentifier("newsletter.finishSignup")
                 }
-                Button(source.sourceKind == "email" ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry signup using my newsletter address") {
+                Button(source.isCustom ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry signup using my newsletter address") {
                     Task { await model.retrySubscription(source) }
                 }.font(.system(size: 14)).disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
             }
-            Button(source.subscriptionStatus == "unsubscribed" ? "Updates stopped" : source.sourceKind == "email" ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
+            Button(source.subscriptionStatus == "unsubscribed" ? "Updates stopped" : source.isCustom ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
                 confirmingUnsubscribe = true
             }
             .font(.system(size: 14)).buttonStyle(.plain)
@@ -620,7 +699,7 @@ struct SourceEditor: View {
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text(source.sourceKind == "email" ? "Stop creating posts from these emails. To stop delivery, disable the scheduled email in the sending app. Existing posts stay available." : "Stop creating new posts and request unsubscribe from the publisher. Existing posts stay available. Some publishers require an extra confirmation.")
+            Text(source.isCustom ? "Stop creating posts from these emails. To stop delivery, disable the scheduled email in the sending app. Existing posts stay available." : "Stop creating new posts and request unsubscribe from the publisher. Existing posts stay available. Some publishers require an extra confirmation.")
         }
     }
 }

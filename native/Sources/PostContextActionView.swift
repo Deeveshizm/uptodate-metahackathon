@@ -8,7 +8,11 @@ struct PostContextActionView: View {
     let post: Post
     var isFeed = false
     @State private var showing = false
+    @State private var showingBiggie = false
     @State private var sharing = false
+    @Environment(\.openURL) private var openURL
+    @State private var phoneUnavailable = false
+    @State private var phoneNumber = ""
     private var sourceURL: URL? {
         guard !post.isEmailSource, let url = URL(string: post.originalUrl),
               ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
@@ -66,13 +70,7 @@ struct PostContextActionView: View {
             } else {
                 Image(systemName: symbol).font(.system(size: 13, weight: .medium))
             }
-        }
-            .frame(width: 34, height: 24)
-            .foregroundStyle(.primary)
-            .background(.primary.opacity(0.07), in: Capsule())
-            .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-            .frame(minWidth: 44, minHeight: 44)
-            .contentShape(Rectangle())
+        }.modifier(PostActionPill())
     }
     private var symbol: String {
         switch post.actionKind {
@@ -131,7 +129,7 @@ struct PostContextActionView: View {
                     .accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
             } else {
                 Menu {
-                    Button { showing = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
+                    Button { showingBiggie = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
                         .accessibilityIdentifier("post.ai.biggie")
                     #if os(iOS)
                     Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
@@ -145,36 +143,59 @@ struct PostContextActionView: View {
                     .accessibilityIdentifier("post.contextAction")
             }
         }.buttonStyle(.plain)
-        .sheet(isPresented: $showing) {
-            switch post.actionKind {
-            case "ingredients": IngredientsSheet(post: post)
-            default: PostChatSheet(post: post)
-            }
+        .sheet(isPresented: $showing) { IngredientsSheet(post: post) }
+        .alert("Phone unavailable", isPresented: $phoneUnavailable) {
+            Button("Copy number") { copyText(phoneNumber) }
+            Button("OK", role: .cancel) { }
+        } message: {
+            #if targetEnvironment(simulator)
+            Text("The simulator has no Phone app. Test calling on an iPhone.\n\n\(phoneNumber)")
+            #else
+            Text("No available app could open this phone number.\n\n\(phoneNumber)")
+            #endif
         }
         #if os(iOS)
+        .fullScreenCover(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         .sheet(isPresented: $sharing) {
             PostAIShareSheet(context: post.aiContext)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationCornerRadius(28)
         }
+        #else
+        .sheet(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         #endif
     }
     @ViewBuilder private func linkControl(_ kind: String) -> some View {
         let actions = links.filter { $0.kind == kind }
         if actions.count == 1, let action = actions.first, let url = action.destination {
-            Link(destination: url) { pill(action.symbol, gitHub: action.isGitHub) }
-                .accessibilityLabel(action.label)
-                .accessibilityIdentifier("post.\(kind)")
+            Group {
+                if kind == "phone" {
+                    Button { call(action) } label: { pill(action.symbol) }
+                } else {
+                    Link(destination: url) { pill(action.symbol, gitHub: action.isGitHub) }
+                }
+            }.accessibilityLabel(action.label).accessibilityIdentifier("post.\(kind)")
         } else if actions.count > 1, let first = actions.first {
             Menu {
                 ForEach(actions) { action in
-                    if let url = action.destination { Link(action.label, destination: url) }
+                    if action.kind == "phone" {
+                        Button(action.label) { call(action) }
+                    } else if let url = action.destination { Link(action.label, destination: url) }
                 }
             } label: { pill(first.symbol, gitHub: first.isGitHub) }
                 .accessibilityLabel(kind == "phone" ? "Phone numbers" : kind == "github" ? "GitHub repositories" : "Websites")
                 .accessibilityIdentifier("post.\(kind)")
         }
+    }
+    private func call(_ action: PostLinkAction) {
+        guard let url = action.destination, action.kind == "phone" else { return }
+        phoneNumber = action.url.replacingOccurrences(of: "tel:", with: "")
+        #if targetEnvironment(simulator)
+        phoneUnavailable = true
+        #else
+        openURL(url) { accepted in if !accepted { phoneUnavailable = true } }
+        #endif
     }
     @ViewBuilder private var feedSourceControl: some View {
         if let url = sourceURL {
@@ -280,7 +301,7 @@ private struct IngredientsSheet: View {
     }
 }
 
-private struct PostChatSheet: View {
+private struct BiggieChatView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let post: Post
@@ -291,9 +312,6 @@ private struct PostChatSheet: View {
     @State private var sharing = false
     @State private var task: Task<Void, Never>?
     @FocusState private var questionFocused: Bool
-    #if os(iOS)
-    @State private var detent: PresentationDetent = .medium
-    #endif
     private var canSend: Bool {
         !sending && !model.offline && !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -326,10 +344,13 @@ private struct PostChatSheet: View {
                     if value != nil { withAnimation { proxy.scrollTo("replyError", anchor: .bottom) } }
                 }
             }
+            .background(.background)
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
             .navigationTitle("Biggie")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.background, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             #endif
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -338,14 +359,9 @@ private struct PostChatSheet: View {
                 }
             }
         }
+        .background(.background)
         .onDisappear { task?.cancel() }
         #if os(iOS)
-        .presentationDetents([.medium, .large], selection: $detent)
-        .presentationDragIndicator(.visible)
-        .presentationCornerRadius(28)
-        .onChange(of: questionFocused) { _, focused in
-            if focused { detent = .large }
-        }
         .sheet(isPresented: $sharing) {
             PostAIShareSheet(context: sharedContext)
                 .presentationDetents([.medium, .large])
@@ -359,27 +375,17 @@ private struct PostChatSheet: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            Menu {
-                #if os(iOS)
-                Button {
-                    questionFocused = false
-                    sharing = true
-                } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
-                    .accessibilityIdentifier("post.chat.share")
-                #else
-                ShareLink(item: sharedContext) { Label("Open in…", systemImage: "arrow.up.forward.app") }
-                #endif
-                Button { questionFocused = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
-                    .accessibilityIdentifier("post.chat.biggie")
-            } label: {
-                Image(systemName: "link").font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(.primary).frame(width: 44, height: 44)
-                    .background(.primary.opacity(0.07), in: Circle())
-                    .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-            }
-            .menuOrder(.fixed)
-            .accessibilityLabel("Post source and AI options")
-            .accessibilityIdentifier("post.chat.source")
+            #if os(iOS)
+            Button {
+                questionFocused = false
+                sharing = true
+            } label: { openInIcon }
+                .accessibilityLabel("Open in another app")
+                .accessibilityIdentifier("post.chat.share")
+            #else
+            ShareLink(item: sharedContext) { openInIcon }
+                .accessibilityLabel("Open in another app")
+            #endif
 
             TextField("Ask about this post", text: $question, axis: .vertical)
                 .lineLimit(1...3).textFieldStyle(.plain).focused($questionFocused)
@@ -401,6 +407,13 @@ private struct PostChatSheet: View {
         .buttonStyle(.plain)
         .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 12)
         .background(.background)
+    }
+
+    private var openInIcon: some View {
+        Image(systemName: "arrow.up.forward.app").font(.system(size: 17, weight: .medium))
+            .foregroundStyle(.primary).frame(width: 44, height: 44)
+            .background(.primary.opacity(0.07), in: Circle())
+            .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
     }
 
     private func send() {

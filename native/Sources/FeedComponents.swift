@@ -13,12 +13,26 @@ enum FeedStyle {
     ]
 }
 
+struct PostActionPill: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 13, weight: .medium))
+            .frame(width: 34, height: 24)
+            .foregroundStyle(.primary)
+            .background(.primary.opacity(0.07), in: Capsule())
+            .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+    }
+}
+
 // Every screen shares the feed's full-bleed scaffold: edge-to-edge rows on the
 // page background, separated by dividers rather than inset grouped cards.
 struct PageScroll<Content: View>: View {
+    var showsHeader = true
     @ViewBuilder var content: Content
     var body: some View {
-        ScrollView {
+        AppScrollView(showsHeader: showsHeader) {
             LazyVStack(alignment: .leading, spacing: 0) { content }
                 .frame(maxWidth: FeedStyle.feedWidth).frame(maxWidth: .infinity)
         }.background(.background)
@@ -203,6 +217,17 @@ struct FeedPostCard: View {
                 }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
             }
 
+            HStack {
+                PostContextActionView(post: post, isFeed: true)
+                Spacer()
+                Button { Task { await model.bookmark(post) } } label: {
+                    Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
+                        .font(.system(size: 16)).frame(width: 44, height: 44)
+                }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post")
+                    .disabled(model.busy || model.offline)
+            }.buttonStyle(.plain).foregroundStyle(.primary)
+                .padding(.horizontal, 16).padding(.top, 2)
+
             VStack(alignment: .leading, spacing: 8) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(post.tags ?? []) { tag in
@@ -229,16 +254,7 @@ struct FeedPostCard: View {
                             .contentShape(Rectangle())
                     }.buttonStyle(.plain).accessibilityIdentifier("post.readMore")
                 }
-                HStack {
-                    PostContextActionView(post: post, isFeed: true)
-                    Spacer()
-                    Button { Task { await model.bookmark(post) } } label: {
-                        Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
-                            .font(.system(size: 16)).frame(width: 44, height: 44)
-                    }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post")
-                        .disabled(model.busy || model.offline)
-                }.buttonStyle(.plain).foregroundStyle(.primary).padding(.top, 2)
-            }.padding(.horizontal, 16).padding(.top, 6)
+            }.padding(.horizontal, 16).padding(.top, 2)
         }
         .background {
             // Catch blank areas without giving controls a parent tap gesture.

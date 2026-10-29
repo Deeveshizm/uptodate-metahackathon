@@ -22,6 +22,16 @@ struct NewsletterSource: Codable, Identifiable, Equatable {
     let subscriptionStatus: String?
     let subscriptionDetail: String?
     var sourceKind: String? = nil
+    var category: String? = nil
+    var managementName: String? = nil
+    var unsubscribedAt: String? = nil
+    var archivedAt: String? = nil
+    var displayName: String { managementName ?? name }
+    var isCustom: Bool {
+        if let category { return category == "custom" }
+        return sourceKind == "email" || ["muse", "claude"].contains(name.lowercased())
+    }
+    var isUnsubscribed: Bool { subscriptionStatus == "unsubscribed" }
 
     var subscriptionTitle: String {
         switch subscriptionStatus {
@@ -29,11 +39,11 @@ struct NewsletterSource: Codable, Identifiable, Equatable {
         case "submitted": "Signup submitted · waiting for email"
         case "confirmation_required": "Confirm your subscription"
         case "email_received": "Publisher email received · waiting for an edition"
-        case "receiving": sourceKind == "email" ? "Email newsletter connected" : "Newsletter emails connected"
+        case "receiving": isCustom ? "Email newsletter connected" : "Newsletter emails connected"
         case "needs_inbox": "Waiting for your newsletter address"
         case "needs_agent", "manual_action", "failed": "Signup needs attention"
         case "unsubscribe_pending", "unsubscribing": "Publisher unsubscribe pending · new posts stopped"
-        case "unsubscribed": sourceKind == "email" ? "Email updates stopped" : "Unsubscribed"
+        case "unsubscribed": isCustom ? "Email updates stopped" : "Unsubscribed"
         default: "Newsletter saved"
         }
     }

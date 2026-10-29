@@ -18,7 +18,11 @@ struct NewsletterLinkForm: View {
             Text("Newsletter website").font(.subheadline.weight(.medium))
             HStack(spacing: 10) {
                 TextField("https://newsletter.example.com", text: $link)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
+                    .padding(.horizontal, 16).padding(.vertical, 12)
+                    .frame(minHeight: 44)
+                    .background(.primary.opacity(0.05), in: Capsule())
+                    .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
                     .textContentType(.URL)
                     .autocorrectionDisabled()
                     .focused($linkFocused)
@@ -37,6 +41,8 @@ struct NewsletterLinkForm: View {
                     }
                 }
                 .labelStyle(.iconOnly)
+                .buttonStyle(.bordered).buttonBorderShape(.circle)
+                .frame(width: 44, height: 44)
                 .accessibilityLabel("Paste newsletter website link")
             }
             if let validation {
@@ -50,6 +56,7 @@ struct NewsletterLinkForm: View {
                 Text("Subscribe to newsletter").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
             .disabled(model.busy || model.offline || normalizedLink == nil)
             .accessibilityIdentifier("newsletter.subscribe")
             if model.account?.aliasStatus != "active" {

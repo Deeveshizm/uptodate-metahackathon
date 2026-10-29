@@ -32,6 +32,7 @@ from .subscriptions import Subscriptions
 from .post_chat import ChatInput, answer_post
 from .budgets import JobBudget
 from .source_identity import newsletter_identity
+from .source_lifecycle import category, maintain_sources, management_source
 
 
 def uid():
@@ -274,6 +275,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         dispatcher.safe_dispatch()
         cloud_receiving()
         engine.assets.collect()
+        with store.connect() as db:
+            maintain_sources(db)
         return {'status': 'checked'}
 
     def remember_verified_user(profile):
@@ -453,8 +456,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone()
             if not source:
                 raise HTTPException(404, "Newsletter not found")
-            if source["source_kind"] == "email":
-                db.execute("UPDATE sources SET subscription_status='receiving',muted=0,subscription_detail='New email editions will create posts again' WHERE id=?",(source_id,))
+            if category(dict(source)) == 'custom':
+                db.execute("UPDATE sources SET subscription_status='receiving',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='New email editions will create posts again' WHERE id=?",(source_id,))
                 return {"status":"receiving","source_id":source_id}
             if source["subscription_status"] in ("submitted", "confirmation_required", "email_received", "receiving", "submitting"):
                 raise HTTPException(409, "Signup was already submitted; check confirmation or incoming mail")
@@ -470,7 +473,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             else:
                 db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'subscription')",
                            (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
-            db.execute("UPDATE sources SET subscription_status='queued',muted=0,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
+            db.execute("UPDATE sources SET subscription_status='queued',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
+            db.execute('DELETE FROM source_mail_actions WHERE source_id=? AND user_id=?', (source_id, user['id']))
         schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
@@ -483,6 +487,21 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             return subscriptions.unsubscribe(user["id"], source_id)
         except SourceError as exc:
             raise HTTPException(503, str(exc)) from None
+
+    @app.post('/v1/me/sources/{source_id}/unsubscribe/confirm')
+    def confirm_manual_unsubscribe(source_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            source = db.execute('SELECT * FROM sources WHERE id=? AND user_id=?', (source_id, user['id'])).fetchone()
+            if not source:
+                raise HTTPException(404, 'Newsletter not found')
+            if source['subscription_status'] == 'unsubscribed':
+                return {'status':'unsubscribed', 'detail':'Already unsubscribed'}
+            if source['subscription_status'] not in ('unsubscribe_pending', 'unsubscribing'):
+                raise HTTPException(409, 'Request unsubscribe before confirming completion')
+            detail = 'Unsubscribe completion confirmed by you. New posts are stopped; existing posts are kept.'
+            db.execute("UPDATE sources SET subscription_status='unsubscribed',subscription_detail=?,unsubscribed_at=?,archived_at=NULL WHERE id=? AND user_id=?", (detail, now(), source_id, user['id']))
+        return {'status':'unsubscribed', 'detail':detail}
 
     @app.post("/v1/generation", status_code=202)
     def generate_from_url(body: GenerationInput, background: BackgroundTasks, user=Depends(current_user)):
@@ -686,7 +705,9 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     @app.get("/v1/me/sources")
     def sources(user=Depends(current_user)):
         with store.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM sources WHERE user_id=? ORDER BY name", (user["id"],))]
+            maintain_sources(db, user['id'])
+            rows = db.execute('SELECT * FROM sources WHERE user_id=? AND archived_at IS NULL ORDER BY name', (user['id'],)).fetchall()
+            return [management_source(row, db.execute('SELECT COUNT(*) FROM posts WHERE source_id=? AND user_id=?', (row['id'], user['id'])).fetchone()[0]) for row in rows]
 
     @app.get("/v1/inbox/candidates")
     def inbox_candidates(user=Depends(current_user)):

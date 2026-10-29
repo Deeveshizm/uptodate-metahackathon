@@ -49,6 +49,7 @@ def main():
         else:
             version=target.execute('SELECT version FROM uptodate_runtime.schema_version WHERE id=1').fetchone()
             if not version or version[0]!=1:raise RuntimeError('Unexpected runtime schema version')
+        target.execute((ROOT/'supabase/migrations/20261029000100_source_lifecycle.sql').read_text())
     headers={'apikey':values['SUPABASE_SECRET_KEY'],'Authorization':'Bearer '+values['SUPABASE_SECRET_KEY']}
     bucket=values.get('POST_IMAGE_BUCKET','post-images')
     origin=values['SUPABASE_URL'].rstrip('/')

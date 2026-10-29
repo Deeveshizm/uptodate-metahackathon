@@ -115,6 +115,9 @@ ADDITIONS = {
         "source_kind": "TEXT NOT NULL DEFAULT 'newsletter'",
         "email_sender": "TEXT NOT NULL DEFAULT ''",
         "email_topic": "TEXT NOT NULL DEFAULT ''",
+        "source_category": "TEXT NOT NULL DEFAULT ''",
+        "unsubscribed_at": "TEXT",
+        "archived_at": "TEXT",
     },
     "jobs": {
         "kind": "TEXT NOT NULL DEFAULT 'email'", "stage": "TEXT NOT NULL DEFAULT ''",

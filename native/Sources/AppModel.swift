@@ -408,7 +408,7 @@ final class AppModel: ObservableObject {
         await perform {
             _ = try await self.request("v1/me/sources/\(source.id)/subscribe", method: "POST")
             try await self.reload()
-            self.notice = "Signup queued using your account alias. Subscription progress is in Manage."
+            self.notice = source.isCustom ? "Email processing resumed for \(source.displayName)." : "Signup queued using your account alias. Subscription progress is in Manage."
         }
     }
 
@@ -424,6 +424,17 @@ final class AppModel: ObservableObject {
             }
         }
         return actionURL
+    }
+
+    func confirmUnsubscribe(_ source: NewsletterSource) async -> Bool {
+        var confirmed = false
+        await perform {
+            _ = try await self.request("v1/me/sources/\(source.id)/unsubscribe/confirm", method: "POST")
+            try await self.reload()
+            self.notice = "Unsubscribed from \(source.displayName). Existing posts are kept."
+            confirmed = true
+        }
+        return confirmed
     }
 
     func generateFromLink(url: String, mode: String, sourceId: String? = nil) async -> Bool {
