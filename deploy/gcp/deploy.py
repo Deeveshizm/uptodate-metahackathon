@@ -116,8 +116,8 @@ def main():
         'GENERATION_USER_DAILY_BUDGET_USD':values.get('GENERATION_USER_DAILY_BUDGET_USD','0.5'),
         'GENERATION_JOB_BUDGET_USD':values.get('GENERATION_JOB_BUDGET_USD','0.25'),
     }
-    for name in ['RELAY_TEST_DOMAIN','RELAY_TEST_USER_ID']:
-        if values.get(name):plain[name]=values[name]
+    receiving_domain=values.get('RESEND_RECEIVING_DOMAIN') or values.get('RELAY_TEST_DOMAIN')
+    if receiving_domain:plain['RESEND_RECEIVING_DOMAIN']=receiving_domain
     with tempfile.TemporaryDirectory(prefix='uptodate-run-') as directory:
         env_path=Path(directory)/'environment.json'
         def deploy(name,worker_url=''):

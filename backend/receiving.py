@@ -1,8 +1,7 @@
-"""Read-only Resend adapter for a dedicated, single-account local relay test.
+"""Resend-managed aliases for verified accounts and owner-scoped email ingestion.
 
-Temporary addresses live only in SQLite. Hosted profiles and the future permanent
-domain stay untouched. Resend's header-derived recipients are NOT our production
-multi-tenant routing boundary; Cloudflare will supply the SMTP envelope recipient.
+Only recipients returned by the authenticated provider API select an account;
+message headers, forwarded-for hints and client-supplied addresses cannot route mail.
 """
 import hashlib
 import json
@@ -190,42 +189,47 @@ def unsubscribe_action(message):
     return None
 
 
-class TemporaryRelay:
-    def __init__(self, domain, owner_id, reader=None):
+class ResendRelay:
+    def __init__(self, domain, reader=None):
         if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.resend\.app", domain):
-            raise ValueError("RELAY_TEST_DOMAIN must be your Resend receiving subdomain")
-        self.domain, self.owner_id, self.reader = domain, str(uuid.UUID(owner_id)), reader
+            raise ValueError("RESEND_RECEIVING_DOMAIN must be your Resend receiving subdomain")
+        self.domain, self.reader = domain, reader
         self.lock = threading.Lock()
         self.last_error = None
 
     @classmethod
     def from_environment(cls):
-        domain, owner = os.environ.get("RELAY_TEST_DOMAIN", ""), os.environ.get("RELAY_TEST_USER_ID", "")
-        if not domain and not owner:
+        # Existing installations retain their domain and reserved addresses.
+        # RELAY_TEST_USER_ID no longer selects or restricts mailbox owners.
+        domain = os.environ.get("RESEND_RECEIVING_DOMAIN") or os.environ.get("RELAY_TEST_DOMAIN", "")
+        if not domain:
             return None
-        if not domain or not owner:
-            raise ValueError("Set both RELAY_TEST_DOMAIN and RELAY_TEST_USER_ID for the isolated relay test")
         key = os.environ.get("RESEND_API_KEY", "")
-        return cls(domain, owner, ResendReader(key) if key else None)
+        return cls(domain, ResendReader(key) if key else None)
 
     def profile(self, db, profile):
-        if profile["id"] != self.owner_id:
-            return profile
-        if profile.get("alias") or profile.get("alias_status") == "disabled":
-            raise ValueError("Temporary receiving cannot override a hosted relay")
-        existing = db.execute("SELECT * FROM test_relay_aliases WHERE user_id=?", (self.owner_id,)).fetchone()
-        if not existing:
-            address = "n_" + uuid.uuid4().hex + "@" + self.domain
-            db.execute("INSERT INTO test_relay_aliases(address,user_id,status,created_at) VALUES(?,?,'provisioning',?)",
-                       (address, self.owner_id, timestamp()))
-            existing = db.execute("SELECT * FROM test_relay_aliases WHERE user_id=?", (self.owner_id,)).fetchone()
+        owner_id = str(uuid.UUID(profile["id"]))
+        if profile.get("alias_status") == "disabled":
+            # Reserve revoked addresses forever; never give them to a new user.
+            db.execute("UPDATE test_relay_aliases SET user_id=NULL WHERE user_id=?", (owner_id,))
+            return {**profile, "alias": None}
+        if profile.get("alias"):
+            raise ValueError("Resend receiving cannot override an existing permanent alias")
+        status = "active" if self.reader else "provisioning"
+        address = "n_" + uuid.uuid4().hex + "@" + self.domain
+        db.execute("INSERT INTO test_relay_aliases(address,user_id,status,created_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO NOTHING",
+                   (address, owner_id, status, timestamp()))
+        existing = db.execute("SELECT * FROM test_relay_aliases WHERE user_id=?", (owner_id,)).fetchone()
         if not existing["address"].endswith("@" + self.domain):
-            raise ValueError("Use a separate test database when changing temporary receiving domains")
-        return {**profile, "alias": existing["address"], "alias_status": existing["status"], "alias_scope": "temporary_test"}
+            raise ValueError("Existing addresses require their original receiving domain")
+        # A configured catch-all accepts new aliases immediately. A delivery
+        # probe is not required separately for every verified account.
+        db.execute("UPDATE test_relay_aliases SET status=? WHERE user_id=?", (status, owner_id))
+        return {**profile, "alias": existing["address"], "alias_status": status, "alias_scope": "resend"}
 
     def sync(self, store):
         if not self.reader:
-            raise ReceivingError("Save RESEND_API_KEY in the ignored backend settings file")
+            raise ReceivingError("Resend receiving is not configured on the server")
         if not self.lock.acquire(blocking=False):
             return {"status": "processing", "received": 0, "queued": 0}
         try:
@@ -240,15 +244,22 @@ class TemporaryRelay:
 
     def _sync(self, store):
         with store.connect() as db:
-            relay = db.execute("SELECT * FROM test_relay_aliases WHERE user_id=?", (self.owner_id,)).fetchone()
-        if not relay:
+            aliases = {row["address"]: dict(row) for row in db.execute(
+                "SELECT r.* FROM test_relay_aliases r JOIN users u ON u.id=r.user_id "
+                "WHERE r.status='active' AND u.alias=r.address").fetchall()
+                if row["address"].endswith("@" + self.domain)}
+        if not aliases:
             return {"status": "waiting_for_account", "received": 0, "queued": 0}
         result = {"status": "checked", "received": 0, "queued": 0}
         for summary in self.reader.messages():
-            # This dedicated-domain test has exactly ONE permitted account.
-            # No guessed owner or header-based cross-user dispatch is allowed.
-            if recipient_set(summary) != {relay["address"]}:
+            recipients = recipient_set(summary)
+            # Ambiguous multi-recipient messages are not guessed or broadcast.
+            if len(recipients) != 1:
                 continue
+            relay = aliases.get(next(iter(recipients)))
+            if not relay:
+                continue
+            owner_id = relay["user_id"]
             try:
                 message_id = str(uuid.UUID(summary["id"]))
             except (ValueError, KeyError, TypeError):
@@ -263,19 +274,21 @@ class TemporaryRelay:
             if parsed:parsed['receiving_message_id']=message_id
             with store.connect() as db:
                 # Recheck ownership after network calls; deletion revokes delivery.
-                live = db.execute("SELECT * FROM test_relay_aliases WHERE address=? AND user_id=?",
-                                  (relay["address"], self.owner_id)).fetchone()
-                if not live:
-                    return result
+                db.execute("BEGIN IMMEDIATE")
+                live = db.execute("SELECT r.address FROM test_relay_aliases r JOIN users u ON u.id=r.user_id "
+                                  "WHERE r.address=? AND r.user_id=? AND r.status='active' AND u.alias=r.address",
+                                  (relay["address"], owner_id)).fetchone()
+                if not live or db.execute("SELECT 1 FROM test_relay_receipts WHERE message_id=?", (message_id,)).fetchone():
+                    continue
                 sender = parseaddr(str(message.get("from", "")))[1].lower()
                 sender_domain = sender.rsplit("@", 1)[-1] if "@" in sender else ""
                 channel=email_channel(sender,str(message.get('subject') or ''))
                 sources = db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_alias=? AND expected_sender_domain!='' AND sender LIKE 'newsletter:%'",
-                                     (self.owner_id, relay["address"])).fetchall()
+                                     (owner_id, relay["address"])).fetchall()
                 matches = [source for source in sources if sender_domain == source["expected_sender_domain"] or sender_domain.endswith("." + source["expected_sender_domain"])]
                 matched = matches[0] if len(matches) == 1 else None
                 if not matches:
-                    matched = db.execute("SELECT * FROM sources WHERE user_id=? AND email_sender=? AND email_topic=?", (self.owner_id,sender,channel)).fetchone()
+                    matched = db.execute("SELECT * FROM sources WHERE user_id=? AND email_sender=? AND email_topic=?", (owner_id,sender,channel)).fetchone()
                 if len(matches) > 1:
                     parsed, state = None, "requires_source_match"
                 if parsed and not matched and len(matches) <= 1:
@@ -285,13 +298,13 @@ class TemporaryRelay:
                     verified = auth.get("dkim") == "pass" or auth.get("dmarc") == "pass"
                     provider = "Muse" if verified and any(sender_domain == domain or sender_domain.endswith('.'+domain) for domain in ("muse.ai", "meta.ai")) else None
                     db.execute("INSERT INTO inbox_candidates(id,user_id,sender,sender_name,provider,subject,payload,channel_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,sender,channel_key) DO UPDATE SET subject=excluded.subject,payload=excluded.payload,updated_at=excluded.updated_at",
-                               (uuid.uuid4().hex,self.owner_id,sender,display or sender_domain,provider,parsed["subject"],json.dumps(parsed),channel,timestamp(),timestamp()))
+                               (uuid.uuid4().hex,owner_id,sender,display or sender_domain,provider,parsed["subject"],json.dumps(parsed),channel,timestamp(),timestamp()))
                     parsed, state = None, "needs_newsletter_approval"
                 if matched:
                     action = unsubscribe_action(message)
                     if action:
                         db.execute("INSERT INTO source_mail_actions(source_id,user_id,unsubscribe_url,one_click,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET unsubscribe_url=excluded.unsubscribe_url,one_click=excluded.one_click,updated_at=excluded.updated_at",
-                                   (matched["id"], self.owner_id, action[0], int(action[1]), timestamp()))
+                                   (matched["id"], owner_id, action[0], int(action[1]), timestamp()))
                     if matched["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "unsubscribing"):
                         parsed, state = None, "ignored_unsubscribed"
                     else:
@@ -300,31 +313,31 @@ class TemporaryRelay:
                                   "Publisher email requires confirmation; open it in Receiving" if state == "manual_action" else
                                   "Publisher email received at your account alias; waiting for a readable newsletter edition")
                         db.execute("UPDATE sources SET subscription_status=?,subscription_detail=? WHERE id=? AND user_id=?",
-                                   (status, detail, matched["id"], self.owner_id))
+                                   (status, detail, matched["id"], owner_id))
                 job_id = None
                 if parsed:
                     fingerprint = "received-email:" + parsed["fingerprint"]
-                    previous = db.execute("SELECT id FROM jobs WHERE user_id=? AND fingerprint=?", (self.owner_id, fingerprint)).fetchone()
+                    previous = db.execute("SELECT id FROM jobs WHERE user_id=? AND fingerprint=?", (owner_id, fingerprint)).fetchone()
                     if previous:
                         job_id = previous["id"]
                     else:
-                        source = matched or db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (self.owner_id, parsed["sender"])).fetchone()
+                        source = matched or db.execute("SELECT id FROM sources WHERE user_id=? AND sender=?", (owner_id, parsed["sender"])).fetchone()
                         source_id = source["id"] if source else uuid.uuid4().hex
                         if not source:
-                            db.execute("INSERT INTO sources(id,user_id,name,sender,subscription_status,subscription_detail,subscription_alias,expected_sender_domain,source_kind) VALUES(?,?,?,?,'receiving','Email received at the temporary test alias',?,?,'email')",
-                                       (source_id, self.owner_id, parsed["source_name"], parsed["sender"], relay["address"], sender_domain))
+                            db.execute("INSERT INTO sources(id,user_id,name,sender,subscription_status,subscription_detail,subscription_alias,expected_sender_domain,source_kind) VALUES(?,?,?,?,'receiving','Email received at the account alias',?,?,'email')",
+                                       (source_id, owner_id, parsed["source_name"], parsed["sender"], relay["address"], sender_domain))
                         if not matched:
                             action = unsubscribe_action(message)
                             if action:
                                 db.execute("INSERT INTO source_mail_actions(source_id,user_id,unsubscribe_url,one_click,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET unsubscribe_url=excluded.unsubscribe_url,one_click=excluded.one_click,updated_at=excluded.updated_at",
-                                           (source_id, self.owner_id, action[0], int(action[1]), timestamp()))
+                                           (source_id, owner_id, action[0], int(action[1]), timestamp()))
                         job_id = uuid.uuid4().hex
                         db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'received_email')",
-                                   (job_id, self.owner_id, source_id, fingerprint, parsed["subject"], json.dumps(parsed), timestamp()))
+                                   (job_id, owner_id, source_id, fingerprint, parsed["subject"], json.dumps(parsed), timestamp()))
                         result["queued"] += 1
                 db.execute("INSERT INTO test_relay_receipts(message_id,user_id,state,job_id,received_at) VALUES(?,?,?,?,?)",
-                           (message_id, self.owner_id, state, job_id, timestamp()))
-                db.execute("UPDATE test_relay_aliases SET status='active' WHERE address=? AND user_id=?", (relay["address"], self.owner_id))
-                db.execute("UPDATE users SET alias=? WHERE id=?", (relay["address"], self.owner_id))
+                           (message_id, owner_id, state, job_id, timestamp()))
+                db.execute("UPDATE test_relay_aliases SET status='active' WHERE address=? AND user_id=?", (relay["address"], owner_id))
+                db.execute("UPDATE users SET alias=? WHERE id=?", (relay["address"], owner_id))
                 result["received"] += 1
         return result

@@ -592,8 +592,8 @@ struct SourcesView: View {
             } else {
                 InfoRow("Placeholder only. Import .eml files until receiving is connected.")
             }
-            if model.account?.aliasScope == "temporary_test" {
-                InfoRow("Temporary test address. Newsletter subscriptions will need updating when we connect our own domain.")
+            if ["temporary_test", "resend"].contains(model.account?.aliasScope ?? "") {
+                InfoRow("Managed newsletter address. Existing subscriptions keep using this address when we add our own domain.")
             }
             }
             if model.authConfiguration?.mode == "supabase" && model.account?.aliasStatus != "active" {

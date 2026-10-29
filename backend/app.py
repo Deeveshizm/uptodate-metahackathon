@@ -26,7 +26,7 @@ from .generation import generation_model, engine_generation
 from .retrieval import SourceError, public_url
 from .source_engine import SourceEngine
 from .auth import SupabaseAuth
-from .receiving import ReceivingError, TemporaryRelay
+from .receiving import ReceivingError, ResendRelay
 from .signup import FormSignup
 from .subscriptions import Subscriptions
 from .post_chat import ChatInput, answer_post
@@ -99,10 +99,10 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         from .browser_signup import BrowserSignup
         engine.subscription_agent = FormSignup(engine.fetcher, browser=BrowserSignup() if os.environ.get("NEWSLETTER_SIGNUP_MODE") == "browser" else None)
     auth = auth_provider if auth_provider is not None else SupabaseAuth.from_environment()
-    relay = test_relay if test_relay is not None else TemporaryRelay.from_environment()
+    relay = test_relay if test_relay is not None else ResendRelay.from_environment()
     subscriptions = Subscriptions(store, engine.fetcher)
     if relay and (not auth or auth.relay_aliases):
-        raise ValueError("Temporary receiving requires verified accounts with permanent relay activation disabled")
+        raise ValueError("Resend receiving requires verified accounts with permanent relay activation disabled")
 
     def receive_mail():
         try:
@@ -111,22 +111,28 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             return
         if result and result.get("received"):
             with store.connect() as db:
-                pending_unsubscribe = [row["id"] for row in db.execute("SELECT s.id FROM sources s JOIN source_mail_actions a ON a.source_id=s.id WHERE s.user_id=? AND s.subscription_status='unsubscribe_pending' AND a.one_click=1", (relay.owner_id,))]
-            for source_id in pending_unsubscribe:
-                subscriptions.unsubscribe(relay.owner_id, source_id)
+                pending_unsubscribe = [(row["user_id"], row["id"]) for row in db.execute(
+                    "SELECT s.user_id,s.id FROM sources s JOIN source_mail_actions a ON a.source_id=s.id "
+                    "JOIN test_relay_aliases r ON r.user_id=s.user_id AND r.address=s.subscription_alias "
+                    "WHERE r.status='active' AND s.subscription_status='unsubscribe_pending' AND a.one_click=1")]
+            for owner_id, source_id in pending_unsubscribe:
+                subscriptions.unsubscribe(owner_id, source_id)
         with store.connect() as db:
-            active = db.execute("SELECT 1 FROM test_relay_aliases WHERE user_id=? AND status='active'", (relay.owner_id,)).fetchone()
-            if active:
-                for source in db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_status='needs_inbox'", (relay.owner_id,)).fetchall():
-                    fingerprint = "relay-ready-signup:" + source["id"]
-                    previous = db.execute("SELECT 1 FROM jobs WHERE user_id=? AND fingerprint=?", (relay.owner_id, fingerprint)).fetchone()
-                    if not previous:
-                        db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
-                                   (uid(), relay.owner_id, source["id"], fingerprint, "Resume signup with ready relay",
-                                    json.dumps({"url": source["signup_url"], "auto_subscribe": True}), now()))
-                        db.execute("UPDATE sources SET subscription_status='queued' WHERE id=?", (source["id"],))
-            jobs = [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='received_email' AND status='queued'", (relay.owner_id,))]
-            jobs += [row["id"] for row in db.execute("SELECT id FROM jobs WHERE user_id=? AND kind='newsletter' AND fingerprint LIKE 'relay-ready-signup:%' AND status='queued'", (relay.owner_id,))]
+            db.execute("BEGIN IMMEDIATE")
+            sources = db.execute("SELECT s.* FROM sources s JOIN test_relay_aliases r ON r.user_id=s.user_id "
+                                 "JOIN users u ON u.id=s.user_id AND u.alias=r.address "
+                                 "WHERE r.status='active' AND s.subscription_status='needs_inbox'").fetchall()
+            for source in sources:
+                owner_id = source["user_id"]
+                fingerprint = "relay-ready-signup:" + source["id"]
+                previous = db.execute("SELECT 1 FROM jobs WHERE user_id=? AND fingerprint=?", (owner_id, fingerprint)).fetchone()
+                if not previous:
+                    db.execute("INSERT INTO jobs(id,user_id,source_id,fingerprint,subject,status,payload,created_at,kind) VALUES(?,?,?,?,?,'queued',?,?,'newsletter')",
+                               (uid(), owner_id, source["id"], fingerprint, "Resume signup with ready relay",
+                                json.dumps({"url": source["signup_url"], "auto_subscribe": True}), now()))
+                    db.execute("UPDATE sources SET subscription_status='queued' WHERE id=? AND user_id=?", (source["id"], owner_id))
+            jobs = [row["id"] for row in db.execute("SELECT id FROM jobs WHERE kind='received_email' AND status='queued'")]
+            jobs += [row["id"] for row in db.execute("SELECT id FROM jobs WHERE kind='newsletter' AND fingerprint LIKE 'relay-ready-signup:%' AND status='queued'")]
         for job_id in jobs:
             if not dispatcher:
                 process_job(job_id)
@@ -283,6 +289,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         # Local content is keyed by verified UUID; the main email is never used
         # as a subscription address. Pending/disabled relays cannot reach agents.
         with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             placeholder = f'{profile["id"]}@inbox.prototype.invalid'
             db.execute("INSERT OR IGNORE INTO users(id,token_hash,alias,created_at,timezone) VALUES(?,?,?,?,?)",
                        (profile["id"], "external:" + profile["id"], placeholder, now(), profile["timezone"]))
@@ -290,7 +297,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 try:
                     profile = relay.profile(db, profile)
                 except ValueError:
-                    raise HTTPException(409, "Temporary relay configuration conflicts with an existing address") from None
+                    raise HTTPException(409, "Receiving configuration conflicts with an existing address") from None
             alias = (profile.get("alias") if profile.get("alias_status") == "active" else None) or placeholder
             db.execute("UPDATE users SET alias=?,timezone=? WHERE id=?", (alias, profile["timezone"], profile["id"]))
         return {**profile, "alias": profile.get("alias") or ""}
@@ -601,23 +608,25 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             user = remember_verified_user(auth.ensure_relay(credentials.credentials, user))
         return {**account_json(user), "alias_deliverable": user.get("alias_status") == "active"}
 
-    def require_test_relay(user):
-        if not relay or user["id"] != relay.owner_id:
-            raise HTTPException(404, "Temporary receiving is not enabled for this account")
+    def require_receiving(user):
+        if not relay or user.get("alias_scope") != "resend":
+            raise HTTPException(404, "Receiving is not enabled for this account")
 
-    @app.get("/v1/relay/test")
+    @app.get("/v1/relay")
+    @app.get("/v1/relay/test", include_in_schema=False)
     def test_receiving_status(user=Depends(current_user)):
-        require_test_relay(user)
+        require_receiving(user)
         with store.connect() as db:
             counts = dict(db.execute("SELECT state,COUNT(*) FROM test_relay_receipts WHERE user_id=? GROUP BY state", (user["id"],)).fetchall())
-        return {"scope": "temporary_single_account", "provider_configured": relay.reader is not None,
+        return {"scope": "account", "provider_configured": relay.reader is not None,
                 "alias_status": user["alias_status"], "receipts": counts, "last_error": relay.last_error}
 
-    @app.post("/v1/relay/test/sync", status_code=202)
+    @app.post("/v1/relay/sync", status_code=202)
+    @app.post("/v1/relay/test/sync", status_code=202, include_in_schema=False)
     def sync_test_receiving(background: BackgroundTasks, user=Depends(current_user)):
-        require_test_relay(user)
+        require_receiving(user)
         if not relay.reader:
-            raise HTTPException(503, "Save RESEND_API_KEY in the ignored backend settings file")
+            raise HTTPException(503, "Resend receiving is not configured on the server")
         if dispatcher:
             background.add_task(dispatcher.enqueue_receiving)
         else:
