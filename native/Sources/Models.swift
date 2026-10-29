@@ -152,7 +152,57 @@ struct PlaceAction: Codable, Identifiable {
     let address: String?
     let sourceUrl: String?
     var mapUrl: String? = nil
+    var websiteUrl: String? = nil
+    var identityKnown: Bool? = nil
     var id: String { name + (address ?? "") }
+
+    var sourceMapURL: URL? {
+        guard let value = mapUrl, let url = URL(string: value),
+              ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
+              url.host != nil, url.user == nil, url.password == nil else { return nil }
+        return url
+    }
+
+    func mapURL(for app: MapsApp) -> URL? {
+        if let source = sourceMapURL {
+            let host = (source.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "", options: .anchored)
+            if app == .apple, host == "maps.apple.com" { return source }
+            if app == .google {
+                if ["maps.app.goo.gl", "goo.gl"].contains(host) { return source }
+                if host == "maps.google.com" || (host == "google.com" && source.path.hasPrefix("/maps")) {
+                    var components = URLComponents(url: source, resolvingAgainstBaseURL: false)
+                    components?.scheme = "comgooglemapsurl"
+                    return components?.url
+                }
+            }
+            if app == .waze, host == "waze.com" { return source }
+        }
+        guard identityKnown != false, name != "Location from email" else { return nil }
+        let query = [name, address ?? ""].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: ", ")
+        guard !query.isEmpty else { return nil }
+        var components = URLComponents(string: app == .apple ? "https://maps.apple.com/" : app.scheme + "://")
+        components?.queryItems = [URLQueryItem(name: "q", value: query)]
+        return components?.url
+    }
+}
+
+enum MapsApp: String, CaseIterable, Identifiable {
+    case apple, google, waze
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .apple: "Apple Maps"
+        case .google: "Google Maps"
+        case .waze: "Waze"
+        }
+    }
+    var scheme: String {
+        switch self {
+        case .apple: "maps"
+        case .google: "comgooglemaps"
+        case .waze: "waze"
+        }
+    }
 }
 
 struct ContentAction: Codable {

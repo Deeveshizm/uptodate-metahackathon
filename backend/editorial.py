@@ -170,6 +170,11 @@ def source_details(document, ingredients=None, places=None):
     else:
         action = {"kind": "ask_ai", "label": "Ask about this paper" if metadata.get("abstract") or urlsplit(document.url).hostname == "arxiv.org" else "Ask AI",
                   "source_url": document.url, "status": "planned"}
+    if action['kind'] == 'places' and len(action['data']) == 1:
+        from .locations import website_reference
+        website = website_reference(document, '\n'.join(span['text'] for span in document.spans))
+        if website:
+            action = {**action, 'data': [{**action['data'][0], 'website_url': website}]}
     return source, action
 
 

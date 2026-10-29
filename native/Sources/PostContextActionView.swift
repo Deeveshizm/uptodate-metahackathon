@@ -7,6 +7,32 @@ import UIKit
 struct PostContextActionView: View {
     let post: Post
     @State private var showing = false
+    @State private var sourceEmail = false
+    private var sourceURL: URL? {
+        guard !post.isEmailSource, let url = URL(string: post.originalUrl),
+              ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
+              url.host != nil, url.user == nil, url.password == nil else { return nil }
+        return url
+    }
+    private var websites: [(place: PlaceAction, url: URL)] {
+        guard post.actionKind == "places" else { return [] }
+        return (post.contentAction?.places ?? []).compactMap { place in
+            guard let value = place.websiteUrl, let url = URL(string: value),
+                  ["https", "http"].contains(url.scheme ?? ""), url.host != nil,
+                  url.user == nil, url.password == nil else { return nil }
+            return (place, url)
+        }
+    }
+    private func pill(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .medium))
+            .frame(width: 42, height: 30)
+            .foregroundStyle(.primary)
+            .background(.primary.opacity(0.07), in: Capsule())
+            .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+    }
     private var symbol: String {
         switch post.actionKind {
         case "ingredients": "checklist"
@@ -14,24 +40,77 @@ struct PostContextActionView: View {
         default: "sparkles"
         }
     }
+    private func installed(_ app: MapsApp) -> Bool {
+        #if os(iOS)
+        guard let url = URL(string: app.scheme + "://") else { return false }
+        return UIApplication.shared.canOpenURL(url)
+        #else
+        return app == .apple
+        #endif
+    }
+    @ViewBuilder private func mapOptions(for place: PlaceAction) -> some View {
+        let apps = MapsApp.allCases.filter { installed($0) && place.mapURL(for: $0) != nil }
+        if !apps.isEmpty {
+            ForEach(apps) { app in
+                if let url = place.mapURL(for: app) { Link(app.title, destination: url) }
+            }
+        } else if let url = place.sourceMapURL {
+            Link("Open source map", destination: url)
+        } else {
+            Text("No supported map app available").disabled(true)
+        }
+    }
     var body: some View {
-        Button { showing = true } label: {
-            Image(systemName: symbol)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 42, height: 30)
-                .foregroundStyle(.primary)
-                .background(.primary.opacity(0.07), in: Capsule())
-                .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
-        }.buttonStyle(.plain).accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
+        HStack(spacing: 6) {
+            if websites.count == 1, let website = websites.first {
+                Link(destination: website.url) { pill("globe") }
+                    .accessibilityLabel("Visit \(website.place.name) website")
+                    .accessibilityIdentifier("post.website")
+            } else if websites.count > 1 {
+                Menu {
+                    ForEach(websites, id: \.place.id) { website in
+                        Link(website.place.name, destination: website.url)
+                    }
+                } label: { pill("globe") }
+                    .accessibilityLabel("Venue websites")
+                    .accessibilityIdentifier("post.website")
+            } else if post.actionKind != "places" {
+                if let url = sourceURL {
+                    Link(destination: url) { pill("link") }
+                        .accessibilityLabel("Open original source")
+                        .accessibilityIdentifier("post.sourceLink")
+                } else if post.isEmailSource {
+                    Button { sourceEmail = true } label: { pill("envelope") }
+                        .accessibilityLabel("Read source email")
+                        .accessibilityIdentifier("post.sourceEmail")
+                }
+            }
+            if post.actionKind == "places" {
+                Menu {
+                    let places = post.contentAction?.places ?? []
+                    if places.count == 1, let place = places.first {
+                        Section(place.name) { mapOptions(for: place) }
+                    } else {
+                        ForEach(places) { place in
+                            Menu(place.name) { mapOptions(for: place) }
+                        }
+                    }
+                } label: { pill(symbol) }
+                    .menuOrder(.fixed)
+                    .accessibilityLabel("Open location in Maps")
+                    .accessibilityIdentifier("post.contextAction")
+            } else {
+                Button { showing = true } label: { pill(symbol) }
+                    .accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
+            }
+        }.buttonStyle(.plain)
         .sheet(isPresented: $showing) {
             switch post.actionKind {
             case "ingredients": IngredientsSheet(post: post)
-            case "places": PlacesSheet(post: post)
             default: PostChatSheet(post: post)
             }
         }
+        .sheet(isPresented: $sourceEmail) { SourceEmailSheet(post: post) }
     }
 }
 
@@ -103,35 +182,6 @@ private struct IngredientsSheet: View {
             store.reset(); lists = []; calendarID = ""
             message = "Could not save ingredients. Check Reminders access and try again."
         }
-    }
-}
-
-private struct PlacesSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
-    let post: Post
-    var body: some View {
-        NavigationStack {
-            List {
-                ForEach(post.contentAction?.places ?? []) { place in
-                    Button {
-                        if let value = place.mapUrl, let map = URL(string: value), map.scheme == "https" {
-                            openURL(map); return
-                        }
-                        var url = URLComponents(string: "https://maps.apple.com/")!
-                        url.queryItems = [URLQueryItem(name: "q", value: [place.name, place.address ?? ""].filter { !$0.isEmpty }.joined(separator: ", "))]
-                        if let destination = url.url { openURL(destination) }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Label(place.name, systemImage: "mappin.and.ellipse")
-                            if let address = place.address, !address.isEmpty { Text(address).font(.caption).foregroundStyle(.secondary) }
-                            Text(place.mapUrl == nil ? "Search in Apple Maps" : "Open source map").font(.caption)
-                        }
-                    }
-                }
-            }.navigationTitle("Places in this post")
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-        }.frame(minWidth: 320, minHeight: 400)
     }
 }
 

@@ -2,6 +2,7 @@
 import re
 
 from .documents import normalize
+from .locations import email_places, labelled_address, place_prose
 
 
 def preserve_short_email(document):
@@ -39,10 +40,8 @@ def preserve_short_email(document):
     suffix=title.split(':',1)[-1].strip() if ':' in title else ''
     if suffix and suffix.casefold() in body.casefold():title=suffix
     if not 5 <= len(title) <= 130:return None
-    places=list(document.metadata.get('places',[]))
-    address=re.search(r'(?:^|\n)(?:Where|Address|Location)\s*:\s*([^\n]+)',body,re.I)
-    if not places and suffix and suffix.casefold() in body.casefold() and address and not address[1].startswith('http'):
-        places=[{'name':suffix,'address':address[1].strip(),'source_url':document.url}]
+    places=list(document.metadata.get('places',[])) or email_places(document)
+    if places:body=place_prose(body)
     from .editorial import PIPELINE_VERSION,source_category,source_details
     source,action=source_details(document,places=places)
     return {'title':title,'hook':'','finding':body,'limitations':'','original_url':document.url,

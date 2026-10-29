@@ -2,16 +2,11 @@
 import copy
 import hashlib
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from .documents import Document, make_spans, normalize, parse_document
 from .retrieval import Resource
-
-
-def map_link(url):
-    parts=urlsplit(url)
-    host=(parts.hostname or '').lower().removeprefix('www.')
-    return host in ('maps.google.com','maps.app.goo.gl','maps.apple.com','openstreetmap.org') or (host=='google.com' and parts.path.startswith('/maps')) or (host=='goo.gl' and parts.path.startswith('/maps'))
+from .locations import email_places, map_link
 
 
 def email_documents(payload):
@@ -38,15 +33,7 @@ def email_documents(payload):
         document.figures.append({'id':f'email-photo-{index}','url':image_url,'caption':'Photo linked in '+payload['subject'],
                                 'license_url':'','page':None,'selection_basis':'email_photo_reference'})
     document.links=payload.get('links') or [{'url':u,'title':u} for u in payload.get('urls',[])]
-    locations=[]
-    for link in document.links:
-        if not map_link(link['url']):continue
-        query=parse_qs(urlsplit(link['url']).query)
-        name=link.get('title','').strip()
-        if not name or re.fullmatch(r'(?:open|view|get|see)?\s*(?:in|on)?\s*(?:google|apple)?\s*(?:maps?|directions|location)',name,re.I) or name.startswith('http'):
-            name=(query.get('query') or query.get('q') or [''])[0]
-        if name and not re.fullmatch(r'[-+\d.,\s]+',name):
-            locations.append({'name':name[:200],'address':'','map_url':link['url'],'source_url':url})
+    locations=email_places(document)
     if locations:document.metadata['places']=locations[:12]
     document.metadata['location_links']=[link for link in document.links if map_link(link['url'])][:20]
     document.metadata['email_images_pending']=bool(payload.get('email_images_pending') or re.search(r'<img[^>]+src=[\"\']cid:',payload.get('html',''),re.I)) and not document.figures

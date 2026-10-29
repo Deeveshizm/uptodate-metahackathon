@@ -358,8 +358,14 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 tags.append({"code": "image_failed" if failed else "image_pending", "label": "Image unavailable" if failed else "Image pending", "detail": visual.get("detail", "Source visual is still being prepared.")})
             if not analysis.get("provenance"):
                 tags.append({"code": "source_update_pending", "label": "Source update pending", "detail": "This earlier post has not yet been regenerated with original-source provenance."})
+        visible={k: row[k] for k in ("id", "title", "hook", "finding", "limitations", "original_url", "status", "rights", "generation", "published_date", "verification")}
+        if (analysis.get('action') or {}).get('kind')=='places':
+            from .locations import place_prose
+            for key in ('hook','finding','limitations'):visible[key]=place_prose(visible[key])
+            if isinstance(analysis.get('summary'),str):analysis['summary']=place_prose(analysis['summary'])
+            analysis['sections']=[{**section,'text':place_prose(section['text'])} for section in analysis.get('sections',[])]
         return {
-            **{k: row[k] for k in ("id", "title", "hook", "finding", "limitations", "original_url", "status", "rights", "generation", "published_date", "verification")},
+            **visible,
             "analysis": analysis, "visual": visual, "visuals": analysis.get("visuals", [visual] if visual.get("asset_id") else []),
             "paper": analysis.get("source"), "content_action": analysis.get("action"), "tags": tags,
             "publication": analysis.get("publication", {}),

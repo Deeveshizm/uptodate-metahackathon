@@ -436,6 +436,19 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
                 "detail": str(exc), "prompt": prompt}, None
 
 
+def venue_address_text(value):
+    from .documents import normalize
+    aliases={'north':'n','south':'s','east':'e','west':'w','street':'st','road':'rd','avenue':'ave',
+             'boulevard':'blvd','drive':'dr','lane':'ln','court':'ct','parkway':'pkwy','highway':'hwy'}
+    return ' '.join(aliases.get(word,word) for word in re.findall(r'[\w]+',normalize(value).casefold()))
+
+
+def venue_street(address):
+    street=address.split(',')[0]
+    street=re.split(r'(?:#|\b(?:suite|ste|unit|apt)\.?\s*)\s*[\w-]+',street,maxsplit=1,flags=re.I)[0]
+    return venue_address_text(street)
+
+
 def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, pages=None):
     """Check explicit venue websites/verified photo pages, without rewriting email content."""
     places=draft.get('analysis',{}).get('action',{}).get('data',[])
@@ -444,24 +457,53 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
     from .documents import Document,normalize
     urls=pages if pages is not None else [link['url'] for link in document.links if not map_link(link['url'])]
     urls=list(dict.fromkeys(url for url in urls if safe_url(url) and not re.search(r'unsubscribe|confirm|activate|login|sign.?in',url,re.I)))[:4 if pages is not None else 2]
+    visited=set()
     for url in urls:
+        if url in visited:continue
+        visited.add(url)
+        if len(visited)>5:break
         stage('checking_venue_website_photos')
         try:
             resource=fetcher.fetch(url)
             if 'html' not in resource.content_type:continue
             soup=BeautifulSoup(resource.body,'html.parser')
             text=normalize(soup.get_text(' ',strip=True)).casefold()
+            address_text=' '+venue_address_text(text)+' '
             matching=[]
             for place in places:
                 name=normalize(place['name']).casefold().removeprefix('the ')
-                street=normalize(place.get('address','').split(',')[0]).casefold()
-                if name in text and (not street or street in text):matching.append(place)
-            if not matching:continue
+                street=venue_street(place.get('address',''))
+                if name in text and (not street or ' '+street+' ' in address_text):matching.append(place)
+            if not matching:
+                if pages is None:
+                    # A linked official homepage often delegates venue evidence
+                    # to its location page. Follow bounded same-host locators.
+                    host=(urlsplit(resource.url).hostname or '').removeprefix('www.')
+                    for anchor in soup.find_all('a',href=True):
+                        target=safe_url(urljoin(resource.url,anchor['href']))
+                        if not target or (urlsplit(target).hostname or '').removeprefix('www.')!=host:continue
+                        label=anchor.get_text(' ',strip=True)+' '+urlsplit(target).path
+                        if re.search(r'locations?|find.?us|our.?cafes?|our.?stores?|coffee.?shops?',label,re.I) and target not in urls:
+                            urls.append(target)
+                        if len(urls)>=5:break
+                continue
+            # On a multi-location page, use images from the matching address's
+            # smallest card/section, rather than a different branch's hero.
+            region=soup
+            street=venue_street(matching[0].get('address',''))
+            if street:
+                regions=[]
+                for node in soup.find_all(['address','article','section','div','li']):
+                    if not node.find('img'):continue
+                    content=normalize(node.get_text(' ',strip=True))
+                    if len(content)<=2500 and ' '+street+' ' in ' '+venue_address_text(content)+' ':
+                        regions.append((len(content),node))
+                if regions:region=min(regions,key=lambda item:item[0])[1]
             figures=[]
-            hero=soup.find('meta',attrs={'property':'og:image'})
+            hero=soup.find('meta',attrs={'property':'og:image'}) if region is soup else None
             candidates=[{'url':hero.get('content',''),'alt':''}] if hero else []
             candidates.extend({'url':node.get('data-src') or node.get('data-lazy-src') or node.get('nitro-lazy-src') or node.get('src',''),
-                               'alt':node.get('alt','')} for node in soup.find_all('img',limit=50)
+                               'alt':node.get('alt','')} for node in region.find_all('img',limit=50)
                               if not any(p.name in ('nav','footer','aside') for p in node.parents))
             seen=set()
             for candidate in candidates:

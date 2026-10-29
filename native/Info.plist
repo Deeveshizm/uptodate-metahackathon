@@ -4,6 +4,12 @@
 <dict>
 	<key>UpToDateAPIURL</key>
 	<string>$(UPTODATE_API_URL)</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>maps</string>
+		<string>comgooglemaps</string>
+		<string>waze</string>
+	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
