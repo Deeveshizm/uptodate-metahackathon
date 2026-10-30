@@ -13,6 +13,9 @@ struct UpToDateApp: App {
         WindowGroup {
             RootView().environmentObject(model)
                 .frame(minWidth: 340, minHeight: 600)
+                // Temporarily disable dark mode until the UI's contrast and readability are optimized for it.
+                // Re-enable system appearance together with UIUserInterfaceStyle in Info.plist.
+                .preferredColorScheme(.light)
         }
     }
 }
@@ -42,7 +45,7 @@ struct RootView: View {
                     switch selection {
                     case 1: NavigationStack { LibraryView() }
                     case 2: NavigationStack { ManageView(importEmail: { importing = true }) }
-                    case 3: NavigationStack { SourcesView() }
+                    case 3: NavigationStack { SourcesView(openBookmarks: { selection = 1 }, openRead: { selection = 4 }) }
                     case 4: NavigationStack { ReadPostsView() }
                     default: NavigationStack { FeedView() }
                     }
@@ -75,7 +78,7 @@ struct RootView: View {
                 model.notice = nil
             }
         }
-        .alert("Prototype", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .alert("UpToDate", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
@@ -96,33 +99,16 @@ struct RootView: View {
 
     private var scrollHeader: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 18) {
-                Menu {
-                    // Mirrors the bottom navigation bar, in the same order.
-                    Section {
-                        Button("Home", systemImage: "house") { selection = 0 }
-                        Button("Saved", systemImage: "bookmark") { selection = 1 }
-                        Button("Manage", systemImage: "newspaper") { selection = 2 }
-                        Button("Read", systemImage: "checkmark.circle") { selection = 4 }
-                    }
-                    Section {
-                        Button("Profile", systemImage: "person.crop.circle") { selection = 3 }
-                    }
-                } label: { Image(systemName: "line.3.horizontal").font(.system(size: 25, weight: .regular)).frame(width: 36, height: 36) }
-                    .accessibilityLabel("Open menu")
-                Spacer()
+            ZStack {
                 Button { selection = 0 } label: {
                     Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold))
                 }.buttonStyle(.plain).accessibilityLabel("Home")
-                Spacer()
-                if model.busy { ProgressView().controlSize(.small) }
-                Button { selection = 3 } label: {
-                    SourceAvatar(name: "Your profile", size: 34, symbol: "person")
-                        .overlay(alignment: .topTrailing) {
-                            if !model.review.isEmpty { Circle().fill(.pink).frame(width: 7, height: 7).offset(x: 4, y: -3) }
-                        }
-                }.accessibilityLabel("Open your profile")
-            }.padding(.horizontal, 18).padding(.vertical, 10).foregroundStyle(.primary)
+                HStack {
+                    Spacer()
+                    if model.busy { ProgressView().controlSize(.small).frame(width: 34, height: 34) }
+                }.allowsHitTesting(false)
+            }.frame(maxWidth: .infinity).frame(height: 44)
+                .padding(.horizontal, 18).padding(.vertical, 5).foregroundStyle(.primary)
             Divider()
             if model.offline {
                 HStack {
@@ -537,95 +523,54 @@ struct SourceLinkView: View {
 }
 struct SourcesView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var deleting = false
-    @State private var editingProfile = false
-    private var alias: String { model.account?.alias ?? "" }
-
+    let openBookmarks: () -> Void
+    let openRead: () -> Void
     var body: some View {
         PageScroll {
-            PageHeader(title: "Your account")
-            HStack(spacing: 20) {
-                SourceAvatar(name: "Your profile", size: 66, symbol: "person")
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(model.account?.displayName?.isEmpty == false ? model.account!.displayName! : "Your reading space")
-                        .font(.system(size: 21, weight: .semibold)).tracking(-0.4)
-                    HStack(spacing: 22) {
-                        profileStat(model.sources.count, "sources")
-                        profileStat(model.bookmarks.count, "saved")
-                        profileStat(model.feed?.total ?? 0, "today")
-                    }
-                }
+            HStack {
+                Text("Your account").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                 Spacer()
-            }.padding(.horizontal, FeedStyle.gutter).padding(.bottom, 16)
-            InfoRow("Follow what you're curious about.")
-            if let email = model.account?.email, !email.isEmpty { InfoRow(email) }
-            if model.authConfiguration?.mode == "supabase" {
-                ActionRow(title: "Edit profile", disabled: model.busy) { editingProfile = true }
+                NavigationLink { ProfileSettingsView(startEditing: true) } label: {
+                    Text("Edit").font(.system(size: 13, weight: .medium))
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .background(.primary.opacity(0.06), in: Capsule())
+                }.buttonStyle(.plain)
+            }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 14)
+            VStack(spacing: 12) {
+                ProfilePhotoPicker()
+                Text(model.account?.displayName?.isEmpty == false ? model.account!.displayName! : "Your profile")
+                    .font(.system(size: 25, weight: .semibold)).tracking(-0.5)
+                AccountEmailRow()
             }
-
-            SectionHeader("Your newsletter address")
-            if alias.isEmpty {
-                InfoRow("Your private newsletter address will appear here once receiving is set up. Your sign-in email is kept separate.")
-            } else {
-            Button {
-                copyText(alias)
-                model.notice = model.account?.aliasStatus == "active" ? "Private newsletter address copied." :
-                    (model.account?.aliasStatus == "provisioning" ? "Address copied. Receiving still needs its delivery test." : "Placeholder alias copied; it cannot receive mail yet.")
-            } label: {
-                HStack(spacing: 12) {
-                    Text(alias).font(.system(size: 14, design: .monospaced))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .layoutPriority(1)
-                    Spacer()
-                    Image(systemName: "doc.on.doc").font(.system(size: 14))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 16)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain).accessibilityLabel("Copy newsletter address").accessibilityValue(alias)
-            if model.account?.aliasStatus == "active" {
-                InfoRow("Use this address for newsletter subscriptions. Mail goes to UpToDate, with no forwarding to your sign-in email.")
-            } else if model.account?.aliasStatus == "provisioning" {
-                InfoRow("Address assigned. We still need to verify incoming delivery before newsletter signup is enabled.")
-            } else {
-                InfoRow("Placeholder only. Import .eml files until receiving is connected.")
-            }
-            if ["temporary_test", "resend"].contains(model.account?.aliasScope ?? "") {
-                InfoRow("Managed newsletter address. Existing subscriptions keep using this address when we add our own domain.")
-            }
-            }
-            if model.authConfiguration?.mode == "supabase" && model.account?.aliasStatus != "active" {
-                ActionRow(title: "Check newsletter address", disabled: model.busy || model.offline) {
-                    Task { await model.refreshAccount() }
-                }
-            }
-
-            SectionHeader("Prototype tools")
-            ActionRow(title: "Load sample Weekly Roundup edition", disabled: model.busy) {
-                Task { await model.loadDemo() }
-            }
+            .frame(maxWidth: .infinity).padding(.horizontal, FeedStyle.gutter)
+            .padding(.top, 16).padding(.bottom, 12)
+            SectionHeader("Your library")
+            Button(action: openBookmarks) {
+                AccountOptionRow(title: "Bookmarks", symbol: "bookmark")
+            }.buttonStyle(.plain)
             RowDivider()
-            InfoRow("Account timezone: \(model.account?.timezone ?? "UTC")")
+            Button(action: openRead) {
+                AccountOptionRow(title: "Read posts", symbol: "checkmark.circle")
+            }.buttonStyle(.plain)
             RowDivider()
-            ActionRow(title: "Sign out", disabled: model.busy) { Task { await model.signOut() } }
+            SectionHeader("Account")
+            NavigationLink { ProfileSettingsView() } label: {
+                AccountOptionRow(title: "Profile", symbol: "person.crop.circle")
+            }.buttonStyle(.plain)
             RowDivider()
-            ActionRow(title: "Delete account and data", destructive: true,
-                      disabled: model.busy || model.offline) { deleting = true }
-        }
-        .toolbar(.hidden)
-        .sheet(isPresented: $editingProfile) { ProfileSettingsView() }
-        .confirmationDialog("Delete your account, imported excerpts, bookmarks, and share links?", isPresented: $deleting, titleVisibility: .visible) {
-            Button("Delete account", role: .destructive) { Task { await model.deleteAccount() } }
-        }
-    }
-
-    private func profileStat(_ value: Int, _ label: String) -> some View {
-        VStack(spacing: 3) {
-            Text("\(value)").font(.system(size: 17, weight: .semibold))
-            Text(label).font(.system(size: 11)).foregroundStyle(.secondary)
-        }
+            NavigationLink { ManageAccountView() } label: {
+                AccountOptionRow(title: "Manage account", symbol: "lock.shield")
+            }.buttonStyle(.plain)
+            RowDivider()
+            Button { Task { await model.signOut() } } label: {
+                Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(maxWidth: .infinity).padding(.vertical, 15)
+                    .background(.primary.opacity(0.06), in: Capsule())
+            }
+            .buttonStyle(.plain).disabled(model.busy)
+            .padding(.horizontal, FeedStyle.gutter).padding(.top, 42).padding(.bottom, 28)
+        }.toolbar(.hidden)
     }
 }
 

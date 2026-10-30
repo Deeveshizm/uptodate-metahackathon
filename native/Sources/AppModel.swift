@@ -4,6 +4,8 @@ import Combine
 @MainActor
 final class AppModel: ObservableObject {
     @Published var account: Account?
+    @Published private(set) var avatarData: Data?
+    private var loadedAvatarRevision: String?
     @Published var feed: DailyFeed?
     @Published var readFeed: DailyFeed?
     @Published var loadingOlder = false
@@ -62,6 +64,8 @@ final class AppModel: ObservableObject {
             sources = snapshot.sources
             readFeed = snapshot.readFeed
             offline = true
+            avatarData = try? Data(contentsOf: cache.deletingLastPathComponent().appendingPathComponent("avatar.png"))
+            loadedAvatarRevision = avatarData == nil ? nil : account?.avatarRevision
         }
         if token == nil {
             if let text = Session.read(account: "auth-flow"),
@@ -112,6 +116,8 @@ final class AppModel: ObservableObject {
         guard token != nil else { return }
         await perform {
             self.account = try await self.get("v1/me")
+            await self.syncTimezone()
+            await self.refreshAvatar()
             try await self.reload()
         }
     }
@@ -157,6 +163,8 @@ final class AppModel: ObservableObject {
         do {
             try persistSession(session)
             account = try await get("v1/me")
+            await syncTimezone()
+            await refreshAvatar()
             try await reload()
         } catch {
             clearLocalSession()
@@ -290,10 +298,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func updateProfile(name: String, timezone: String) async -> Bool {
+    func updateProfile(name: String) async -> Bool {
         var saved = false
         await perform {
-            let body = try JSONSerialization.data(withJSONObject: ["display_name": name, "timezone": timezone])
+            let body = try JSONSerialization.data(withJSONObject: ["display_name": name])
             self.account = try self.decoder.decode(Account.self, from: await self.request("v1/me", method: "PATCH", body: body))
             try await self.reload()
             saved = true
@@ -301,10 +309,71 @@ final class AppModel: ObservableObject {
         return saved
     }
 
+    private func syncTimezone() async {
+        let current = TimeZone.current.identifier
+        guard authConfiguration?.mode == "supabase", account?.timezone != current else { return }
+        let epoch = sessionEpoch
+        do {
+            let body = try JSONSerialization.data(withJSONObject: ["timezone": current])
+            let updated: Account = try decoder.decode(Account.self, from: await request("v1/me", method: "PATCH", body: body))
+            guard epoch == sessionEpoch else { return }
+            account = updated
+        } catch { /* Keep the saved timezone if connectivity is interrupted. */ }
+    }
+
+    private func refreshAvatar() async {
+        let file = cache.deletingLastPathComponent().appendingPathComponent("avatar.png")
+        guard let revision = account?.avatarRevision else {
+            avatarData = nil; loadedAvatarRevision = nil
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
+        guard loadedAvatarRevision != revision || avatarData == nil else { return }
+        let epoch = sessionEpoch
+        do {
+            let image = try await request("v1/me/avatar")
+            guard epoch == sessionEpoch, account?.avatarRevision == revision else { return }
+            avatarData = image; loadedAvatarRevision = revision
+            try? image.write(to: file, options: [.atomic, .completeFileProtection])
+        } catch { /* Leave the last photo visible while temporarily offline. */ }
+    }
+
+    func updateAvatar(_ image: Data) async {
+        await perform {
+            self.account = try self.decoder.decode(Account.self, from: await self.request("v1/me/avatar", method: "PUT", body: image, contentType: "image/jpeg", timeout: 60))
+            await self.refreshAvatar()
+            try await self.reload()
+        }
+    }
+
+    func removeAvatar() async {
+        await perform {
+            _ = try await self.request("v1/me/avatar", method: "DELETE")
+            self.account = try await self.get("v1/me")
+            await self.refreshAvatar()
+            try await self.reload()
+        }
+    }
+
+    func resetPasswordFromAccount() async {
+        guard let email = account?.email, !email.isEmpty else { return }
+        await perform {
+            let client = try self.authClient()
+            let flow = try self.emailFlow(email: email, kind: .recovery)
+            let previousSession = self.authSession
+            try await client.recover(email: email, flow: flow)
+            self.clearLocalSession()
+            try Session.save(String(decoding: JSONEncoder().encode(flow), as: UTF8.self), account: "auth-flow")
+            self.pendingEmail = email; self.pendingAuthKind = .recovery
+            if let previousSession { try? await client.signOut(previousSession) }
+            self.notice = "Recovery link sent. Open it on this device to choose a new password."
+        }
+    }
+
     func refresh() async { await perform { try await self.reload() } }
 
     func refreshAccount() async {
-        await perform { self.account = try await self.get("v1/me"); try await self.reload() }
+        await perform { self.account = try await self.get("v1/me"); await self.refreshAvatar(); try await self.reload() }
     }
 
     private func reload() async throws {
@@ -616,6 +685,8 @@ final class AppModel: ObservableObject {
         Session.clear()
         token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []
         imageCache.removeAll()
+        avatarData = nil; loadedAvatarRevision = nil
+        try? FileManager.default.removeItem(at: cache.deletingLastPathComponent().appendingPathComponent("avatar.png"))
         let images = cache.deletingLastPathComponent().appendingPathComponent("images")
         try? FileManager.default.removeItem(at: images)
         try? FileManager.default.removeItem(at: cache)

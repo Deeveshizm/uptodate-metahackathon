@@ -95,7 +95,7 @@ class AssetStore:
         removed = 0
         with self.store.connect() as db:
             # A day of grace prevents races with in-flight uploads/publications.
-            paths = db.execute('SELECT storage_path FROM media_objects m WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM post_assets p WHERE p.storage_path=m.storage_path) AND NOT EXISTS(SELECT 1 FROM gallery_assets g WHERE g.storage_path=m.storage_path) LIMIT ? FOR UPDATE OF m SKIP LOCKED', (time.time() - 86400, limit)).fetchall()
+            paths = db.execute('SELECT storage_path FROM media_objects m WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM post_assets p WHERE p.storage_path=m.storage_path) AND NOT EXISTS(SELECT 1 FROM gallery_assets g WHERE g.storage_path=m.storage_path) AND NOT EXISTS(SELECT 1 FROM profile_avatars a WHERE a.storage_path=m.storage_path) LIMIT ? FOR UPDATE OF m SKIP LOCKED', (time.time() - 86400, limit)).fetchall()
             for item in paths:
                 response = self._request('DELETE', 'object/' + self.bucket, json={'prefixes': [item['storage_path']]})
                 if response.status_code == 200:

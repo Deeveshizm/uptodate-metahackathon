@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS post_assets (
  id TEXT PRIMARY KEY, post_id TEXT NOT NULL UNIQUE REFERENCES posts(id) ON DELETE CASCADE,
  image BLOB NOT NULL, content_type TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS profile_avatars (
+ user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ revision TEXT NOT NULL, image BLOB NOT NULL, content_type TEXT NOT NULL, storage_path TEXT
+);
 CREATE TABLE IF NOT EXISTS test_relay_aliases (
  address TEXT PRIMARY KEY, user_id TEXT UNIQUE REFERENCES users(id) ON DELETE SET NULL,
  status TEXT NOT NULL CHECK(status IN ('provisioning','active')), created_at TEXT NOT NULL

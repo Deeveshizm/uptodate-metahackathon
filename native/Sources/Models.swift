@@ -9,6 +9,7 @@ struct Account: Codable {
     var displayName: String? = nil
     var aliasStatus: String? = nil
     var aliasScope: String? = nil
+    var avatarRevision: String? = nil
 }
 
 struct NewsletterSource: Codable, Identifiable, Equatable {

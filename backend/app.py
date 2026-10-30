@@ -33,6 +33,7 @@ from .post_chat import ChatInput, answer_post
 from .budgets import JobBudget
 from .source_identity import newsletter_identity
 from .source_lifecycle import category, maintain_sources, management_source
+from .profile_avatars import MAX_UPLOAD, normalize_avatar
 
 
 def uid():
@@ -318,7 +319,9 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         return dict(row)
 
     def account_json(user):
-        return {**{key: user[key] for key in ("id", "alias", "timezone")},
+        with store.connect() as db:
+            avatar = db.execute("SELECT revision FROM profile_avatars WHERE user_id=?", (user["id"],)).fetchone()
+        return {"avatar_revision": avatar["revision"] if avatar else None,**{key: user[key] for key in ("id", "alias", "timezone")},
                 "alias": user.get("alias") or "",
                 "email": user.get("email"), "display_name": user.get("display_name"),
                 "alias_status": user.get("alias_status", "unconfigured"),
@@ -648,6 +651,42 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         if fields:
             auth.update_profile(credentials.credentials, user["id"], fields)
         return account_json(remember_verified_user(auth.identity(credentials.credentials)))
+
+    @app.get("/v1/me/avatar")
+    def get_avatar(user=Depends(current_user)):
+        with store.connect() as db:
+            row = db.execute("SELECT * FROM profile_avatars WHERE user_id=?", (user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "No profile photo")
+        return Response(engine.assets.read(row), media_type="image/png", headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+    @app.put("/v1/me/avatar")
+    async def put_avatar(request: Request, user=Depends(current_user)):
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > MAX_UPLOAD:
+                raise HTTPException(413, "Profile photo must be under 2 MB")
+        try:
+            image = await asyncio.to_thread(normalize_avatar, bytes(raw))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        def save_photo():
+            with store.connect() as db:
+                path = engine.assets.upload(db, image) if engine.assets.remote else None
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute("SELECT 1 FROM users WHERE id=?", (user["id"],)).fetchone():
+                    raise HTTPException(404, "Account no longer exists")
+                db.execute("INSERT INTO profile_avatars(user_id,revision,image,content_type,storage_path) VALUES(?,?,?,?,?) "
+                           "ON CONFLICT(user_id) DO UPDATE SET revision=excluded.revision,image=excluded.image,content_type=excluded.content_type,storage_path=excluded.storage_path",
+                           (user["id"], uid(), b"" if path else image, "image/png", path))
+            return account_json(user)
+        return await asyncio.to_thread(save_photo)
+
+    @app.delete("/v1/me/avatar", status_code=204)
+    def delete_avatar(user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute("DELETE FROM profile_avatars WHERE user_id=?", (user["id"],))
 
     @app.delete("/v1/me", status_code=204)
     def delete_account(user=Depends(current_user)):
