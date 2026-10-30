@@ -678,6 +678,31 @@ final class AppModel: ObservableObject {
         return destination
     }
 
+    func beginNewsletterSetup(_ source: NewsletterSource) async -> Bool {
+        var ready = false
+        await perform {
+            _ = try await self.request("v1/me/sources/\(source.id)/setup", method: "POST")
+            ready = true
+        }
+        return ready
+    }
+
+    func newsletterCode(_ confirmation: NewsletterConfirmation) async -> String? {
+        var code: String?
+        await perform {
+            struct Result: Decodable { let code: String }
+            let result = try self.decoder.decode(Result.self, from: await self.request("v1/newsletter-confirmations/\(confirmation.id)/code", method: "POST"))
+            code = result.code
+        }
+        return code
+    }
+
+    func refreshNewsletterConfirmations() async {
+        guard account != nil else { return }
+        do { newsletterConfirmations = try await get("v1/newsletter-confirmations") }
+        catch { /* The normal refresh path reports connection failures. */ }
+    }
+
     func completeNewsletterConfirmation(_ confirmation: NewsletterConfirmation) async -> Bool {
         var completed = false
         await perform {
@@ -688,10 +713,14 @@ final class AppModel: ObservableObject {
     }
 
     func removePendingSetup(_ source: NewsletterSource) async {
+        await removeSource(source)
+    }
+
+    func removeSource(_ source: NewsletterSource) async {
         await perform {
             _ = try await self.request("v1/me/sources/\(source.id)", method: "DELETE")
             try await self.reload()
-            self.notice = "Setup removed. Future emails from this newsletter will be ignored."
+            self.notice = source.isUnsubscribed ? "Newsletter removed from the list. Existing posts are kept." : "Setup removed. Future emails from this newsletter will be ignored."
         }
     }
 

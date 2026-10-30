@@ -421,6 +421,8 @@ struct ManageView: View {
     @State private var addingLink = false
     @State private var pendingUnsubscribe: NewsletterSource?
     @State private var confirmingUnsubscribe = false
+    @State private var pendingDelete: NewsletterSource?
+    @State private var confirmingDelete = false
     @State private var handoff: NewsletterUnsubscribeHandoff?
     @State private var options: NewsletterSource?
     var importEmail: () -> Void
@@ -467,6 +469,14 @@ struct ManageView: View {
                             .disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
                             .accessibilityIdentifier("newsletter.resubscribe")
                     }.listRowBackground(Color.clear)
+                        .accessibilityActions {
+                            Button("Delete") { askToDelete(source) }
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button { askToDelete(source) } label: { Label("Delete", systemImage: "trash") }
+                                .tint(.red).disabled(model.busy || model.offline)
+                                .accessibilityIdentifier("newsletter.deleteUnsubscribed")
+                        }
                 }
             } header: { Text("Unsubscribed").font(.headline) }
               footer: { Text("Available to resubscribe for 30 days. Existing posts are kept.").font(.caption) }
@@ -481,9 +491,9 @@ struct ManageView: View {
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { options = nil } } }
             }
         }
-        .confirmationDialog("Unsubscribe from \(pendingUnsubscribe?.displayName ?? "this newsletter")?",
+        .confirmationDialog(pendingUnsubscribe?.isCustom == true ? "Stop processing \(pendingUnsubscribe?.displayName ?? "these emails")?" : "Unsubscribe from \(pendingUnsubscribe?.displayName ?? "this newsletter")?",
                             isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
-            Button("Unsubscribe", role: .destructive) {
+            Button(pendingUnsubscribe?.isCustom == true ? "Stop processing" : "Unsubscribe", role: .destructive) {
                 guard let source = pendingUnsubscribe else { return }
                 Task {
                     if let url = await model.unsubscribe(source) { handoff = NewsletterUnsubscribeHandoff(source: source, url: url) }
@@ -495,6 +505,13 @@ struct ManageView: View {
                  ? "Stop creating posts from these emails. Disable the sending task in Muse, Claude, or the sending app to stop delivery. Existing posts are kept."
                  : "Stop new posts and unsubscribe at the publisher. A confirmation page will open if needed. Existing posts are kept.")
         }
+        .confirmationDialog("Delete \(pendingDelete?.displayName ?? "this newsletter")?", isPresented: $confirmingDelete, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                guard let source = pendingDelete else { return }
+                Task { await model.removeSource(source) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { Text("Remove it from the Unsubscribed list now. Existing posts are kept, and future emails stay ignored.") }
     }
 
     private func topAction(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
@@ -520,25 +537,29 @@ struct ManageView: View {
         pendingUnsubscribe = source
         confirmingUnsubscribe = true
     }
+    private func askToDelete(_ source: NewsletterSource) {
+        pendingDelete = source
+        confirmingDelete = true
+    }
     private func subscriptionRow(_ source: NewsletterSource) -> some View {
         Toggle(source.displayName, isOn: Binding(get: { source.muted == 0 }, set: { shown in
             Task { await model.updateSource(source, muted: !shown) }
         }))
         .toggleStyle(.switch).tint(.green).disabled(model.busy || model.offline)
-        .accessibilityHint(source.canUnsubscribe ? "Show or hide this newsletter in Home. Swipe left to unsubscribe." : "Show or hide this newsletter in Home.")
+        .accessibilityHint(source.canUnsubscribe ? (source.isCustom ? "Show or hide this newsletter in Home. Swipe left to stop processing." : "Show or hide this newsletter in Home. Swipe left to unsubscribe.") : "Show or hide this newsletter in Home.")
         .accessibilityActions {
-            if source.canUnsubscribe { Button("Unsubscribe") { askToUnsubscribe(source) } }
+            if source.canUnsubscribe { Button(source.isCustom ? "Stop processing" : "Unsubscribe") { askToUnsubscribe(source) } }
             else if source.canRemoveSetup { Button("Delete unfinished signup") { Task { await model.removePendingSetup(source) } } }
         }
         .listRowBackground(Color.clear)
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             if source.canUnsubscribe {
-                Button { askToUnsubscribe(source) } label: { Label("Unsubscribe", systemImage: "minus.circle") }
+                Button { askToUnsubscribe(source) } label: { Label(source.isCustom ? "Stop processing" : "Unsubscribe", systemImage: "minus.circle") }
                     .tint(.red).disabled(model.busy || model.offline)
             } else if source.canRemoveSetup {
                 Button(role: .destructive) { Task { await model.removePendingSetup(source) } } label: {
                     Label("Delete", systemImage: "trash")
-                }.disabled(model.busy || model.offline).accessibilityIdentifier("newsletter.removeSetup")
+                }.tint(.red).disabled(model.busy || model.offline).accessibilityIdentifier("newsletter.removeSetup")
             }
         }
         .contextMenu { Button("Subscription options") { options = source } }
@@ -680,13 +701,18 @@ struct SourceEditor: View {
                 if !source.isCustom, !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
                     Button {
                         if let url = URL(string: source.signupUrl), ["https", "http"].contains(url.scheme ?? "") {
-                            copyText(model.account?.alias ?? "")
-                            finishingSignup = true
+                            Task {
+                                if await model.beginNewsletterSetup(source) {
+                                    copyText(model.account?.alias ?? "")
+                                    finishingSignup = true
+                                }
+                            }
                         }
                     } label: {
                         Text("Finish setup").modifier(CapsuleButtonLabelSizing(fontSize: 14, weight: .medium))
                     }
                         .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                        .tint(.blue)
                         .disabled(model.busy || model.offline)
                         .accessibilityIdentifier("newsletter.finishSignup")
                 }
@@ -702,10 +728,14 @@ struct SourceEditor: View {
                 }
             }
             if source.canUnsubscribe {
-            Button(source.isCustom ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
+            Button(role: .destructive) {
                 confirmingUnsubscribe = true
+            } label: {
+                Text(source.isCustom ? "Stop processing" : "Unsubscribe from newsletter")
+                    .modifier(CapsuleButtonLabelSizing(fontSize: 14, weight: .medium))
             }
-            .font(.system(size: 14)).buttonStyle(.plain)
+            .buttonStyle(.bordered).buttonBorderShape(.capsule).tint(.red)
+            .accessibilityIdentifier("newsletter.stopProcessing")
             .disabled(model.busy || model.offline || source.subscriptionStatus == "unsubscribed")
             }
         }
@@ -713,10 +743,10 @@ struct SourceEditor: View {
         .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)
         .onAppear { signup = source.signupUrl }
         .sheet(isPresented: $finishingSignup) {
-            if let url = URL(string: source.signupUrl) { PublisherSignupSheet(url: url, alias: model.account?.alias ?? "") }
+            if let url = URL(string: source.signupUrl) { PublisherSignupSheet(url: url, alias: model.account?.alias ?? "", sourceID: source.id) }
         }
-        .confirmationDialog("Unsubscribe from \(source.name)?", isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
-            Button("Unsubscribe", role: .destructive) {
+        .confirmationDialog(source.isCustom ? "Stop processing \(source.displayName)?" : "Unsubscribe from \(source.displayName)?", isPresented: $confirmingUnsubscribe, titleVisibility: .visible) {
+            Button(source.isCustom ? "Stop processing" : "Unsubscribe", role: .destructive) {
                 Task {
                     if let url = await model.unsubscribe(source) { openURL(url) }
                 }

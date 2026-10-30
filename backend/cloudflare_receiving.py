@@ -95,7 +95,9 @@ class CloudflareReader:
             row = db.execute("SELECT * FROM cloudflare_inbound WHERE id=?", (message_id,)).fetchone()
         if not row:
             raise ReceivingError("Incoming email is no longer available")
-        return parse_message(bytes(row["raw"]), row["recipient"], row["id"])
+        message=parse_message(bytes(row["raw"]), row["recipient"], row["id"])
+        message['created_at']=row['created_at']
+        return message
 
 
 class CloudflareRelay(ResendRelay):

@@ -74,11 +74,28 @@ struct NewsletterConfirmationPrompt: View {
     @EnvironmentObject private var model: AppModel
     let confirmation: NewsletterConfirmation
     @State private var destination: ConfirmationDestination?
+    @State private var code: String?
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(confirmation.sourceName ?? "Confirm newsletter signup").font(.headline)
             Text(confirmation.subject).font(.subheadline)
             Text("From \(confirmation.senderDomain)").font(.caption).foregroundStyle(.secondary)
+            if confirmation.isCode {
+                if let code { Text(code).font(.title2.monospaced().weight(.semibold)).textSelection(.enabled) }
+                Button {
+                    Task {
+                        if let value = await model.newsletterCode(confirmation) { code = value; copyText(value) }
+                    }
+                } label: { Text(code == nil ? "View and copy code" : "Copy code").modifier(CapsuleButtonLabelSizing()) }
+                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(.blue)
+                    .disabled(model.busy || model.offline)
+                    .accessibilityIdentifier("newsletter.copyCode")
+                if code != nil {
+                    Button("I've entered it") { Task { _ = await model.completeNewsletterConfirmation(confirmation) } }
+                        .buttonStyle(.bordered).buttonBorderShape(.capsule)
+                        .disabled(model.busy || model.offline)
+                }
+            } else {
             Button {
                 Task {
                     if let url = await model.newsletterConfirmationURL(confirmation) {
@@ -92,6 +109,7 @@ struct NewsletterConfirmationPrompt: View {
             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
             .disabled(model.busy || model.offline)
             .accessibilityIdentifier("newsletter.openConfirmation")
+            }
         }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
             .background(.secondary.opacity(0.05))
             .sheet(item: $destination) { destination in
@@ -217,18 +235,27 @@ struct SourceEmailSheet: View {
 }
 
 struct PublisherSignupSheet: View {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let url: URL
     let alias: String
+    var sourceID: String? = nil
+    @State private var showingCopyNotice = false
+    @State private var copyNoticeVersion = 0
+    @State private var code: String?
+    private var codeConfirmation: NewsletterConfirmation? {
+        guard let sourceID else { return nil }
+        return model.newsletterConfirmations.first { $0.sourceId == sourceID && $0.isCode }
+    }
     var body: some View {
+        Group {
         #if os(iOS)
         PublisherBrowser(url: url, onDone: { dismiss() })
             .ignoresSafeArea()
-            .onAppear { copyText(alias) }
         #else
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
-                Button { copyText(alias) } label: {
+                Button { copyNoticeVersion += 1 } label: {
                     Text("Copy private email").modifier(CapsuleButtonLabelSizing())
                 }.accessibilityIdentifier("signup.copyAlias")
                     .buttonStyle(.bordered).buttonBorderShape(.capsule).padding(.horizontal)
@@ -238,8 +265,57 @@ struct PublisherSignupSheet: View {
                 Spacer()
             }.navigationTitle("Finish newsletter signup")
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
-        }.frame(minWidth: 340,minHeight: 500).onAppear { copyText(alias) }
+        }.frame(minWidth: 340,minHeight: 500)
         #endif
+        }
+        .overlay(alignment: .top) {
+            if let code, let confirmation = codeConfirmation {
+                HStack(spacing: 12) {
+                    Button { copyText(code) } label: {
+                        Label("Code \(code) copied", systemImage: "doc.on.doc")
+                    }.accessibilityLabel("Copy verification code \(code)")
+                    Button("I've entered it") { Task { _ = await model.completeNewsletterConfirmation(confirmation) } }
+                        .foregroundStyle(.blue)
+                }
+                .font(.footnote.weight(.medium))
+                .padding(.horizontal, 16).padding(.vertical, 11)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.horizontal, 12).padding(.top, 64)
+                .accessibilityIdentifier("signup.codePill")
+            } else if showingCopyNotice {
+                Label("Alias email copied to clipboard", systemImage: "checkmark.circle.fill")
+                    .font(.footnote.weight(.medium))
+                    .padding(.horizontal, 16).padding(.vertical, 11)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(.primary.opacity(0.1), lineWidth: 0.5))
+                    .padding(.horizontal, 16).padding(.top, 64)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .accessibilityIdentifier("signup.aliasCopied")
+                    .allowsHitTesting(false)
+            }
+        }
+        .task(id: codeConfirmation?.id) {
+            code = nil
+            if let confirmation = codeConfirmation, let value = await model.newsletterCode(confirmation) {
+                copyText(value)
+                code = value
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                await model.refreshNewsletterConfirmations()
+                do { try await Task.sleep(for: .seconds(3)) }
+                catch { return }
+            }
+        }
+        .task(id: copyNoticeVersion) {
+            guard !alias.isEmpty else { return }
+            copyText(alias)
+            withAnimation(.easeOut(duration: 0.2)) { showingCopyNotice = true }
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+            withAnimation(.easeOut(duration: 0.2)) { showingCopyNotice = false }
+        }
     }
 }
 
@@ -263,8 +339,10 @@ struct PublisherUnsubscribeSheet: View {
                     Task { if await model.confirmUnsubscribe(source) { dismiss() } }
                 } label: {
                     Text("I've unsubscribed").modifier(CapsuleButtonLabelSizing())
+                        .foregroundStyle(.white)
                 }
                 .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                .tint(.blue)
                 .disabled(model.busy || model.offline)
                 .accessibilityIdentifier("newsletter.confirmUnsubscribe")
                 .padding(.bottom, 12)

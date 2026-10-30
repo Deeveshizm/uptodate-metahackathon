@@ -144,6 +144,7 @@ ADDITIONS = {
         "source_category": "TEXT NOT NULL DEFAULT ''",
         "unsubscribed_at": "TEXT",
         "archived_at": "TEXT",
+        "setup_expires_at": "TEXT",
     },
     "jobs": {
         "kind": "TEXT NOT NULL DEFAULT 'email'", "stage": "TEXT NOT NULL DEFAULT ''",
@@ -154,6 +155,11 @@ ADDITIONS = {
         "verification": "TEXT NOT NULL DEFAULT 'manual_required'",
         "visual": "TEXT NOT NULL DEFAULT '{}'",
         "artifact_key": "TEXT REFERENCES generation_artifacts(cache_key) ON DELETE SET NULL",
+    },
+    "newsletter_confirmations": {
+        "kind": "TEXT NOT NULL DEFAULT 'link'",
+        "verification_code": "TEXT NOT NULL DEFAULT ''",
+        "expires_at": "TEXT",
     },
 }
 

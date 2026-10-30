@@ -3,6 +3,18 @@ import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
+def publisher_sender_rank(source, sender):
+    """Prefer a bound mailbox, then a publication subdomain, then its domain."""
+    source=dict(source)
+    local, separator, domain=sender.lower().rpartition('@')
+    if not separator:return 0
+    bound=source.get('email_sender','').lower()
+    if bound:return 3 if sender.lower()==bound else 0
+    expected=source.get('expected_sender_domain','').lower()
+    if expected and expected==local+'.'+domain:return 2
+    return int(bool(expected and (domain==expected or domain.endswith('.'+expected))))
+
+
 def newsletter_identity(url):
     parts = urlsplit(url)
     host = (parts.hostname or "").lower().removeprefix("www.")

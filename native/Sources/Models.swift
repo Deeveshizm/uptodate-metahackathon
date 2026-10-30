@@ -128,6 +128,9 @@ struct NewsletterConfirmation: Decodable, Identifiable {
     let status: String
     let sourceId: String?
     let sourceName: String?
+    var kind: String? = nil
+    var expiresAt: String? = nil
+    var isCode: Bool { kind == "code" }
 }
 
 struct EmailSourceText: Decodable {

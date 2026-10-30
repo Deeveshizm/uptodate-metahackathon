@@ -531,43 +531,41 @@ private struct BiggieThinkingBubble: View {
 }
 
 private struct PostAIShareSheet: View {
-    @EnvironmentObject private var model: AppModel
     let post: Post
-    @State private var source: String?
-    @State private var error: String?
+    private var sourceURL: URL? {
+        guard !post.isEmailSource, let url = URL(string: post.originalUrl),
+              ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
+              url.host != nil, url.user == nil, url.password == nil else { return nil }
+        return url
+    }
     var body: some View {
         Group {
-            if let source {
+            if let sourceURL {
                 #if os(iOS)
-                PostSourceActivity(context: source)
+                PostSourceActivity(sourceURL: sourceURL)
                 #else
                 VStack(spacing: 16) {
                     Text("Open the original source").font(.headline)
-                    ShareLink(item: source) { Label("Choose an app", systemImage: "arrow.up.forward.app") }
+                    ShareLink(item: sourceURL) { Label("Choose an app", systemImage: "arrow.up.forward.app") }
                 }.padding(28)
                 #endif
-            } else if let error { Text(error).foregroundStyle(.secondary).padding() }
-            else { ProgressView("Preparing source…").padding() }
-        }.task {
-            do {
-                if post.isEmailSource {
-                    let original = try await model.sourceEmail(post)
-                    source = original.title + "\n\n" + original.text
-                } else { source = post.originalUrl }
-            } catch { self.error = error.localizedDescription }
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "link").font(.title2)
+                    Text("No public source link").font(.headline)
+                    Text("This post comes from an email without a public original-source URL.")
+                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.padding(28)
+            }
         }
     }
 }
 
 #if os(iOS)
 private struct PostSourceActivity: UIViewControllerRepresentable {
-    let context: String
+    let sourceURL: URL
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        let item: Any
-        if let url=URL(string:self.context),url.host != nil,["https","http"].contains(url.scheme ?? "") {
-            item=url
-        } else { item=self.context }
-        let controller = UIActivityViewController(activityItems: [item], applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: [sourceURL], applicationActivities: nil)
         controller.excludedActivityTypes = [.postToFacebook, .postToTwitter, .postToWeibo, .message, .mail,
                                           .print, .assignToContact, .saveToCameraRoll, .addToReadingList,
                                           .postToFlickr, .postToVimeo, .postToTencentWeibo, .airDrop]

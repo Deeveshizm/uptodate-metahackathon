@@ -8,7 +8,7 @@ import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -519,12 +519,12 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                            (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
             db.execute("UPDATE sources SET subscription_status='queued',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
             db.execute('DELETE FROM source_mail_actions WHERE source_id=? AND user_id=?', (source_id, user['id']))
-            db.execute("UPDATE newsletter_confirmations SET status='superseded',action_url='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened','confirmed')", (source_id,user['id']))
+            db.execute("UPDATE newsletter_confirmations SET status='superseded',action_url='',verification_code='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened','confirmed')", (source_id,user['id']))
         schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
 
     @app.delete('/v1/me/sources/{source_id}', status_code=204)
-    def remove_pending_source(source_id: str, user=Depends(current_user)):
+    def remove_source(source_id: str, user=Depends(current_user)):
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             source=db.execute('SELECT * FROM sources WHERE id=? AND user_id=?',(source_id,user['id'])).fetchone()
@@ -533,12 +533,15 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             if source['archived_at'] and source['subscription_status']=='unsubscribed':
                 return
             confirmed=db.execute("SELECT 1 FROM newsletter_confirmations WHERE source_id=? AND user_id=? AND status='confirmed'",(source_id,user['id'])).fetchone()
-            if confirmed or source['subscription_status'] in ('receiving','email_received','unsubscribe_pending','unsubscribing','unsubscribed') or category(dict(source))=='custom':
+            unsubscribed=source['subscription_status']=='unsubscribed'
+            if not unsubscribed and (confirmed or source['subscription_status'] in ('receiving','email_received','unsubscribe_pending','unsubscribing') or category(dict(source))=='custom'):
                 raise HTTPException(409,'This subscription is active; use Unsubscribe instead')
             stamp=now()
-            db.execute("UPDATE sources SET subscription_status='unsubscribed',subscription_detail='Setup removed; future email processing stopped',unsubscribed_at=?,archived_at=? WHERE id=? AND user_id=?",(stamp,stamp,source_id,user['id']))
+            detail='Removed from newsletter list; future emails remain ignored' if unsubscribed else 'Setup removed; future email processing stopped'
+            db.execute("UPDATE sources SET subscription_status='unsubscribed',subscription_detail=?,unsubscribed_at=COALESCE(unsubscribed_at,?),archived_at=? WHERE id=? AND user_id=?",(detail,stamp,stamp,source_id,user['id']))
             db.execute("UPDATE jobs SET status='cancelled',stage='cancelled',error='Pending setup removed by user',payload=NULL WHERE source_id=? AND user_id=? AND status='queued' AND kind NOT IN ('ask_ai','visual')",(source_id,user['id']))
-            db.execute("UPDATE newsletter_confirmations SET status='cancelled',action_url='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened')",(source_id,user['id']))
+            db.execute("UPDATE newsletter_confirmations SET status='cancelled',action_url='',verification_code='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened')",(source_id,user['id']))
+            db.execute('DELETE FROM source_mail_actions WHERE source_id=? AND user_id=?',(source_id,user['id']))
 
     @app.post("/v1/me/sources/{source_id}/unsubscribe")
     def unsubscribe_source(source_id: str, user=Depends(current_user)):
@@ -822,12 +825,24 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         from .newsletter_confirmations import expire_confirmations
         with store.connect() as db:
             expire_confirmations(db)
-            rows=db.execute("SELECT c.id,c.subject,c.sender_domain,c.status,c.source_id,s.name AS source_name "
+            rows=db.execute("SELECT c.id,c.subject,c.sender_domain,c.status,c.source_id,c.kind,c.expires_at,s.name AS source_name "
                             "FROM newsletter_confirmations c LEFT JOIN sources s ON s.id=c.source_id "
                             "WHERE c.user_id=? AND c.status IN ('pending','opened') "
                             "AND (c.source_id IS NULL OR s.subscription_status NOT IN ('unsubscribed','unsubscribe_pending','unsubscribing')) "
                             "ORDER BY c.created_at DESC LIMIT 20",(user['id'],)).fetchall()
             return JSONResponse([dict(row) for row in rows],headers={'Cache-Control':'private, no-store'})
+
+    @app.post('/v1/me/sources/{source_id}/setup')
+    def start_manual_setup(source_id:str,user=Depends(current_user)):
+        if user.get('alias_status')!='active':raise HTTPException(409,'Your newsletter address is not ready')
+        with store.connect() as db:
+            source=db.execute('SELECT * FROM sources WHERE id=? AND user_id=?',(source_id,user['id'])).fetchone()
+            if not source:raise HTTPException(404,'Newsletter not found')
+            if source['archived_at'] or source['subscription_status'] in ('receiving','unsubscribed','unsubscribe_pending','unsubscribing'):
+                raise HTTPException(409,'This newsletter is not waiting for signup')
+            expires=(datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()
+            db.execute('UPDATE sources SET setup_expires_at=?,subscription_alias=? WHERE id=? AND user_id=?',(expires,user['alias'],source_id,user['id']))
+        return {'expires_at':expires}
 
     def own_confirmation(db,confirmation_id,user):
         from .newsletter_confirmations import expire_confirmations
@@ -845,6 +860,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row=own_confirmation(db,confirmation_id,user)
+            if row['kind']=='code':raise HTTPException(409,'Use the verification code action for this email')
             url=public_url(row['action_url'])
             if urlsplit(url).scheme!='https':
                 raise HTTPException(409,'Confirmation link is unavailable')
@@ -855,6 +871,19 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 db.execute("UPDATE sources SET expected_sender_domain=?,subscription_status='confirmation_required',subscription_detail='Confirmation link opened by you; finish on the publisher website.' WHERE id=? AND user_id=?",(row['sender_domain'],row['source_id'],user['id']))
             return JSONResponse({'url':url},headers={'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer'})
 
+    @app.post('/v1/newsletter-confirmations/{confirmation_id}/code')
+    def newsletter_code(confirmation_id:str,user=Depends(current_user)):
+        from .newsletter_confirmations import expire_confirmations
+        # Commit expiry cleanup even when the requested code is then rejected.
+        with store.connect() as cleanup:
+            expire_confirmations(cleanup)
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=own_confirmation(db,confirmation_id,user)
+            if row['kind']!='code' or not row['verification_code']:raise HTTPException(409,'No current signup code is available')
+            db.execute("UPDATE newsletter_confirmations SET status='opened' WHERE id=?",(confirmation_id,))
+            return JSONResponse({'code':row['verification_code'],'expires_at':row['expires_at']},headers={'Cache-Control':'private, no-store'})
+
     @app.post('/v1/newsletter-confirmations/{confirmation_id}/complete',status_code=204)
     def complete_newsletter_confirmation(confirmation_id:str,user=Depends(current_user)):
         with store.connect() as db:
@@ -862,7 +891,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             row=own_confirmation(db,confirmation_id,user)
             if row['status']!='opened':
                 raise HTTPException(409,'Open the confirmation link on the publisher website first')
-            db.execute("UPDATE newsletter_confirmations SET status='confirmed',action_url='' WHERE id=?",(confirmation_id,))
+            db.execute("UPDATE newsletter_confirmations SET status='confirmed',action_url='',verification_code='' WHERE id=?",(confirmation_id,))
             if row['source_id']:
                 db.execute("UPDATE sources SET subscription_status='submitted',subscription_detail='Confirmation marked complete by you; waiting for the first newsletter edition.' WHERE id=? AND user_id=?",(row['source_id'],user['id']))
 

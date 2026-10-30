@@ -21,6 +21,7 @@ import httpx
 
 from .pipeline import parse_newsletter, safe_url
 from .relay_aliases import ACTIVE_ALIASES, active_alias, alias_digest
+from .source_identity import publisher_sender_rank
 
 RELAY_LOCAL_PATTERN = r"n_(?:[a-z2-7]{13}|[0-9a-f]{32})"
 
@@ -297,7 +298,7 @@ class ResendRelay:
             message = self.reader.message(message_id)
             if message.get("id") != message_id or recipient_set(message) != {relay["address"]}:
                 raise ReceivingError("Received message identity or recipient changed; nothing was imported")
-            from .newsletter_confirmations import record_confirmation, complete_on_delivery, expire_confirmations
+            from .newsletter_confirmations import record_confirmation, complete_on_delivery, expire_confirmations, signup_code
             if receipt:
                 with store.connect() as db:
                     db.execute('BEGIN IMMEDIATE')
@@ -318,12 +319,16 @@ class ResendRelay:
                 channel=email_channel(sender,str(message.get('subject') or ''))
                 sources = db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_alias=? AND expected_sender_domain!='' AND sender LIKE 'newsletter:%'",
                                      (owner_id, relay["address"])).fetchall()
-                matches = [source for source in sources if sender_domain == source["expected_sender_domain"] or sender_domain.endswith("." + source["expected_sender_domain"])]
+                ranked=[(publisher_sender_rank(source,sender),source) for source in sources]
+                best=max((rank for rank,_ in ranked),default=0)
+                matches = [source for rank,source in ranked if rank==best and rank>0]
                 matched = matches[0] if len(matches) == 1 else None
                 if not matches:
                     matched = db.execute("SELECT * FROM sources WHERE user_id=? AND email_sender=? AND email_topic=?", (owner_id,sender,channel)).fetchone()
                 if len(matches) > 1:
                     parsed, state = None, "requires_source_match"
+                if signup_code(db,owner_id,relay['address'],message):
+                    parsed,state=None,'manual_action'
                 if state == 'manual_action':
                     matched = record_confirmation(db,owner_id,relay['address'],message,matched)
                 expire_confirmations(db)
