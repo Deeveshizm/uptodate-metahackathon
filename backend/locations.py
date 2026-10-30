@@ -9,6 +9,21 @@ GENERIC = re.compile(r"(?:(?:open|view|get|see|show|find|click)\s+)?(?:(?:in|on|
 NAME_LABELS={"pick","today's pick","today’s pick","recommendation","recommended venue","venue","place","restaurant","cafe","café","coffee shop","name"}
 
 
+def venue_name(value):
+    value=normalize(value)
+    alias=re.fullmatch(r'(.+?)\s+\(([^()]+)\)',value)
+    if alias:
+        primary=normalize(alias[1])
+        if re.search(r'(?<!\w)'+re.escape(primary)+r'(?!\w)',normalize(alias[2]),re.I):
+            return primary
+    return value
+
+
+def generic_map_label(value):
+    return bool(GENERIC.fullmatch(value) or re.match(
+        r'^(?:(?:open|view|see|get)\s+)?(?:(?:google|apple)\s+)?maps?\s+(?:for|to|of|at)\b',value,re.I))
+
+
 def labelled_fields(text):
     # Match each field's starting boundary independently so adjacent inline
     # fields are not swallowed by the previous value.
@@ -55,7 +70,10 @@ def website_reference(document,text):
             if value and not map_link(value):return value
     for link in document.links:
         value=safe_url(link.get('url',''))
-        if value and not map_link(value) and re.fullmatch(r'(?:visit |official |our )?website',link.get('title','').strip(),re.I):return value
+        if value and not map_link(value) and (
+            re.fullmatch(r'(?:visit |official |our )?website',link.get('title','').strip(),re.I)
+            or re.match(r'^(?:[-–—•]\s*)?(?:official |our )?web\s*site\s*:',link.get('context','').strip(),re.I)
+        ):return value
     return None
 
 
@@ -63,8 +81,14 @@ def email_places(document):
     text='\n'.join(span['text'] for span in document.spans)
     fields=labelled_fields(text)
     suffix=document.title.split(':',1)[-1].strip() if ':' in document.title else ''
-    name=next((value for label,value in fields if label in NAME_LABELS),None)
+    explicit_name=next((venue_name(value) for label,value in fields if label in NAME_LABELS),None)
+    name=explicit_name
     if not name and suffix and suffix.casefold() in text.casefold():name=suffix
+    if not name:
+        headings=list(dict.fromkeys(normalize(span.get('section','')) for span in document.spans
+            if span.get('section') and span['section'] not in ('Body','Email',document.title)
+            and not re.fullmatch(r'sources?|references?|footer|disclaimer|introduction|overview|ingredients|instructions|hours|contact(?: details)?',normalize(span['section']),re.I)))
+        if len(headings)==1 and len(headings[0])<=200:name=venue_name(headings[0])
     address=text_address(text) or ''
     website=website_reference(document,text)
     links=[link for link in document.links if map_link(link.get('url',''))]
@@ -78,7 +102,10 @@ def email_places(document):
             path=re.search(r'/maps/(?:place|search)/([^/]+)',parts.path)
             if path:value=unquote(path[1]).replace('+',' ')
         if re.fullmatch(r'[-+\d.,\s]+',value) or value.startswith('place_id:'):value=''
-        identity=label if label and not GENERIC.fullmatch(label) and not label.startswith('http') else name or value
+        if explicit_name and len(links)==1:
+            identity=explicit_name
+        else:
+            identity=label if label and not generic_map_label(label) and not label.startswith('http') else name or value
         linked_address=(query.get('address') or [''])[0] or text_address(link.get('context','')) or (address if len(links)==1 else '')
         if not identity:identity=linked_address or 'Location from email'
         place={'name':identity[:200],'address':linked_address[:400],'map_url':urlunsplit(parts._replace(scheme='https')),'source_url':document.url}

@@ -562,6 +562,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             if street:
                 regions=[]
                 for node in soup.find_all(['address','article','section','div','li']):
+                    if any(parent.name in ('nav','header','footer','aside') for parent in node.parents):continue
                     if not node.find('img'):continue
                     content=normalize(node.get_text(' ',strip=True))
                     if len(content)<=2500 and ' '+street+' ' in ' '+venue_address_text(content)+' ':

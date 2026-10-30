@@ -26,6 +26,10 @@ benchmark charts, measured results, robot brains or generic AI clip art.
 For a real venue, illustrate the named offerings and general mood rather than
 inventing its actual interior, building, signage or surroundings. The result is
 clearly illustrative, never documentary evidence. Do not invent menu offerings.
+Treat business names as proper names, never as literal objects or ingredients.
+The focal subject of a venue recommendation is the dining or visiting experience,
+not a vegetable named in the business name or one dessert mentioned in passing.
+Only make a dish the main subject when the post itself is about that dish.
 Search may inform accurate visual references, not add new claims to the post.
 No screenshot, article layout, poster, logos or invented charts. For a verified
 research flow ONLY, the exact supplied stage labels may appear, sized for a small
@@ -40,8 +44,8 @@ def visual_brief(draft):
     styles = {
         'recipe': ('Editorial food photography with natural window light and appetizing, realistic textures.',
                    'Editorial food photography with dramatic side light, rich detail and a simple contrasting surface.'),
-        'places': ('Expressive hand-painted gouache still life, tactile brushwork and lively subject-led colors.',
-                   'Layered cut-paper editorial still life, tactile depth, confident shapes and vivid subject-led colors.'),
+        'places': ('Expressive hand-painted editorial scene of a source-supported dining or visiting experience, tactile brushwork and lively colors.',
+                   'Layered cut-paper editorial scene of a source-supported dining or visiting experience, tactile depth and vivid colors.'),
         'paper': ('Sculptural editorial 3D illustration, purposeful materials, directional lighting and strong spatial depth.',
                   'Precise layered paper sculpture, tactile edges and a bold, subject-led color contrast.',
                   'Expressive editorial ink drawing with textured color accents and a strong focal subject.'),
@@ -56,12 +60,13 @@ def visual_brief(draft):
     recipe = action.get('data') if action.get('kind') == 'ingredients' else {}
     ingredients = recipe.get('ingredients', [])[:8] if isinstance(recipe,dict) else []
     return {'purpose':'Explain the story at a glance, not decorate its headline.', 'content_type':category,
-            'mode':'verified_research_flow' if flow else 'subject',
+            'mode':'verified_research_flow' if flow else 'venue_experience' if category=='places' else 'subject',
             'medium':'Clean, precise editorial flowchart with legible source-grounded labels, generous spacing and strong directional hierarchy.' if flow else options[index],
             'verified_methodology':workflow if flow else [], 'headline_context':draft['title'][:250],
             'verified_summary':draft['finding'][:2000], 'source_caveats':draft.get('limitations','')[:800],
             'source_details':(analysis.get('sections') or [])[:3], 'source_supported_ingredients':ingredients,
-            'venue_rule':'Conceptual only; never present an invented location as a real photo.' if category=='places' else None}
+            'venue_names':[place['name'][:200] for place in action.get('data',[])[:3] if isinstance(place,dict) and place.get('name')] if category=='places' and action.get('kind')=='places' else [],
+            'venue_rule':'Business names are proper names, not ingredients. Focus on the venue experience, not a passing menu item. Conceptual only; never present an invented location as a real photo.' if category=='places' else None}
 
 
 def image_reasoning():

@@ -419,6 +419,7 @@ struct PostDetail: View {
 struct ManageView: View {
     @EnvironmentObject private var model: AppModel
     @State private var addingLink = false
+    @State private var creatingNewsletter = false
     @State private var pendingUnsubscribe: NewsletterSource?
     @State private var confirmingUnsubscribe = false
     @State private var pendingDelete: NewsletterSource?
@@ -436,10 +437,11 @@ struct ManageView: View {
         AppSourceList {
             VStack(spacing: 0) {
                 PageHeader(title: "Your newsletters", trailing: "\(subscribed.count) subscribed")
-                HStack(alignment: .top, spacing: 28) {
+                HStack(alignment: .top, spacing: 12) {
                     topAction("Add newsletter", symbol: "plus") { addingLink = true }
                     topAction("Import .eml", symbol: "square.and.arrow.down", action: importEmail)
-                }.frame(maxWidth: .infinity).padding(.vertical, 18)
+                    topAction("Create newsletter", symbol: "sparkles") { creatingNewsletter = true }
+                }.frame(maxWidth: .infinity).padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)
                 ForEach(model.newsletterConfirmations) { confirmation in
                     NewsletterConfirmationPrompt(confirmation: confirmation)
                 }
@@ -483,6 +485,7 @@ struct ManageView: View {
         }
         .toolbar(.hidden).refreshable { await model.refresh() }
         .sheet(isPresented: $addingLink) { SourceLinkView() }
+        .sheet(isPresented: $creatingNewsletter) { NewsletterComposerView() }
         .sheet(item: $handoff) { value in PublisherUnsubscribeSheet(source: value.source, url: value.url) }
         .sheet(item: $options) { source in
             NavigationStack {
@@ -521,8 +524,8 @@ struct ManageView: View {
                     .frame(width: 60, height: 60)
                     .background(.primary.opacity(0.07), in: Circle())
                     .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
-                Text(title).font(.system(size: 12, weight: .medium))
-            }.frame(width: 112).foregroundStyle(.primary)
+                Text(title).font(.system(size: 12, weight: .medium)).multilineTextAlignment(.center).lineLimit(2)
+            }.frame(maxWidth: .infinity).foregroundStyle(.primary)
         }.buttonStyle(.plain).disabled(model.busy || model.offline)
     }
     private func subsection(_ title: String) -> some View {
