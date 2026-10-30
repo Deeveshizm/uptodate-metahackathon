@@ -317,6 +317,13 @@ private struct BiggieChatView: View {
     private var canSend: Bool {
         !sending && !model.offline && !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+    private var avatar: Image {
+        #if SWIFT_PACKAGE
+        return Image("BiggieAvatar", bundle: .module)
+        #else
+        return Image("BiggieAvatar")
+        #endif
+    }
     var body: some View {
         NavigationStack {
             ScrollViewReader { proxy in
@@ -351,6 +358,18 @@ private struct BiggieChatView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             #endif
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    VStack(spacing: 2) {
+                        avatar
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 36, height: 36)
+                            .clipShape(Circle())
+                            .accessibilityHidden(true)
+                        Text("Biggie").font(.caption.weight(.semibold))
+                    }
+                    .accessibilityElement(children: .combine)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button { dismiss() } label: { Image(systemName: "xmark").font(.subheadline.weight(.medium)) }
                         .foregroundStyle(.secondary).accessibilityLabel("Close Ask AI")
