@@ -97,8 +97,8 @@ struct AccountEmailRow: View {
                 model.notice = "Newsletter address copied."
             } label: {
                 Label("Copy alias", systemImage: "doc.on.doc")
-                    .font(.system(size: 11, weight: .medium)).fixedSize()
-                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .font(.system(size: 11 * FeedStyle.buttonScale, weight: .medium)).fixedSize()
+                    .padding(.horizontal, 10 * FeedStyle.buttonScale).padding(.vertical, 8 * FeedStyle.buttonScale)
                     .background(.primary.opacity(0.06), in: Capsule())
             }
             .buttonStyle(.plain)
@@ -140,8 +140,8 @@ struct AccountPageHeader: View {
             Spacer()
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .font(.system(size: 13, weight: .medium)).buttonStyle(.plain)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .font(.system(size: 13 * FeedStyle.buttonScale, weight: .medium)).buttonStyle(.plain)
+                    .padding(.horizontal, 14 * FeedStyle.buttonScale).padding(.vertical, 9 * FeedStyle.buttonScale)
                     .background(.primary.opacity(0.06), in: Capsule())
             }
         }.padding(.horizontal, FeedStyle.gutter).padding(.top, 18).padding(.bottom, 30)
@@ -177,8 +177,8 @@ struct ProfileSettingsView: View {
                 Button {
                     Task { if await model.updateProfile(name: name) { editing = false } }
                 } label: {
-                    Text("Save changes").font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(.background).frame(maxWidth: .infinity).padding(.vertical, 15)
+                    Text("Save changes").font(.system(size: 15 * FeedStyle.buttonScale, weight: .semibold))
+                        .foregroundStyle(.background).frame(maxWidth: .infinity).padding(.vertical, 15 * FeedStyle.buttonScale)
                         .background(.primary, in: Capsule())
                 }
                 .buttonStyle(.plain).padding(.top, 16)

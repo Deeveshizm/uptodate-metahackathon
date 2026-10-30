@@ -155,8 +155,8 @@ struct AuthView: View {
     }
     private func primary(_ title: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title).font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.background).frame(maxWidth: .infinity).padding(.vertical, 17)
+            Text(title).font(.system(size: 15 * FeedStyle.buttonScale, weight: .semibold))
+                .foregroundStyle(.background).frame(maxWidth: .infinity).padding(.vertical, 17 * FeedStyle.buttonScale)
                 .background(.primary, in: Capsule())
         }.buttonStyle(.plain).disabled(disabled).opacity(disabled ? 0.45 : 1)
     }

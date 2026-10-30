@@ -9,13 +9,12 @@ import UIKit
 @main
 struct UpToDateApp: App {
     @StateObject private var model = AppModel()
+    @AppStorage("appAppearance") private var appearance = "system"
     var body: some Scene {
         WindowGroup {
             RootView().environmentObject(model)
                 .frame(minWidth: 340, minHeight: 600)
-                // Temporarily disable dark mode until the UI's contrast and readability are optimized for it.
-                // Re-enable system appearance together with UIUserInterfaceStyle in Info.plist.
-                .preferredColorScheme(.light)
+                .preferredColorScheme(appearance == "dark" ? .dark : appearance == "light" ? .light : nil)
         }
     }
 }
@@ -33,37 +32,14 @@ struct RootView: View {
     @EnvironmentObject private var model: AppModel
     @State private var importing = false
     @State private var selection = 0
-    @State private var navigationMinimized = false
-    @State private var scrollTracker = NavigationScrollTracker()
+    @State private var homeNavigationID = UUID()
 
     var body: some View {
         Group {
             if model.account == nil {
                 AuthView()
             } else {
-                Group {
-                    switch selection {
-                    case 1: NavigationStack { LibraryView() }
-                    case 2: NavigationStack { ManageView(importEmail: { importing = true }) }
-                    case 3: NavigationStack { SourcesView(openBookmarks: { selection = 1 }, openRead: { selection = 4 }) }
-                    case 4: NavigationStack { ReadPostsView() }
-                    default: NavigationStack { FeedView() }
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                .environment(\.appScrollHeader, AnyView(scrollHeader))
-                .environment(\.navigationScrollHandler, { offset in
-                    if let minimized = scrollTracker.update(offset), minimized != navigationMinimized {
-                        navigationMinimized = minimized
-                    }
-                })
-                .overlay(alignment: .bottom) {
-                    FloatingBottomNavigation(selection: $selection, minimized: navigationMinimized)
-                        .padding(.bottom, 8)
-                }
-                .onChange(of: selection) { _, _ in
-                    scrollTracker.reset()
-                    navigationMinimized = false
-                }
+                nativeTabs
             }
         }
         .tint(.primary)
@@ -98,11 +74,57 @@ struct RootView: View {
         }
     }
 
+    private var tabSelection: Binding<Int> {
+        Binding(get: { min(selection, 3) }, set: { destination in
+            if destination == 0 { showHome() }
+            else { selection = destination }
+        })
+    }
+
+    private func showHome() {
+        selection = 0
+        homeNavigationID = UUID()
+    }
+
+    @ViewBuilder private var nativeTabs: some View {
+        #if os(iOS)
+        NativeTabNavigation(selection: $selection, roots: tabRoots,
+                            avatarData: model.account?.avatarRevision == nil ? nil : model.avatarData,
+                            onHome: showHome)
+            .ignoresSafeArea(.container)
+        #else
+        TabView(selection: tabSelection) {
+            tabRoots[0].tabItem { Label("Home", systemImage: "house") }.tag(0)
+            tabRoots[1].tabItem { Label("Saved", systemImage: "bookmark") }.tag(1)
+            tabRoots[2].tabItem { Label("Manage", systemImage: "newspaper") }.tag(2)
+            tabRoots[3].tabItem { Label("Profile", systemImage: "person.crop.circle") }.tag(3)
+        }
+        #endif
+    }
+
+    private var tabRoots: [AnyView] {
+        [
+            tabRoot(NavigationStack { FeedView() }.id(homeNavigationID)),
+            tabRoot(NavigationStack { LibraryView() }),
+            tabRoot(NavigationStack { ManageView(importEmail: { importing = true }) }),
+            tabRoot(NavigationStack {
+                if selection == 4 { ReadPostsView() }
+                else { SourcesView(openBookmarks: { selection = 1 }, openRead: { selection = 4 }) }
+            })
+        ]
+    }
+
+    private func tabRoot<Content: View>(_ content: Content) -> AnyView {
+        AnyView(content.environmentObject(model)
+            .tint(.primary)
+            .environment(\.appScrollHeader, AnyView(scrollHeader)))
+    }
+
     private var scrollHeader: some View {
         VStack(spacing: 0) {
             ZStack {
-                Button { selection = 0 } label: {
-                    Text(FeedStyle.wordmark).font(.system(size: 25, weight: .semibold))
+                Button { showHome() } label: {
+                    Text(FeedStyle.wordmark).font(.system(size: 30, weight: .semibold))
                 }.buttonStyle(.plain).accessibilityLabel("Home")
                 HStack {
                     Spacer()
@@ -338,7 +360,7 @@ struct PostDetail: View {
                 Text("From \(current.source.name)").font(.caption)
                 Divider()
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
+                    HStack(spacing: FeedStyle.actionSpacing) {
                         Button { Task { await model.markRead(current) } } label: {
                             Image(systemName: current.read ? "checkmark.circle.fill" : "checkmark")
                                 .modifier(PostActionPill())
@@ -356,13 +378,12 @@ struct PostDetail: View {
                         PostContextActionView(post: current)
                         Button { Task { await model.bookmark(current) } } label: {
                             Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
-                                .font(.system(size: 16)).frame(width: 44, height: 44)
+                                .modifier(BookmarkButtonSizing())
                         }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
                             .disabled(model.busy || model.offline)
                     }.buttonStyle(.plain).disabled(model.busy || model.offline)
                 }
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 24)
-                .padding(.bottom, 80)
                 .frame(maxWidth: FeedStyle.feedWidth, alignment: .leading).frame(maxWidth: .infinity)
         }
         .background(.background)
@@ -428,8 +449,9 @@ struct ManageView: View {
                     HStack {
                         Text(source.displayName).font(.body)
                         Spacer()
-                        Button("Resubscribe") { Task { await model.retrySubscription(source) } }
-                            .font(.caption.weight(.medium)).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                        Button { Task { await model.retrySubscription(source) } } label: {
+                            Text("Resubscribe").modifier(CapsuleButtonLabelSizing(fontSize: 12, weight: .medium))
+                        }.buttonStyle(.bordered).buttonBorderShape(.capsule)
                             .disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
                             .accessibilityIdentifier("newsletter.resubscribe")
                     }.listRowBackground(Color.clear)
@@ -535,6 +557,8 @@ struct SourceLinkView: View {
 }
 struct SourcesView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage("appAppearance") private var appearance = "system"
     let openBookmarks: () -> Void
     let openRead: () -> Void
     var body: some View {
@@ -543,8 +567,8 @@ struct SourcesView: View {
                 Text("Your account").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                 Spacer()
                 NavigationLink { ProfileSettingsView(startEditing: true) } label: {
-                    Text("Edit").font(.system(size: 13, weight: .medium))
-                        .padding(.horizontal, 14).padding(.vertical, 9)
+                    Text("Edit").font(.system(size: 13 * FeedStyle.buttonScale, weight: .medium))
+                        .padding(.horizontal, 14 * FeedStyle.buttonScale).padding(.vertical, 9 * FeedStyle.buttonScale)
                         .background(.primary.opacity(0.06), in: Capsule())
                 }.buttonStyle(.plain)
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 14)
@@ -574,10 +598,28 @@ struct SourcesView: View {
                 AccountOptionRow(title: "Manage account", symbol: "lock.shield")
             }.buttonStyle(.plain)
             RowDivider()
+            SectionHeader("Appearance")
+            Toggle(isOn: Binding(get: {
+                appearance == "system" ? colorScheme == .dark : appearance == "dark"
+            }, set: { appearance = $0 ? "dark" : "light" })) {
+                Label("Dark mode", systemImage: "moon")
+                    .font(.system(size: 15))
+            }
+            .toggleStyle(.switch).tint(.green)
+            .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 16)
+            .accessibilityIdentifier("profile.darkMode")
+            if appearance != "system" {
+                Button("Use system appearance") { appearance = "system" }
+                    .font(.system(size: 13)).foregroundStyle(.secondary)
+                    .buttonStyle(.plain).frame(minHeight: 44)
+                    .padding(.horizontal, FeedStyle.gutter)
+                    .accessibilityIdentifier("profile.systemAppearance")
+            }
+            RowDivider()
             Button { Task { await model.signOut() } } label: {
                 Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
-                    .font(.system(size: 15, weight: .medium))
-                    .frame(maxWidth: .infinity).padding(.vertical, 15)
+                    .font(.system(size: 15 * FeedStyle.buttonScale, weight: .medium))
+                    .frame(maxWidth: .infinity).padding(.vertical, 15 * FeedStyle.buttonScale)
                     .background(.primary.opacity(0.06), in: Capsule())
             }
             .buttonStyle(.plain).disabled(model.busy)
@@ -624,20 +666,25 @@ struct SourceEditor: View {
             }
             if ["manual_action", "failed", "needs_agent", "needs_inbox", "confirmation_required", "unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") {
                 if !source.isCustom, !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
-                    Button("Finish setup") {
+                    Button {
                         if let url = URL(string: source.signupUrl), ["https", "http"].contains(url.scheme ?? "") {
                             copyText(model.account?.alias ?? "")
                             finishingSignup = true
                         }
-                    }.font(.system(size: 14, weight: .medium))
+                    } label: {
+                        Text("Finish setup").modifier(CapsuleButtonLabelSizing(fontSize: 14, weight: .medium))
+                    }
                         .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
                         .disabled(model.busy || model.offline)
                         .accessibilityIdentifier("newsletter.finishSignup")
                 }
                 if source.subscriptionStatus != "confirmation_required" {
-                Button(source.isCustom ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry") {
+                Button {
                     Task { await model.retrySubscription(source) }
-                }.font(.system(size: 14, weight: .medium))
+                } label: {
+                    Text(source.isCustom ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry")
+                        .modifier(CapsuleButtonLabelSizing(fontSize: 14, weight: .medium))
+                }
                     .buttonStyle(.bordered).buttonBorderShape(.capsule)
                     .disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
                 }

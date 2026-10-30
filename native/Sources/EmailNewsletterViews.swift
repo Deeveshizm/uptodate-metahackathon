@@ -79,12 +79,15 @@ struct NewsletterConfirmationPrompt: View {
             Text(confirmation.sourceName ?? "Confirm newsletter signup").font(.headline)
             Text(confirmation.subject).font(.subheadline)
             Text("From \(confirmation.senderDomain)").font(.caption).foregroundStyle(.secondary)
-            Button(confirmation.status == "opened" ? "Open confirmation again" : "Confirm subscription") {
+            Button {
                 Task {
                     if let url = await model.newsletterConfirmationURL(confirmation) {
                         destination = ConfirmationDestination(url: url)
                     }
                 }
+            } label: {
+                Text(confirmation.status == "opened" ? "Open confirmation again" : "Confirm subscription")
+                    .modifier(CapsuleButtonLabelSizing())
             }
             .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
             .disabled(model.busy || model.offline)
@@ -118,8 +121,10 @@ private struct NewsletterConfirmationSheet: View {
                 #endif
                 Text("Finish confirming on the publisher’s page. UpToDate will watch for its welcome email or next edition.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
-                Button("I've confirmed") {
+                Button {
                     Task { if await model.completeNewsletterConfirmation(confirmation) { dismiss() } }
+                } label: {
+                    Text("I've confirmed").modifier(CapsuleButtonLabelSizing())
                 }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
                     .disabled(model.busy || model.offline).padding(.bottom, 12)
             }
@@ -214,7 +219,9 @@ struct PublisherSignupSheet: View {
         #else
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
-                Button("Copy private email") { copyText(alias) }.accessibilityIdentifier("signup.copyAlias")
+                Button { copyText(alias) } label: {
+                    Text("Copy private email").modifier(CapsuleButtonLabelSizing())
+                }.accessibilityIdentifier("signup.copyAlias")
                     .buttonStyle(.bordered).buttonBorderShape(.capsule).padding(.horizontal)
                 Text("Your private email is copied. Paste it into the publisher’s email field to finish setup.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
@@ -243,8 +250,10 @@ struct PublisherUnsubscribeSheet: View {
                 #endif
                 Text("Complete the publisher's unsubscribe steps, then confirm below.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
-                Button("I've unsubscribed") {
+                Button {
                     Task { if await model.confirmUnsubscribe(source) { dismiss() } }
+                } label: {
+                    Text("I've unsubscribed").modifier(CapsuleButtonLabelSizing())
                 }
                 .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
                 .disabled(model.busy || model.offline)

@@ -66,9 +66,9 @@ struct PostContextActionView: View {
         Group {
             if gitHub {
                 githubMark.resizable().renderingMode(.template).scaledToFit()
-                    .frame(width: 14, height: 14)
+                    .frame(width: 14 * FeedStyle.buttonScale, height: 14 * FeedStyle.buttonScale)
             } else {
-                Image(systemName: symbol).font(.system(size: 13, weight: .medium))
+                Image(systemName: symbol).font(.system(size: 13 * FeedStyle.buttonScale, weight: .medium))
             }
         }.modifier(PostActionPill())
     }
@@ -100,7 +100,7 @@ struct PostContextActionView: View {
         }
     }
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: FeedStyle.actionSpacing) {
             if isFeed {
                 feedSourceControl
                 linkControl("phone")
@@ -407,31 +407,37 @@ private struct BiggieChatView: View {
 
             TextField("Ask about this post", text: $question, axis: .vertical)
                 .lineLimit(1...3).textFieldStyle(.plain).focused($questionFocused)
-                .padding(.horizontal, 18).padding(.vertical, 12)
-                .frame(minHeight: 44)
+                .font(.system(size: 16))
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                .frame(minHeight: 36)
                 .background(.primary.opacity(0.05), in: Capsule())
                 .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(minHeight: 44, alignment: .bottom)
                 .accessibilityIdentifier("post.chat.question")
                 .onChange(of: question) { _, value in if value.count > 1000 { question = String(value.prefix(1000)) } }
 
             Button { send() } label: {
-                Image(systemName: "arrow.up").font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white).frame(width: 44, height: 44)
+                Image(systemName: "arrow.up").font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white).frame(width: 36, height: 36)
                     .background(Color.blue, in: Circle())
+                    .frame(width: 44, height: 44, alignment: .bottom)
+                    .contentShape(Rectangle())
             }
             .opacity(canSend ? 1 : 0.45).disabled(!canSend)
             .accessibilityLabel("Send to Biggie").accessibilityIdentifier("post.chat.send")
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 12)
+        .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
         .background(.background)
     }
 
     private var openInIcon: some View {
-        Image(systemName: "arrow.up.forward.app").font(.system(size: 17, weight: .medium))
-            .foregroundStyle(suggestOpenIn ? Color.blue : Color.primary).frame(width: 44, height: 44)
+        Image(systemName: "arrow.up.forward.app").font(.system(size: 15, weight: .medium))
+            .foregroundStyle(suggestOpenIn ? Color.blue : Color.primary).frame(width: 36, height: 36)
             .background(suggestOpenIn ? Color.blue.opacity(0.12) : Color.primary.opacity(0.07), in: Circle())
             .overlay(Circle().stroke(suggestOpenIn ? Color.blue : Color.primary.opacity(0.12), lineWidth: suggestOpenIn ? 2 : 0.5))
+            .frame(width: 44, height: 44, alignment: .bottom)
+            .contentShape(Rectangle())
     }
 
     private func send() {
@@ -484,8 +490,8 @@ private struct BiggieMessageBubble: View {
                             if let url = citation.destination { Link(citation.title, destination: url) }
                         }
                     } label: {
-                        Label("Sources", systemImage: "globe").font(.caption)
-                            .padding(.horizontal, 12).padding(.vertical, 7)
+                        Label("Sources", systemImage: "globe").font(.system(size: 12 * FeedStyle.buttonScale))
+                            .padding(.horizontal, 12 * FeedStyle.buttonScale).padding(.vertical, 7 * FeedStyle.buttonScale)
                             .background(.primary.opacity(0.06), in: Capsule())
                     }.accessibilityIdentifier("chat.webSources")
                 }

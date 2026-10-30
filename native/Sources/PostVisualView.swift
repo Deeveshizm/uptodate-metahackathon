@@ -17,8 +17,9 @@ struct PostVisualView: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
                         ForEach(Array(post.gallery.enumerated()), id: \.offset) { index, visual in
-                            VisualPage(post: post, visual: visual, onSelect: onSelect)
-                                .frame(width: geometry.size.width, height: 300).id(index)
+                            VisualPage(post: post, visual: visual, size: geometry.size, onSelect: onSelect)
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                                .clipped().id(index)
                         }
                     }.scrollTargetLayout()
                 }
@@ -26,7 +27,7 @@ struct PostVisualView: View {
                 .scrollPosition(id: $selected)
                 .scrollIndicators(.hidden)
                 .accessibilityIdentifier("post.gallery")
-            }.frame(height: 300)
+            }.aspectRatio(1, contentMode: .fit).clipped()
             if post.gallery.count > 1 {
                 HStack(spacing: 5) {
                     ForEach(post.gallery.indices, id: \.self) { index in
@@ -66,6 +67,7 @@ private struct VisualPage: View {
     @EnvironmentObject private var model: AppModel
     let post: Post
     let visual: PostVisual
+    let size: CGSize
     var onSelect: (() -> Void)? = nil
     @State private var data: Data?
     @State private var finished = false
@@ -86,7 +88,9 @@ private struct VisualPage: View {
     private var page: some View {
         Group {
             if let data, let image = platformImage(data) {
-                image.resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: .infinity)
+                image.resizable()
+                    .aspectRatio(contentMode: post.isResearchPaper ? .fit : .fill)
+                    .frame(width: size.width, height: size.height)
             } else if !finished {
                 ProgressView("Loading source visual").frame(maxWidth: .infinity, minHeight: 180)
             } else {

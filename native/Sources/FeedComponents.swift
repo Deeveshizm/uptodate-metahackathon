@@ -5,6 +5,8 @@ enum FeedStyle {
     static let wordmark = "uptodate"
     static let feedWidth: CGFloat = 620
     static let gutter: CGFloat = 20
+    static let buttonScale: CGFloat = 1.173
+    static let actionSpacing: CGFloat = 8
     static let ring = LinearGradient(colors: [.orange, .pink, .purple], startPoint: .bottomLeading, endPoint: .topTrailing)
     static let covers: [(background: Color, foreground: Color, accent: Color)] = [
         (Color(red: 0.91, green: 0.94, blue: 0.88), Color(red: 0.15, green: 0.25, blue: 0.18), Color(red: 0.54, green: 0.64, blue: 0.43)),
@@ -16,13 +18,32 @@ enum FeedStyle {
 struct PostActionPill: ViewModifier {
     func body(content: Content) -> some View {
         content
-            .font(.system(size: 13, weight: .medium))
-            .frame(width: 34, height: 24)
+            .font(.system(size: 13 * FeedStyle.buttonScale, weight: .medium))
+            .frame(width: 34 * FeedStyle.buttonScale, height: 24 * FeedStyle.buttonScale)
             .foregroundStyle(.primary)
             .background(.primary.opacity(0.07), in: Capsule())
             .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
             .frame(minWidth: 44, minHeight: 44)
             .contentShape(Rectangle())
+    }
+}
+
+struct BookmarkButtonSizing: ViewModifier {
+    func body(content: Content) -> some View {
+        content.font(.system(size: 16 * FeedStyle.buttonScale))
+            .frame(width: 44 * FeedStyle.buttonScale, height: 44 * FeedStyle.buttonScale)
+    }
+}
+
+// Native capsule buttons keep their system styling; grow their label and
+// supplement the system insets so the visible capsule grows with the text.
+struct CapsuleButtonLabelSizing: ViewModifier {
+    var fontSize: CGFloat = 17
+    var weight: Font.Weight = .regular
+    func body(content: Content) -> some View {
+        content.font(.system(size: fontSize * FeedStyle.buttonScale, weight: weight))
+            .padding(.horizontal, 12 * (FeedStyle.buttonScale - 1))
+            .padding(.vertical, 7 * (FeedStyle.buttonScale - 1))
     }
 }
 
@@ -170,7 +191,7 @@ struct EditorialCover: View {
                     }
                 }.padding(28).frame(width: geometry.size.width, height: geometry.size.height)
             }
-        }.aspectRatio(1.06, contentMode: .fit).clipped().foregroundStyle(palette.foreground)
+        }.aspectRatio(1, contentMode: .fit).clipped().foregroundStyle(palette.foreground)
     }
 }
 
@@ -208,7 +229,8 @@ struct FeedPostCard: View {
                         Image(systemName: "photo").font(.system(size: 34, weight: .light))
                         Text(post.visual?.status == "failed" ? "Image unavailable" : "Image is being prepared").font(.callout)
                         Text(post.visual?.status == "failed" ? "Open the post to read it or retry the image." : "You can read the post while its image loads.").font(.caption)
-                    }.foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 220)
+                    }.foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .aspectRatio(1, contentMode: .fit)
                         .background(.secondary.opacity(0.05))
                 }.buttonStyle(.plain).accessibilityLabel("Read \(post.title)")
             } else {
@@ -222,7 +244,7 @@ struct FeedPostCard: View {
                 Spacer()
                 Button { Task { await model.bookmark(post) } } label: {
                     Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
-                        .font(.system(size: 16)).frame(width: 44, height: 44)
+                        .modifier(BookmarkButtonSizing())
                 }.accessibilityLabel(post.bookmarked ? "Remove bookmark" : "Bookmark post")
                     .disabled(model.busy || model.offline)
             }.buttonStyle(.plain).foregroundStyle(.primary)
