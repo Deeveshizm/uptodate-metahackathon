@@ -1033,6 +1033,14 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = dict(get_post(db, user, post_id))
+            revision = (json.loads(row['analysis']).get('source') or {}).get('revision_hash')
+            sql = 'SELECT spans FROM documents WHERE user_id=? AND job_id=? AND url=?'
+            params = [user['id'], row['job_id'], row['original_url']]
+            if revision:
+                sql += ' AND content_hash=?'
+                params.append(revision)
+            saved = db.execute(sql+' ORDER BY created_at DESC LIMIT 1',params).fetchone()
+            source_spans = json.loads(saved['spans']) if saved else []
             advice=handoff_reason(body.question)
             if advice:
                 return {'answer':advice+' Use Open in to send the source to another AI app, then add your question there.',
@@ -1048,7 +1056,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         try:
             model = generation_model()
             model.budget = JobBudget(store, job_id)
-            result = answer_post(row, body, model)
+            result = answer_post(row, body, model, source_spans=source_spans)
             with store.connect() as db:
                 get_post(db, user, post_id)
                 db.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))

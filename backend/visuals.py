@@ -248,10 +248,12 @@ def rank_figures(document, draft):
         if BRANDING.search(caption) or re.search(r'logo|wordmark|favicon|avatar',figure.get('url',''),re.I):
             continue
         overlap = len(words(caption) & context)
-        if overlap < 2 and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
-            continue
         methodological = bool(re.search(r"architectur|method|framework|pipeline|schematic|overview|diagram", caption, re.I))
-        eligible.append((overlap + 2 * len(words(caption) & story) + 3 * (methodological and paper) + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0), figure))
+        generic_method = paper and methodological and len(caption.split()) <= 12 and not re.search(r'baseline|prior work|related work',caption,re.I)
+        if overlap < 2 and not generic_method and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
+            continue
+        primary_method = paper and methodological and not re.search(r'baseline|prior work|related work',caption,re.I)
+        eligible.append(((bool(primary_method), overlap + 2 * len(words(caption) & story) + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0)), figure))
     return [figure for _, figure in sorted(eligible, key=lambda item: item[0], reverse=True)]
 
 
@@ -496,7 +498,7 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
             image = illustrator.generate(prompt)
         return {"kind": "generated", "status": "ready", "caption": "AI-generated editorial illustration · not a source figure",
                 "attribution": "Generated with Muse Image" if getattr(planner, "model", None) == "muse-image-1.0" else "Generated locally",
-                "prompt": prompt, "planning_usage": getattr(planner, "last_usage", [])}, decode_image(image)
+                "prompt": prompt, "brief":getattr(planner,'last_brief',None), "planning_usage": getattr(planner, "last_usage", [])}, decode_image(image)
     except SourceError as exc:
         return {"kind": "pending", "status": "needs_image_generator", "caption": "Illustration pending",
                 "detail": str(exc), "prompt": prompt}, None

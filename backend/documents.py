@@ -1,6 +1,7 @@
 """Convert public originals into bounded, addressable evidence spans."""
 import hashlib
 import io
+import json
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
@@ -14,6 +15,25 @@ from .retrieval import Resource, SourceError
 
 def normalize(text):
     return re.sub(r"\s+", " ", text).strip()
+
+
+def recipe_instructions(value, depth=0):
+    if depth>4:return []
+    if isinstance(value,str):
+        text=normalize(BeautifulSoup(value,'html.parser').get_text(' ',strip=True))
+        return [text] if text else []
+    if isinstance(value,list):
+        return [step for item in value[:40] for step in recipe_instructions(item,depth+1)]
+    if isinstance(value,dict):
+        if value.get('itemListElement'):
+            steps=recipe_instructions(value['itemListElement'],depth+1)
+            name=value.get('name')
+            if isinstance(name,str) and name.strip():
+                heading=normalize(BeautifulSoup(name,'html.parser').get_text(' ',strip=True))
+                return [heading+': '+step for step in steps]
+            return steps
+        return recipe_instructions(value.get('text') or (value.get('name') if value.get('@type')=='HowToStep' else []) or [],depth+1)
+    return []
 
 
 def publication_name(soup):
@@ -144,6 +164,7 @@ def source_metadata(soup, url):
                 graph = obj.get("@graph")
                 if isinstance(graph, list):
                     objects.extend(item for item in graph[:40] if isinstance(item, dict))
+    recipe_objects=[obj for obj in objects if obj.get('@type')=='Recipe' or isinstance(obj.get('@type'),list) and 'Recipe' in obj['@type']]
     for obj in objects:
         kinds = obj.get("@type", [])
         kinds = [kinds] if isinstance(kinds, str) else kinds
@@ -152,9 +173,15 @@ def source_metadata(soup, url):
         if "ScholarlyArticle" in kinds and not result.get("abstract") and isinstance(obj.get("abstract"), str):
             result["abstract"] = normalize(BeautifulSoup(obj["abstract"], "html.parser").get_text(" "))[:8000]
         if "Recipe" in kinds and isinstance(obj.get("recipeIngredient"), list):
+            if len(recipe_objects)>1:
+                own=obj.get('url') or obj.get('@id') or ''
+                if not isinstance(own,str) or urlsplit(urljoin(url,own))._replace(fragment='') != urlsplit(url)._replace(fragment=''):continue
             ingredients = [normalize(v)[:300] for v in obj["recipeIngredient"][:60] if isinstance(v, str) and normalize(v)]
             if ingredients:
                 result["recipe"] = {"name": normalize(str(obj.get("name", "Recipe")))[:200], "ingredients": ingredients, "source_url": url}
+                instructions=recipe_instructions(obj.get('recipeInstructions'))
+                if len(instructions)<=30 and sum(len(step) for step in instructions)<=12000:
+                    result['recipe']['instructions']=instructions
         if any(kind in kinds for kind in ("Place", "LocalBusiness", "Restaurant", "CafeOrCoffeeShop")):
             address = obj.get("address")
             if isinstance(address, dict):
@@ -241,8 +268,14 @@ def parse_document(resource: Resource) -> Document:
             chunks.append((text, section, None))
     if not chunks:
         chunks = [(line, "Body", None) for line in main.stripped_strings]
+    steps=(metadata.get('recipe') or {}).get('instructions',[])
+    if steps:
+        chunks.append(('Recipe instructions: '+' '.join(f'{index}. {step}' for index,step in enumerate(steps,1)),'Instructions',None))
     spans = make_spans(chunks)
-    metadata["source_content_hash"] = hashlib.sha256("\n".join(normalize(chunk[0]) for chunk in chunks).encode()).hexdigest()
+    content="\n".join(normalize(chunk[0]) for chunk in chunks)
+    if metadata.get('recipe'):
+        content+='\n'+json.dumps({key:value for key,value in metadata['recipe'].items() if key!='source_url'},sort_keys=True,ensure_ascii=False)
+    metadata["source_content_hash"] = hashlib.sha256(content.encode()).hexdigest()
     metadata["extraction"] = {"strategy": "section_balanced", "available_characters": sum(len(c[0]) for c in chunks),
                               "selected_characters": sum(len(s["text"]) for s in spans)}
     if sum(len(s["text"]) for s in spans) < 100:

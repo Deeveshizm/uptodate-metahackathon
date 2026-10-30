@@ -1,5 +1,57 @@
 import Foundation
 
+enum ReadingBlock: Equatable {
+    case paragraph(String)
+    case heading(String)
+    case list(marker: String, text: String)
+    case code(language: String, text: String)
+}
+
+enum ReadingTextFormat {
+    static func blocks(_ source: String) -> [ReadingBlock] {
+        var result: [ReadingBlock] = []
+        var paragraph: [String] = []
+        var code: [String] = []
+        var fence: String?
+        var language = ""
+        func flushParagraph() {
+            if !paragraph.isEmpty { result.append(.paragraph(paragraph.joined(separator: "\n"))); paragraph = [] }
+        }
+        for line in source.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let current = fence {
+                if trimmed.hasPrefix(current) {
+                    result.append(.code(language: language, text: code.joined(separator: "\n")))
+                    code = []; fence = nil
+                } else { code.append(line) }
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                flushParagraph(); fence = String(trimmed.prefix(3)); language = String(trimmed.dropFirst(3))
+            } else if trimmed.isEmpty {
+                flushParagraph()
+            } else if let range = trimmed.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                flushParagraph(); result.append(.heading(String(trimmed[range.upperBound...])))
+            } else if let range = trimmed.range(of: #"^(?:[-*•]|\d{1,3}[.)])\s+"#, options: .regularExpression) {
+                flushParagraph()
+                let raw = String(trimmed[range]).trimmingCharacters(in: .whitespaces)
+                result.append(.list(marker: ["-", "*", "•"].contains(raw) ? "•" : raw, text: String(trimmed[range.upperBound...])))
+            } else { paragraph.append(line) }
+        }
+        flushParagraph()
+        if fence != nil { result.append(.code(language: language, text: code.joined(separator: "\n"))) }
+        return result
+    }
+
+    static func inline(_ source: String) -> AttributedString {
+        var text = (try? AttributedString(markdown: source, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(source)
+        // Source actions and verified citations own navigation. Model-written
+        // Markdown must not introduce a separate, unverified link destination.
+        for run in Array(text.runs) where run.link != nil { text[run.range].link = nil }
+        return text
+    }
+}
+
 struct Account: Codable {
     let id: String
     let alias: String
@@ -363,6 +415,13 @@ struct PostAnalysis: Codable {
     let approach: String?
     let impact: String?
     var sections: [PostSourceSection]? = nil
+    var cookingSteps: [String]? = nil
+    var venueFacts: VenueFacts? = nil
+}
+
+struct VenueFacts: Codable {
+    var rating: String? = nil
+    var hours: String? = nil
 }
 
 struct PostSourceSection: Codable, Identifiable {

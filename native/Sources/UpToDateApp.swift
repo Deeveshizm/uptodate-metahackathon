@@ -329,7 +329,7 @@ struct PostDetail: View {
 
     var body: some View {
         AppScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 12) {
                 if current.isDemo { Text("Sample edition").font(.caption).foregroundStyle(.secondary) }
                 Text(current.title).font(.title2.bold())
                 if !current.hook.isEmpty { Text(current.hook).font(.subheadline).foregroundStyle(.secondary) }
@@ -342,11 +342,22 @@ struct PostDetail: View {
                     else if ["needs_image_generator", "failed"].contains(current.visual?.status ?? "") {
                         Button("Retry image") { Task { await model.retryVisual(current) } }.disabled(model.busy || model.offline)
                     }
-                    Text(current.finding).lineSpacing(5).textSelection(.enabled)
+                    ReadableText(text: current.finding).textSelection(.enabled)
+                }
+                if let steps = current.analysis?.cookingSteps, !steps.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Instructions").font(.headline)
+                        ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
+                            HStack(alignment: .top, spacing: 12) {
+                                Text("\(index + 1).").font(.body.weight(.medium)).foregroundStyle(.secondary)
+                                ReadableText(text: step).textSelection(.enabled)
+                            }
+                        }
+                    }.accessibilityIdentifier("post.cookingSteps")
                 }
                 ForEach(current.analysis?.sections ?? []) { section in
                     Text(section.heading).font(.headline)
-                    Text(section.text).textSelection(.enabled)
+                    ReadableText(text: section.text).textSelection(.enabled)
                 }
                 if let abstract = current.paper?.abstract, !abstract.isEmpty {
                     DisclosureGroup("Abstract", isExpanded: $abstractExpanded) {
@@ -357,6 +368,7 @@ struct PostDetail: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
+                VenueFactsView(facts: current.analysis?.venueFacts)
                 Text("From \(current.source.name)").font(.caption)
                 Divider()
                 ScrollView(.horizontal, showsIndicators: false) {

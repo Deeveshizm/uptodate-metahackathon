@@ -61,7 +61,7 @@ class PlaceRecord(StrictModel):
 class Draft(StrictModel):
     content_type: Literal["paper", "recipe", "places", "news", "release", "repository", "opinion", "article"]
     title: str = Field(min_length=5, max_length=130)
-    hook: GroundedText
+    hook: GroundedText | None
     summary: SummaryText
     problem: GroundedText | None
     approach: GroundedText | None
@@ -71,16 +71,18 @@ class Draft(StrictModel):
     ingredients: list[IngredientRecord] = Field(default_factory=list, max_length=40)
     sections: list[SourceSection] = Field(default_factory=list, max_length=3)
     places: list[PlaceRecord] = Field(default_factory=list,max_length=12)
+    method_steps: list[GroundedText] = Field(default_factory=list,max_length=5)
+    cooking_steps: list[GroundedText] = Field(default_factory=list,max_length=16)
 
 
 class Verdict(StrictModel):
-    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "relevance", "scope", "detail_1", "detail_2", "detail_3"]
+    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "instructions", "places", "methodology", "relevance", "scope", "readability", "detail_1", "detail_2", "detail_3"]
     reason: str = Field(max_length=400)
     supported: bool
 
 
 class Verification(StrictModel):
-    verdicts: list[Verdict] = Field(min_length=3, max_length=16)
+    verdicts: list[Verdict] = Field(min_length=2, max_length=16)
 
 
 BLOCKS = ("hook", "summary", "problem", "approach", "finding", "impact", "limitations")
@@ -195,6 +197,9 @@ class MetaModel:
             output["properties"]["span_ids"]["items"]["enum"] = [s["id"] for s in payload["spans"]]
         elif schema is Draft:
             output["$defs"]["Citation"]["properties"]["span_id"]["enum"] = [s["id"] for s in payload["spans"]]
+            # Require an explicit decision instead of silently omitting the
+            # optional Python field. [] is the valid insufficient-evidence case.
+            output['required'] = list(dict.fromkeys([*output.get('required', []),'method_steps','cooking_steps']))
         request = {"model": self.model, "stream": False, "temperature": 0,
                    "reasoning_effort": self.reasoning, "max_tokens": 5000,
                    "messages": [{"role": "system", "content": system + "\nOutput JSON schema:\n" + json.dumps(output)},
@@ -266,6 +271,8 @@ def check_evidence(draft: Draft, document: Document):
     blocks = {field: getattr(draft, field) for field in BLOCKS}
     blocks.update({f"detail_{index}": section.body.model_copy(update={"text": section.heading + ": " + section.body.text})
                    for index, section in enumerate(draft.sections, 1)})
+    blocks.update({f'method_{index}':step for index,step in enumerate(draft.method_steps,1)})
+    blocks.update({f'recipe_step_{index}':step for index,step in enumerate(draft.cooking_steps,1)})
     for field, block in blocks.items():
         if block is None:
             continue
@@ -284,9 +291,9 @@ def check_evidence(draft: Draft, document: Document):
             errors.append(f"{field}: every numerical claim must occur in its cited evidence")
     if numbers(draft.title) - numbers(" ".join(item["quote"] for item in evidence)):
         errors.append("title: numerical claim is missing from cited evidence")
-    if normalize(draft.summary.text).lower() == normalize(draft.hook.text).lower():
+    if draft.hook and normalize(draft.summary.text).lower() == normalize(draft.hook.text).lower():
         errors.append("summary: the post body must add source-backed detail beyond the hook")
-    if sum(len(block.text.split()) for block in blocks.values() if block is not None) > 240:
+    if sum(len(block.text.split()) for field,block in blocks.items() if block is not None and not field.startswith(('method_','recipe_step_'))) > 240:
         errors.append("post: keep the complete post under 240 words")
     if errors:
         raise SourceError("; ".join(errors))
@@ -409,7 +416,7 @@ def generate(document: Document, model=None, stage=lambda _: None):
                 if attempt == 1:
                     raise SourceError("Draft failed checks after one repair attempt: " + feedback) from exc
     return {
-        "title": draft.title, "hook": draft.hook.text, "finding": draft.summary.text,
+        "title": draft.title, "hook": draft.hook.text if draft.hook else "", "finding": draft.summary.text,
         "limitations": draft.limitations.text if draft.limitations else "Automated draft based on retrieved source text. Verify against the original; model checks do not guarantee accuracy.", "original_url": document.url,
         "evidence": evidence,
         "analysis": {"content_type": draft.content_type, **{field: block.text if (block := getattr(draft, field)) else None for field in BLOCKS},

@@ -1,5 +1,83 @@
 import SwiftUI
 
+struct ReadableText: View {
+    let text: String
+    var spacing: CGFloat = 10
+    var fillWidth = true
+    var body: some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            ForEach(Array(ReadingTextFormat.blocks(text).enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .paragraph(let value):
+                    Text(ReadingTextFormat.inline(value)).lineSpacing(4)
+                case .heading(let value):
+                    Text(ReadingTextFormat.inline(value)).font(.body.weight(.semibold))
+                case .list(let marker, let value):
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(marker).accessibilityHidden(true)
+                        Text(ReadingTextFormat.inline(value)).lineSpacing(3)
+                    }
+                case .code(_, let value):
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(value).font(.system(.footnote, design: .monospaced))
+                            .fixedSize(horizontal: true, vertical: false).padding(10)
+                    }.background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }.frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
+    }
+}
+
+struct VenueFactsView: View {
+    let facts: VenueFacts?
+    var body: some View {
+        if let facts {
+            VStack(alignment: .leading, spacing: 8) {
+                if let rating = facts.rating, !rating.isEmpty {
+                    Text(ReadingTextFormat.inline(rating)).font(.subheadline).lineSpacing(3)
+                }
+                if let hours = facts.hours, !hours.isEmpty {
+                    VenueHoursView(hours: hours)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct VenueHoursView: View {
+    let hours: String
+    private var rows: [(day: String, time: String)] {
+        let day = #"(?:Mon(?:day)?|Tue(?:s(?:day)?)?|Wed(?:nesday)?|Thu(?:rs(?:day)?)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?|Daily|Every day|Weekdays|Weekends)"#
+        let pattern = "(?i)^(" + day + "(?:\\s*(?:[-–—]|to|&)\\s*" + day + ")?)(?:\\s*:\\s*|\\s+)(.+)$"
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return hours.components(separatedBy: CharacterSet(charactersIn: ";\n")).compactMap { entry in
+            let entry = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !entry.isEmpty else { return nil }
+            guard let match = expression.firstMatch(in: entry, range: NSRange(entry.startIndex..., in: entry)),
+                  let dayRange = Range(match.range(at: 1), in: entry),
+                  let timeRange = Range(match.range(at: 2), in: entry) else { return ("", entry) }
+            return (String(entry[dayRange]), String(entry[timeRange]))
+        }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Hours").font(.caption.weight(.medium))
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    if row.day.isEmpty {
+                        Text(row.time).gridCellColumns(2)
+                    } else {
+                        GridRow(alignment: .top) {
+                            Text(row.day).frame(minWidth: 48, alignment: .leading)
+                            Text(row.time).monospacedDigit().frame(maxWidth: .infinity, alignment: .leading)
+                        }.accessibilityElement(children: .combine)
+                    }
+                }
+            }.font(.footnote)
+        }.foregroundStyle(.secondary)
+    }
+}
+
 // Keep the provisional visual identity here so it is easy to replace later.
 enum FeedStyle {
     static let wordmark = "uptodate"
@@ -258,8 +336,14 @@ struct FeedPostCard: View {
                             .padding(.horizontal, 8).padding(.vertical, 4)
                             .background(.orange.opacity(0.08), in: Capsule())
                     }
-                    Text(post.finding).font(.subheadline).lineSpacing(4).lineLimit(expanded ? nil : 4)
-                    if expanded, let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
+                    Text(ReadingTextFormat.inline(post.finding))
+                        .font(.subheadline).lineSpacing(4)
+                        .lineLimit(expanded ? nil : 4).truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if expanded {
+                        if let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
+                        VenueFactsView(facts: post.analysis?.venueFacts)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle()).onTapGesture(perform: openPost)

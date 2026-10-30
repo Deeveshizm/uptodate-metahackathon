@@ -127,20 +127,9 @@ struct PostContextActionView: View {
             } else if post.actionKind == "ingredients" {
                 Button { showing = true } label: { pill(symbol) }
                     .accessibilityLabel(post.actionTitle).accessibilityIdentifier("post.contextAction")
+                aiControl
             } else {
-                Menu {
-                    Button { showingBiggie = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
-                        .accessibilityIdentifier("post.ai.biggie")
-                    #if os(iOS)
-                    Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
-                        .accessibilityIdentifier("post.ai.openIn")
-                    #else
-                    Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
-                    #endif
-                } label: { pill(symbol) }
-                    .menuOrder(.fixed)
-                    .accessibilityLabel(post.actionTitle)
-                    .accessibilityIdentifier("post.contextAction")
+                aiControl
             }
         }.buttonStyle(.plain)
         .sheet(isPresented: $showing) { IngredientsSheet(post: post) }
@@ -166,6 +155,17 @@ struct PostContextActionView: View {
         .sheet(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         .sheet(isPresented: $sharing) { PostAIShareSheet(post: post) }
         #endif
+    }
+    private var aiControl: some View {
+        Menu {
+            Button { showingBiggie = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
+                .accessibilityIdentifier("post.ai.biggie")
+            Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                .accessibilityIdentifier("post.ai.openIn")
+        } label: { pill("sparkles") }
+            .menuOrder(.fixed)
+            .accessibilityLabel(post.isResearchPaper ? "Ask about this paper" : "Ask AI")
+            .accessibilityIdentifier(post.actionKind == "ingredients" ? "post.askAI" : "post.contextAction")
     }
     @ViewBuilder private func linkControl(_ kind: String) -> some View {
         let actions = links.filter { $0.kind == kind }
@@ -350,31 +350,9 @@ private struct BiggieChatView: View {
                 }
             }
             .background(.background)
+            .safeAreaInset(edge: .top, spacing: 0) { chatHeader }
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
-            .navigationTitle("Biggie")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.background, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    VStack(spacing: 2) {
-                        avatar
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 36, height: 36)
-                            .clipShape(Circle())
-                            .accessibilityHidden(true)
-                        Text("Biggie").font(.caption.weight(.semibold))
-                    }
-                    .accessibilityElement(children: .combine)
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button { dismiss() } label: { Image(systemName: "xmark").font(.subheadline.weight(.medium)) }
-                        .foregroundStyle(.secondary).accessibilityLabel("Close Ask AI")
-                }
-            }
+            .toolbar(.hidden)
         }
         .background(.background)
         .onDisappear { task?.cancel() }
@@ -389,6 +367,25 @@ private struct BiggieChatView: View {
         .frame(minWidth: 360, minHeight: 420)
         .sheet(isPresented: $sharing) { PostAIShareSheet(post: post) }
         #endif
+    }
+    private var chatHeader: some View {
+        ZStack {
+            VStack(spacing: 4) {
+                avatar.resizable().scaledToFill()
+                    .frame(width: 56, height: 56).clipShape(Circle())
+                    .accessibilityHidden(true)
+                Text("Biggie").font(.caption.weight(.semibold))
+            }.accessibilityElement(children: .combine)
+            HStack {
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.subheadline.weight(.medium))
+                        .frame(width: 44, height: 44)
+                }.foregroundStyle(.secondary).accessibilityLabel("Close Ask AI")
+            }
+        }.frame(maxWidth: .infinity)
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(.background)
     }
 
     private var composer: some View {
@@ -472,7 +469,10 @@ private struct BiggieMessageBubble: View {
         HStack(alignment: .bottom, spacing: 0) {
             if outgoing { Spacer(minLength: 52) }
             VStack(alignment: outgoing ? .trailing : .leading, spacing: 4) {
-                Text(turn.text)
+                Group {
+                    if outgoing { Text(turn.text) }
+                    else { ReadableText(text: turn.text, spacing: 8, fillWidth: false) }
+                }
                     .font(.body).textSelection(.enabled)
                     .padding(.horizontal, 16).padding(.vertical, 12)
                     .foregroundStyle(outgoing ? Color.white : Color.primary)
