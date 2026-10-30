@@ -15,15 +15,15 @@ struct NewsletterLinkForm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Newsletter website").font(.subheadline.weight(.medium))
             HStack(spacing: 10) {
-                TextField("https://newsletter.example.com", text: $link)
+                TextField("", text: $link, prompt: Text("Paste a newsletter link").foregroundStyle(.secondary))
                     .textFieldStyle(.plain)
                     .padding(.horizontal, 16).padding(.vertical, 12)
                     .frame(minHeight: 44)
                     .background(.primary.opacity(0.05), in: Capsule())
                     .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
                     .textContentType(.URL)
+                    .foregroundStyle(.primary)
                     .autocorrectionDisabled()
                     .focused($linkFocused)
                     #if os(iOS)
@@ -34,31 +34,22 @@ struct NewsletterLinkForm: View {
                     .onSubmit(submit)
                     .accessibilityLabel("Newsletter website link")
                     .accessibilityIdentifier("newsletter.website")
-                PasteButton(payloadType: String.self) { values in
-                    if let text = values.first {
-                        link = text
-                        linkFocused = true
-                    }
+                Button(action: submit) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 46, height: 46)
+                        .background(Color.primary.opacity(model.busy || model.offline || normalizedLink == nil ? 0.2 : 1), in: Circle())
                 }
-                .labelStyle(.iconOnly)
-                .buttonStyle(.bordered).buttonBorderShape(.circle)
-                .frame(width: 44, height: 44)
-                .accessibilityLabel("Paste newsletter website link")
+                .buttonStyle(.plain)
+                .disabled(model.busy || model.offline || normalizedLink == nil)
+                .accessibilityLabel("Subscribe")
+                .accessibilityIdentifier("newsletter.subscribe")
             }
             if let validation {
                 Text(validation).font(.caption).foregroundStyle(.red)
                     .accessibilityIdentifier("newsletter.validation")
-            } else {
-                Text("We'll subscribe using your newsletter address automatically.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            Button(action: submit) {
-                Text("Subscribe to newsletter").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.capsule)
-            .disabled(model.busy || model.offline || normalizedLink == nil)
-            .accessibilityIdentifier("newsletter.subscribe")
             if model.account?.aliasStatus != "active" {
                 Text("Signup will start once your newsletter address is ready to receive mail.")
                     .font(.caption).foregroundStyle(.secondary)

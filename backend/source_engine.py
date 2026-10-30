@@ -114,7 +114,7 @@ class SourceEngine:
             source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (job["source_id"], job["user_id"])).fetchone()
         if not user or not source:
             return
-        if source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "submitted", "confirmation_required", "email_received", "receiving"):
+        if source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "unsubscribing", "submitted", "confirmation_required", "email_received", "receiving"):
             status, detail = source["subscription_status"], source["subscription_detail"]
         elif source["subscription_status"] == "submitting":
             status, detail = "manual_action", "A previous signup may have been transmitted; check incoming mail before explicitly retrying"
@@ -132,7 +132,7 @@ class SourceEngine:
                     domain = domain[len(prefix):]
                     break
             with self.store.connect() as db:
-                claimed = db.execute("UPDATE sources SET subscription_status='submitting',subscription_alias=?,expected_sender_domain=? WHERE id=? AND user_id=? AND subscription_status NOT IN ('submitting','submitted','confirmation_required','email_received','receiving','unsubscribed','unsubscribe_pending')",
+                claimed = db.execute("UPDATE sources SET subscription_status='submitting',subscription_alias=?,expected_sender_domain=? WHERE id=? AND user_id=? AND subscription_status NOT IN ('submitting','submitted','confirmation_required','email_received','receiving','unsubscribed','unsubscribe_pending','unsubscribing')",
                                      (user["alias"], domain, job["source_id"], job["user_id"])).rowcount
             if not claimed:
                 with self.store.connect() as db:
@@ -159,7 +159,8 @@ class SourceEngine:
                 content = {"status": "discovery_failed", "detail": str(exc), "feed_url": feed_url}
         generation_job_id = None
         with self.store.connect() as db:
-            db.execute("UPDATE sources SET name=?,signup_url=?,feed_url=?,subscription_status=CASE WHEN subscription_status IN ('unsubscribed','unsubscribe_pending','email_received','receiving') THEN subscription_status ELSE ? END,subscription_detail=CASE WHEN subscription_status IN ('unsubscribed','unsubscribe_pending','email_received','receiving') THEN subscription_detail ELSE ? END WHERE id=?",
+            preserve = "subscription_status IN ('unsubscribed','unsubscribe_pending','unsubscribing','confirmation_required','email_received','receiving') OR EXISTS(SELECT 1 FROM newsletter_confirmations c WHERE c.source_id=sources.id AND c.user_id=sources.user_id AND c.status='confirmed')"
+            db.execute("UPDATE sources SET name=?,signup_url=?,feed_url=?,subscription_status=CASE WHEN " + preserve + " THEN subscription_status ELSE ? END,subscription_detail=CASE WHEN " + preserve + " THEN subscription_detail ELSE ? END WHERE id=?",
                        (name, resource.url, feed_url, status, detail, job["source_id"]))
             if content["status"] == "found":
                 identity = "auto-generate-v1:" + hashlib.sha256((job["source_id"] + ":" + content["url"]).encode()).hexdigest()

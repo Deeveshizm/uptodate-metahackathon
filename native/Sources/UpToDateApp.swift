@@ -87,6 +87,7 @@ struct RootView: View {
             case .failure(let error): model.error = error.localizedDescription
             }
         }
+        .modifier(NewsletterConfirmationPresenter())
         .task(id: model.account?.id) {
             guard model.account != nil else { return }
             while !Task.isCancelled {
@@ -166,12 +167,14 @@ struct FeedView: View {
                 if needsNewsletterPrompt {
                     VStack(spacing: 16) {
                         Image(systemName: "text.book.closed").font(.system(size: 40, weight: .ultraLight))
-                        Text(hasNewsletter ? "Your newsletters, turned into posts." : "Subscribe to your first newsletter.").font(.title2.bold())
+                        Text(hasNewsletter ? "Your newsletters, turned into posts." : "Subscribe to your first newsletter")
+                            .font(.system(size: 22, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
+                            .frame(maxWidth: .infinity, alignment: .center).multilineTextAlignment(.center)
                         Text(hasNewsletter ? "Follow signup and confirmation progress in Manage. Posts will appear here as editions are processed." : "Paste a newsletter link. We'll use your private newsletter address for signup and create posts from incoming editions.")
                             .multilineTextAlignment(.center).foregroundStyle(.secondary)
                         NewsletterLinkForm()
                         Text("You can also import an .eml file from Manage.").font(.caption).foregroundStyle(.secondary)
-                    }.padding(40)
+                    }.padding(.horizontal, 24).padding(.vertical, 36)
                 }
                 ForEach(Array(model.sources.filter { ["manual_action", "needs_agent", "failed", "confirmation_required"].contains($0.subscriptionStatus ?? "") }.prefix(3))) { source in
                     InfoRow("\(source.name): \(source.subscriptionTitle). Open Manage to finish the subscription. Available public posts may already appear below.")
@@ -334,7 +337,7 @@ struct PostDetail: View {
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
                 Text("From \(current.source.name)").font(.caption)
                 Divider()
-                VStack(alignment: .leading, spacing: 4) {
+                ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
                         Button { Task { await model.markRead(current) } } label: {
                             Image(systemName: current.read ? "checkmark.circle.fill" : "checkmark")
@@ -350,16 +353,13 @@ struct PostDetail: View {
                             .accessibilityLabel("Share original source")
                             .accessibilityIdentifier("post.share")
                         }
-                    }.buttonStyle(.plain).disabled(model.busy || model.offline)
-                    HStack {
                         PostContextActionView(post: current)
-                        Spacer()
                         Button { Task { await model.bookmark(current) } } label: {
                             Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
                                 .font(.system(size: 16)).frame(width: 44, height: 44)
                         }.accessibilityLabel(current.bookmarked ? "Remove bookmark" : "Bookmark post")
                             .disabled(model.busy || model.offline)
-                    }.buttonStyle(.plain)
+                    }.buttonStyle(.plain).disabled(model.busy || model.offline)
                 }
             }.padding(.horizontal, FeedStyle.gutter).padding(.vertical, 24)
                 .padding(.bottom, 80)
@@ -405,6 +405,9 @@ struct ManageView: View {
                     topAction("Add newsletter", symbol: "plus") { addingLink = true }
                     topAction("Import .eml", symbol: "square.and.arrow.down", action: importEmail)
                 }.frame(maxWidth: .infinity).padding(.vertical, 18)
+                ForEach(model.newsletterConfirmations) { confirmation in
+                    NewsletterConfirmationPrompt(confirmation: confirmation)
+                }
                 ForEach(model.inboxCandidates.filter { $0.status == "pending" }) { candidate in
                     EmailNewsletterPrompt(candidate: candidate)
                 }
@@ -487,13 +490,22 @@ struct ManageView: View {
         Toggle(source.displayName, isOn: Binding(get: { source.muted == 0 }, set: { shown in
             Task { await model.updateSource(source, muted: !shown) }
         }))
-        .toggleStyle(.switch).disabled(model.busy || model.offline)
-        .accessibilityHint("Show or hide this newsletter in Home. Swipe left to unsubscribe.")
-        .accessibilityAction(named: "Unsubscribe") { askToUnsubscribe(source) }
+        .toggleStyle(.switch).tint(.green).disabled(model.busy || model.offline)
+        .accessibilityHint(source.canUnsubscribe ? "Show or hide this newsletter in Home. Swipe left to unsubscribe." : "Show or hide this newsletter in Home.")
+        .accessibilityActions {
+            if source.canUnsubscribe { Button("Unsubscribe") { askToUnsubscribe(source) } }
+            else if source.canRemoveSetup { Button("Delete unfinished signup") { Task { await model.removePendingSetup(source) } } }
+        }
         .listRowBackground(Color.clear)
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            Button { askToUnsubscribe(source) } label: { Label("Unsubscribe", systemImage: "minus.circle") }
-                .tint(.red).disabled(model.busy || model.offline)
+            if source.canUnsubscribe {
+                Button { askToUnsubscribe(source) } label: { Label("Unsubscribe", systemImage: "minus.circle") }
+                    .tint(.red).disabled(model.busy || model.offline)
+            } else if source.canRemoveSetup {
+                Button(role: .destructive) { Task { await model.removePendingSetup(source) } } label: {
+                    Label("Delete", systemImage: "trash")
+                }.disabled(model.busy || model.offline).accessibilityIdentifier("newsletter.removeSetup")
+            }
         }
         .contextMenu { Button("Subscription options") { options = source } }
     }
@@ -591,7 +603,7 @@ struct SourceEditor: View {
             if source.subscriptionStatus != "unsubscribed" {
                 Toggle("Show in daily feed", isOn: Binding(get: { source.muted == 0 }, set: { shown in
                     Task { await model.updateSource(source, muted: !shown) }
-                })).font(.system(size: 15)).disabled(model.busy || model.offline)
+                })).font(.system(size: 15)).tint(.green).disabled(model.busy || model.offline)
             }
             if !source.isCustom {
             VStack(alignment: .leading, spacing: 7) {
@@ -610,25 +622,33 @@ struct SourceEditor: View {
                 Text("Posts come from emails you chose to connect. Hiding them in the feed does not stop new email processing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if ["manual_action", "failed", "needs_agent", "needs_inbox", "unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") {
+            if ["manual_action", "failed", "needs_agent", "needs_inbox", "confirmation_required", "unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") {
                 if !source.isCustom, !["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? ""), model.account?.aliasStatus == "active" {
-                    Button("Finish signup on publisher website") {
+                    Button("Finish setup") {
                         if let url = URL(string: source.signupUrl), ["https", "http"].contains(url.scheme ?? "") {
                             copyText(model.account?.alias ?? "")
-                            model.notice = "Your newsletter address was copied. Paste it into the publisher’s email field and complete any verification."
                             finishingSignup = true
                         }
-                    }.font(.system(size: 14)).accessibilityIdentifier("newsletter.finishSignup")
+                    }.font(.system(size: 14, weight: .medium))
+                        .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                        .disabled(model.busy || model.offline)
+                        .accessibilityIdentifier("newsletter.finishSignup")
                 }
-                Button(source.isCustom ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry signup using my newsletter address") {
+                if source.subscriptionStatus != "confirmation_required" {
+                Button(source.isCustom ? "Resume email processing" : ["unsubscribed", "unsubscribe_pending"].contains(source.subscriptionStatus ?? "") ? "Subscribe again" : "Retry") {
                     Task { await model.retrySubscription(source) }
-                }.font(.system(size: 14)).disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
+                }.font(.system(size: 14, weight: .medium))
+                    .buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    .disabled(model.busy || model.offline || model.account?.aliasStatus != "active")
+                }
             }
-            Button(source.subscriptionStatus == "unsubscribed" ? "Updates stopped" : source.isCustom ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
+            if source.canUnsubscribe {
+            Button(source.isCustom ? "Stop processing these emails" : "Unsubscribe from newsletter", role: .destructive) {
                 confirmingUnsubscribe = true
             }
             .font(.system(size: 14)).buttonStyle(.plain)
             .disabled(model.busy || model.offline || source.subscriptionStatus == "unsubscribed")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)

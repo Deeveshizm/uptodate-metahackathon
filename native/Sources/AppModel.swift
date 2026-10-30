@@ -15,6 +15,7 @@ final class AppModel: ObservableObject {
     @Published var review: [Post] = []
     @Published var jobs: [Job] = []
     @Published var inboxCandidates: [IncomingNewsletter] = []
+    @Published var newsletterConfirmations: [NewsletterConfirmation] = []
     @Published var error: String?
     @Published var notice: String?
     @Published var busy = false
@@ -388,11 +389,13 @@ final class AppModel: ObservableObject {
         async let sources: [NewsletterSource] = get("v1/me/sources")
         async let review: [Post] = get("v1/review")
         async let candidates: [IncomingNewsletter] = get("v1/inbox/candidates")
-        let values = try await (feed, bookmarks, sources, review, candidates, readFeed)
+        async let confirmations: [NewsletterConfirmation] = get("v1/newsletter-confirmations")
+        let values = try await (feed, bookmarks, sources, review, candidates, readFeed, confirmations)
         guard epoch == sessionEpoch else { throw CancellationError() }
         self.feed = values.0; self.bookmarks = values.1; self.sources = values.2
         self.review = values.3; self.jobs = jobs
         self.inboxCandidates = values.4
+        self.newsletterConfirmations = values.6
         self.readFeed = values.5
         offline = false
         if let account {
@@ -531,11 +534,16 @@ final class AppModel: ObservableObject {
         let pending = jobs.contains(where: { ["queued", "processing"].contains($0.status) })
         guard pending || Date().timeIntervalSince(lastIdleJobPoll) >= 15 else { return }
         lastIdleJobPoll = Date()
+        let epoch = sessionEpoch
         do {
             if account?.aliasStatus != "active" { account = try await get("v1/me") }
             let updated: [Job] = try await get("v1/jobs")
-            inboxCandidates = try await get("v1/inbox/candidates")
-            sources = try await get("v1/me/sources")
+            async let candidates: [IncomingNewsletter] = get("v1/inbox/candidates")
+            async let confirmations: [NewsletterConfirmation] = get("v1/newsletter-confirmations")
+            async let sourceList: [NewsletterSource] = get("v1/me/sources")
+            let mail = try await (candidates, confirmations, sourceList)
+            guard epoch == sessionEpoch else { return }
+            inboxCandidates = mail.0; newsletterConfirmations = mail.1; sources = mail.2
             let discovered = Set(updated.map(\.id)) != Set(jobs.map(\.id))
             let finished = updated.contains { job in
                 !["queued", "processing"].contains(job.status) && jobs.contains(where: { $0.id == job.id && ["queued", "processing"].contains($0.status) })
@@ -656,6 +664,37 @@ final class AppModel: ObservableObject {
         try await get("v1/posts/\(post.id)/source")
     }
 
+    func newsletterConfirmationURL(_ confirmation: NewsletterConfirmation) async -> URL? {
+        var destination: URL?
+        await perform {
+            struct Handoff: Decodable { let url: String }
+            let result = try self.decoder.decode(Handoff.self, from: await self.request("v1/newsletter-confirmations/\(confirmation.id)/open", method: "POST"))
+            guard let url = URL(string: result.url), url.scheme == "https", url.user == nil, url.password == nil else {
+                throw APIError.response(422, "Confirmation link is unavailable")
+            }
+            destination = url
+            try await self.reload()
+        }
+        return destination
+    }
+
+    func completeNewsletterConfirmation(_ confirmation: NewsletterConfirmation) async -> Bool {
+        var completed = false
+        await perform {
+            _ = try await self.request("v1/newsletter-confirmations/\(confirmation.id)/complete", method: "POST")
+            try await self.reload(); completed = true
+        }
+        return completed
+    }
+
+    func removePendingSetup(_ source: NewsletterSource) async {
+        await perform {
+            _ = try await self.request("v1/me/sources/\(source.id)", method: "DELETE")
+            try await self.reload()
+            self.notice = "Setup removed. Future emails from this newsletter will be ignored."
+        }
+    }
+
     func ask(_ post: Post, question: String, history: [PostChatTurn]) async throws -> PostChatReply {
         struct Input: Encodable { let question: String; let history: [PostChatTurn] }
         let bounded = history.suffix(6).map { PostChatTurn(role: $0.role, text: String($0.text.prefix(2000))) }
@@ -683,7 +722,7 @@ final class AppModel: ObservableObject {
         sessionEpoch += 1
         refreshTask?.cancel(); refreshTask = nil; authSession = nil
         Session.clear()
-        token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []
+        token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []; newsletterConfirmations = []
         imageCache.removeAll()
         avatarData = nil; loadedAvatarRevision = nil
         try? FileManager.default.removeItem(at: cache.deletingLastPathComponent().appendingPathComponent("avatar.png"))

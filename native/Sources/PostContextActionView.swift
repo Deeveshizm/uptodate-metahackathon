@@ -135,7 +135,7 @@ struct PostContextActionView: View {
                     Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
                         .accessibilityIdentifier("post.ai.openIn")
                     #else
-                    ShareLink(item: post.aiContext) { Label("Open in…", systemImage: "arrow.up.forward.app") }
+                    Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
                     #endif
                 } label: { pill(symbol) }
                     .menuOrder(.fixed)
@@ -157,13 +157,14 @@ struct PostContextActionView: View {
         #if os(iOS)
         .fullScreenCover(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         .sheet(isPresented: $sharing) {
-            PostAIShareSheet(context: post.aiContext)
+            PostAIShareSheet(post: post)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationCornerRadius(28)
         }
         #else
         .sheet(isPresented: $showingBiggie) { BiggieChatView(post: post) }
+        .sheet(isPresented: $sharing) { PostAIShareSheet(post: post) }
         #endif
     }
     @ViewBuilder private func linkControl(_ kind: String) -> some View {
@@ -311,13 +312,10 @@ private struct BiggieChatView: View {
     @State private var error: String?
     @State private var sharing = false
     @State private var task: Task<Void, Never>?
+    @State private var suggestOpenIn = false
     @FocusState private var questionFocused: Bool
     private var canSend: Bool {
         !sending && !model.offline && !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-    private var sharedContext: String {
-        let draft = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        return draft.isEmpty ? post.aiContext : post.aiContext + "\n\nMy question: " + draft
     }
     var body: some View {
         NavigationStack {
@@ -363,13 +361,14 @@ private struct BiggieChatView: View {
         .onDisappear { task?.cancel() }
         #if os(iOS)
         .sheet(isPresented: $sharing) {
-            PostAIShareSheet(context: sharedContext)
+            PostAIShareSheet(post: post)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationCornerRadius(28)
         }
         #else
         .frame(minWidth: 360, minHeight: 420)
+        .sheet(isPresented: $sharing) { PostAIShareSheet(post: post) }
         #endif
     }
 
@@ -383,7 +382,7 @@ private struct BiggieChatView: View {
                 .accessibilityLabel("Open in another app")
                 .accessibilityIdentifier("post.chat.share")
             #else
-            ShareLink(item: sharedContext) { openInIcon }
+            Button { questionFocused = false; sharing = true } label: { openInIcon }
                 .accessibilityLabel("Open in another app")
             #endif
 
@@ -411,9 +410,9 @@ private struct BiggieChatView: View {
 
     private var openInIcon: some View {
         Image(systemName: "arrow.up.forward.app").font(.system(size: 17, weight: .medium))
-            .foregroundStyle(.primary).frame(width: 44, height: 44)
-            .background(.primary.opacity(0.07), in: Circle())
-            .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+            .foregroundStyle(suggestOpenIn ? Color.blue : Color.primary).frame(width: 44, height: 44)
+            .background(suggestOpenIn ? Color.blue.opacity(0.12) : Color.primary.opacity(0.07), in: Circle())
+            .overlay(Circle().stroke(suggestOpenIn ? Color.blue : Color.primary.opacity(0.12), lineWidth: suggestOpenIn ? 2 : 0.5))
     }
 
     private func send() {
@@ -426,12 +425,13 @@ private struct BiggieChatView: View {
             do {
                 let reply = try await model.ask(post, question: text, history: history)
                 guard !Task.isCancelled else { return }
+                suggestOpenIn = reply.handoffSuggested == true
                 let references = reply.evidenceIds.compactMap { index -> String? in
                     guard post.evidence.indices.contains(index) else { return nil }
                     return post.evidence[index].source
                 }
                 let suffix = references.isEmpty ? "" : "\n\nSource excerpts: " + references.joined(separator: "; ")
-                turns.append(PostChatTurn(role: "assistant", text: reply.answer + suffix))
+                turns.append(PostChatTurn(role: "assistant", text: reply.answer + suffix, citations: reply.citations ?? []))
             } catch {
                 if !Task.isCancelled { self.error = error.localizedDescription; question = text; turns.removeLast() }
             }
@@ -459,6 +459,17 @@ private struct BiggieMessageBubble: View {
                             .fill(outgoing ? Color(red: 0.02, green: 0.36, blue: 0.82) : Color.gray.opacity(0.22))
                     }
                     .accessibilityLabel((outgoing ? "You: " : "Biggie: ") + turn.text)
+                if !outgoing, !turn.citations.isEmpty {
+                    Menu {
+                        ForEach(turn.citations) { citation in
+                            if let url = citation.destination { Link(citation.title, destination: url) }
+                        }
+                    } label: {
+                        Label("Sources", systemImage: "globe").font(.caption)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(.primary.opacity(0.06), in: Capsule())
+                    }.accessibilityIdentifier("chat.webSources")
+                }
                 Text(outgoing ? "you" : "Biggie")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
@@ -494,11 +505,44 @@ private struct BiggieThinkingBubble: View {
     }
 }
 
+private struct PostAIShareSheet: View {
+    @EnvironmentObject private var model: AppModel
+    let post: Post
+    @State private var source: String?
+    @State private var error: String?
+    var body: some View {
+        Group {
+            if let source {
+                #if os(iOS)
+                PostSourceActivity(context: source)
+                #else
+                VStack(spacing: 16) {
+                    Text("Open the original source").font(.headline)
+                    ShareLink(item: source) { Label("Choose an app", systemImage: "arrow.up.forward.app") }
+                }.padding(28)
+                #endif
+            } else if let error { Text(error).foregroundStyle(.secondary).padding() }
+            else { ProgressView("Preparing source…").padding() }
+        }.task {
+            do {
+                if post.isEmailSource {
+                    let original = try await model.sourceEmail(post)
+                    source = original.title + "\n\n" + original.text
+                } else { source = post.originalUrl }
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
 #if os(iOS)
-private struct PostAIShareSheet: UIViewControllerRepresentable {
+private struct PostSourceActivity: UIViewControllerRepresentable {
     let context: String
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(activityItems: [self.context], applicationActivities: nil)
+        let item: Any
+        if let url=URL(string:self.context),url.host != nil,["https","http"].contains(url.scheme ?? "") {
+            item=url
+        } else { item=self.context }
+        let controller = UIActivityViewController(activityItems: [item], applicationActivities: nil)
         controller.excludedActivityTypes = [.postToFacebook, .postToTwitter, .postToWeibo, .message, .mail,
                                           .print, .assignToContact, .saveToCameraRoll, .addToReadingList,
                                           .postToFlickr, .postToVimeo, .postToTencentWeibo, .airDrop]

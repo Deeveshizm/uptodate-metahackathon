@@ -1,7 +1,7 @@
 """Submit supported newsletter forms with the server-assigned relay only.
 
-JavaScript-only forms, CAPTCHA and additional consent steps require manual
-action. A successful POST means submitted, never a confirmed subscription.
+JavaScript forms use the optional isolated browser. CAPTCHA and additional
+consent steps require manual action. A POST is not a confirmed subscription.
 """
 import re
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -43,6 +43,13 @@ class FormSignup:
                 return self.browser.subscribe(url=page.url, email=email, **options)
             return {"status": "manual_action", "detail": "No single supported newsletter form found; use the account relay to subscribe manually"}
         form, email_field = forms[0]
+        # React-style forms often omit method/action and intercept submit to
+        # make a secure JavaScript POST. Let the isolated browser try them;
+        # its request guard blocks GET submissions that would leak the alias.
+        if (form.get("method", "get").lower() == "get" and self.browser
+                and form.get("enctype", "application/x-www-form-urlencoded").lower() == "application/x-www-form-urlencoded"):
+            options = {"before_submit": before_submit} if before_submit is not None else {}
+            return self.browser.subscribe(url=page.url, email=email, **options)
         if form.get("method", "get").lower() != "post" or form.get("enctype", "application/x-www-form-urlencoded").lower() != "application/x-www-form-urlencoded":
             return {"status": "manual_action", "detail": "This signup form needs manual submission using the account relay"}
         if form.select("[class*=captcha], [id*=captcha], [name*=captcha], iframe") or soup.select("script[src*=recaptcha], script[src*=hcaptcha], script[src*=turnstile]"):

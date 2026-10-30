@@ -4,6 +4,8 @@ anyio==4.15.1
 beautifulsoup4==4.15.0
 certifi==2026.10.18
 click==8.5.0
+dkimpy==1.1.8
+dnspython==2.9.1
 fastapi==0.146.0
 greenlet==3.5.6
 h11==0.16.0

@@ -27,17 +27,26 @@ struct NewsletterSource: Codable, Identifiable, Equatable {
     var managementName: String? = nil
     var unsubscribedAt: String? = nil
     var archivedAt: String? = nil
+    var subscriptionConfirmed: Bool? = nil
     var displayName: String { managementName ?? name }
     var isCustom: Bool {
         if let category { return category == "custom" }
         return sourceKind == "email" || ["muse", "claude"].contains(name.lowercased())
     }
     var isUnsubscribed: Bool { subscriptionStatus == "unsubscribed" }
+    var canUnsubscribe: Bool {
+        if isCustom { return subscriptionStatus == "receiving" }
+        guard ["submitted", "email_received", "receiving", "unsubscribe_pending", "unsubscribing"].contains(subscriptionStatus ?? "") else { return false }
+        return subscriptionConfirmed ?? ["email_received", "receiving"].contains(subscriptionStatus ?? "")
+    }
+    var canRemoveSetup: Bool {
+        !isCustom && subscriptionConfirmed != true && ["not_requested","queued","submitting","submitted","confirmation_required","manual_action","failed","needs_agent","needs_inbox"].contains(subscriptionStatus ?? "")
+    }
 
     var subscriptionTitle: String {
         switch subscriptionStatus {
         case "queued", "submitting": "Signup in progress"
-        case "submitted": "Signup submitted · waiting for email"
+        case "submitted": subscriptionConfirmed == true ? "Subscribed · waiting for the first edition" : "Signup submitted · waiting for email"
         case "confirmation_required": "Confirm your subscription"
         case "email_received": "Publisher email received · waiting for an edition"
         case "receiving": isCustom ? "Email newsletter connected" : "Newsletter emails connected"
@@ -58,6 +67,15 @@ struct IncomingNewsletter: Codable, Identifiable {
     let subject: String
     let status: String
     var displayName: String { provider ?? senderName }
+}
+
+struct NewsletterConfirmation: Decodable, Identifiable {
+    let id: String
+    let subject: String
+    let senderDomain: String
+    let status: String
+    let sourceId: String?
+    let sourceName: String?
 }
 
 struct EmailSourceText: Decodable {
@@ -297,12 +315,27 @@ struct PostChatReply: Decodable {
     let evidenceIds: [Int]
     let sourceUrl: String
     let model: String
+    var citations: [PostWebCitation]? = nil
+    var handoffSuggested: Bool? = nil
+    var handoffReason: String? = nil
+}
+
+struct PostWebCitation: Decodable, Identifiable {
+    let title: String
+    let url: String
+    var id: String { url }
+    var destination: URL? {
+        guard let value = URL(string: url), ["https", "http"].contains(value.scheme?.lowercased() ?? ""),
+              value.host != nil, value.user == nil, value.password == nil else { return nil }
+        return value
+    }
 }
 
 struct PostChatTurn: Encodable, Identifiable {
     let id = UUID()
     let role: String
     let text: String
+    var citations: [PostWebCitation] = []
     enum CodingKeys: CodingKey { case role, text }
 }
 

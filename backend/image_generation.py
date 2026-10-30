@@ -43,7 +43,7 @@ class MuseImageIllustrator:
         started = time.monotonic()
         request = {"model": self.model, "prompt": prompt, "n": 1, "size": "1024x1024",
                    "response_format": "b64_json", "output_format": "png", "reasoning_strength": "low",
-                   "tool_enablement": {"enable_image_search": False, "enable_web_search": False, "enable_shell": False}}
+                   "tool_enablement": {"enable_image_search": True, "enable_web_search": True, "enable_shell": False}}
         try:
             with httpx.Client(timeout=httpx.Timeout(120, connect=10), trust_env=False, transport=self.transport) as client:
                 with client.stream("POST", "https://api.meta.ai/v1/images/generations", json=request,

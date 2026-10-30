@@ -51,6 +51,10 @@ def main():
             if not version or version[0]!=1:raise RuntimeError('Unexpected runtime schema version')
         target.execute((ROOT/'supabase/migrations/20261029000100_source_lifecycle.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261029000200_profile_avatars.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261029000300_cloudflare_inbound.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261029000400_newsletter_confirmations.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261030000100_legacy_relay_aliases.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261030000200_revoked_relay_aliases.sql').read_text())
     headers={'apikey':values['SUPABASE_SECRET_KEY'],'Authorization':'Bearer '+values['SUPABASE_SECRET_KEY']}
     bucket=values.get('POST_IMAGE_BUCKET','post-images')
     origin=values['SUPABASE_URL'].rstrip('/')

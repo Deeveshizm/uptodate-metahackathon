@@ -66,12 +66,34 @@ CREATE TABLE IF NOT EXISTS test_relay_receipts (
  message_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  state TEXT NOT NULL, job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL, received_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS legacy_relay_aliases (
+ address TEXT PRIMARY KEY REFERENCES test_relay_aliases(address) ON DELETE CASCADE,
+ user_id TEXT REFERENCES users(id) ON DELETE SET NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS legacy_relay_aliases_owner ON legacy_relay_aliases(user_id);
+CREATE TABLE IF NOT EXISTS revoked_relay_aliases (
+ digest TEXT PRIMARY KEY, revoked_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cloudflare_inbound (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ recipient TEXT NOT NULL, raw BLOB NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cloudflare_inbound_user ON cloudflare_inbound(user_id);
+CREATE INDEX IF NOT EXISTS cloudflare_inbound_created ON cloudflare_inbound(created_at);
 CREATE TABLE IF NOT EXISTS source_mail_actions (
  source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  unsubscribe_url TEXT NOT NULL, one_click INTEGER NOT NULL DEFAULT 0,
  updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS newsletter_confirmations (
+ id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ source_id TEXT REFERENCES sources(id) ON DELETE SET NULL,
+ subject TEXT NOT NULL, sender_domain TEXT NOT NULL, action_url TEXT NOT NULL,
+ status TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS newsletter_confirmations_owner ON newsletter_confirmations(user_id,status);
 CREATE TABLE IF NOT EXISTS inbox_candidates (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  sender TEXT NOT NULL, sender_name TEXT NOT NULL, provider TEXT,

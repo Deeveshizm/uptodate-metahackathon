@@ -92,7 +92,7 @@ def main():
     if not args.image or not args.image.startswith(repository+':'):
         raise RuntimeError('Supply --image with the exact tag produced by the build command')
     secrets={}
-    for name in [*required,'RESEND_API_KEY']:
+    for name in [*required,'RESEND_API_KEY','CLOUDFLARE_INGEST_SECRET']:
         if not values.get(name):continue
         # URL and publishable key are public configuration, not secret resources.
         if name in ['SUPABASE_URL','SUPABASE_PUBLISHABLE_KEY']:continue
@@ -118,6 +118,8 @@ def main():
     }
     receiving_domain=values.get('RESEND_RECEIVING_DOMAIN') or values.get('RELAY_TEST_DOMAIN')
     if receiving_domain:plain['RESEND_RECEIVING_DOMAIN']=receiving_domain
+    for name in ['CLOUDFLARE_RECEIVING_DOMAIN','CLOUDFLARE_RECEIVING_ENABLED']:
+        if values.get(name):plain[name]=values[name]
     with tempfile.TemporaryDirectory(prefix='uptodate-run-') as directory:
         env_path=Path(directory)/'environment.json'
         def deploy(name,worker_url=''):

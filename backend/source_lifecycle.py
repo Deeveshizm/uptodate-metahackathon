@@ -40,4 +40,5 @@ def management_source(source, post_count=0):
     source['category'] = category(source)
     source['post_count'] = post_count
     source['management_name'] = 'Personal imports' if source['name'].strip().casefold() in IMPORT_NAMES else source['name']
+    source['subscription_confirmed'] = bool(source.get('subscription_confirmed')) or source.get('subscription_status') in ('email_received','receiving')
     return source

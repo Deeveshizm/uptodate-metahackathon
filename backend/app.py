@@ -4,6 +4,7 @@ from contextlib import suppress
 import html
 import json
 import os
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -26,14 +27,16 @@ from .generation import generation_model, engine_generation
 from .retrieval import SourceError, public_url
 from .source_engine import SourceEngine
 from .auth import SupabaseAuth
-from .receiving import ReceivingError, ResendRelay
+from .receiving import RELAY_LOCAL_PATTERN, ReceivingError, ResendRelay
+from .relay_aliases import ACTIVE_ALIASES, revoke_account_aliases
 from .signup import FormSignup
 from .subscriptions import Subscriptions
-from .post_chat import ChatInput, answer_post
+from .post_chat import ChatInput, answer_post, handoff_reason
 from .budgets import JobBudget
 from .source_identity import newsletter_identity
 from .source_lifecycle import category, maintain_sources, management_source
 from .profile_avatars import MAX_UPLOAD, normalize_avatar
+from .cloudflare_receiving import MAX_EMAIL_BYTES, INGEST_PATH, authentic_delivery, receiving_domain, relay_from_environment, save_delivery
 
 
 def uid():
@@ -100,7 +103,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         from .browser_signup import BrowserSignup
         engine.subscription_agent = FormSignup(engine.fetcher, browser=BrowserSignup() if os.environ.get("NEWSLETTER_SIGNUP_MODE") == "browser" else None)
     auth = auth_provider if auth_provider is not None else SupabaseAuth.from_environment()
-    relay = test_relay if test_relay is not None else ResendRelay.from_environment()
+    relay = test_relay if test_relay is not None else relay_from_environment(store)
     subscriptions = Subscriptions(store, engine.fetcher)
     if relay and (not auth or auth.relay_aliases):
         raise ValueError("Resend receiving requires verified accounts with permanent relay activation disabled")
@@ -114,7 +117,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             with store.connect() as db:
                 pending_unsubscribe = [(row["user_id"], row["id"]) for row in db.execute(
                     "SELECT s.user_id,s.id FROM sources s JOIN source_mail_actions a ON a.source_id=s.id "
-                    "JOIN test_relay_aliases r ON r.user_id=s.user_id AND r.address=s.subscription_alias "
+                    "JOIN (" + ACTIVE_ALIASES + ") r ON r.user_id=s.user_id AND r.address=s.subscription_alias "
                     "WHERE r.status='active' AND s.subscription_status='unsubscribe_pending' AND a.one_click=1")]
             for owner_id, source_id in pending_unsubscribe:
                 subscriptions.unsubscribe(owner_id, source_id)
@@ -248,6 +251,35 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         else:
             background.add_task(process_job, job_id)
 
+    @app.post(INGEST_PATH, status_code=202)
+    async def cloudflare_email(request: Request, background: BackgroundTasks):
+        domain = receiving_domain()
+        secret = os.environ.get("CLOUDFLARE_INGEST_SECRET", "")
+        if not domain or len(secret) < 32 or not auth:
+            raise HTTPException(404, "Not found")
+        recipient = request.headers.get("x-uptodate-recipient", "")
+        if not re.fullmatch(RELAY_LOCAL_PATTERN + "@" + re.escape(domain), recipient):
+            raise HTTPException(400, "Invalid delivery recipient")
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > MAX_EMAIL_BYTES:
+                raise HTTPException(413, "Incoming email exceeds the 2 MB limit")
+        if not authentic_delivery(secret, request.headers.get("x-uptodate-timestamp", ""), recipient,
+                                  raw, request.headers.get("x-uptodate-signature", "")):
+            raise HTTPException(401, "Delivery authentication failed")
+        try:
+            message_id = await asyncio.to_thread(save_delivery, store, recipient, bytes(raw))
+        except ReceivingError:
+            raise HTTPException(503, "Incoming mailbox is temporarily unavailable") from None
+        if not message_id:
+            raise HTTPException(404, "Recipient is unavailable")
+        if dispatcher:
+            background.add_task(dispatcher.enqueue_receiving, message_id)
+        elif relay:
+            background.add_task(receive_mail)
+        return {"status": "queued"}
+
     def worker_identity(request: Request):
         if not cloud or os.environ.get('CLOUD_RUN_ROLE') != 'worker':
             raise HTTPException(404, 'Not found')
@@ -284,6 +316,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         engine.assets.collect()
         with store.connect() as db:
             maintain_sources(db)
+            from .newsletter_confirmations import expire_confirmations
+            expire_confirmations(db)
         return {'status': 'checked'}
 
     def remember_verified_user(profile):
@@ -485,8 +519,26 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                            (job_id, user["id"], source_id, fingerprint, "Subscribe using account alias", payload, now()))
             db.execute("UPDATE sources SET subscription_status='queued',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='Signup queued using the active account alias' WHERE id=?", (source_id,))
             db.execute('DELETE FROM source_mail_actions WHERE source_id=? AND user_id=?', (source_id, user['id']))
+            db.execute("UPDATE newsletter_confirmations SET status='superseded',action_url='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened','confirmed')", (source_id,user['id']))
         schedule_job(background, job_id)
         return {"job_id": job_id, "status": "queued", "duplicate": False}
+
+    @app.delete('/v1/me/sources/{source_id}', status_code=204)
+    def remove_pending_source(source_id: str, user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            source=db.execute('SELECT * FROM sources WHERE id=? AND user_id=?',(source_id,user['id'])).fetchone()
+            if not source:
+                raise HTTPException(404,'Newsletter not found')
+            if source['archived_at'] and source['subscription_status']=='unsubscribed':
+                return
+            confirmed=db.execute("SELECT 1 FROM newsletter_confirmations WHERE source_id=? AND user_id=? AND status='confirmed'",(source_id,user['id'])).fetchone()
+            if confirmed or source['subscription_status'] in ('receiving','email_received','unsubscribe_pending','unsubscribing','unsubscribed') or category(dict(source))=='custom':
+                raise HTTPException(409,'This subscription is active; use Unsubscribe instead')
+            stamp=now()
+            db.execute("UPDATE sources SET subscription_status='unsubscribed',subscription_detail='Setup removed; future email processing stopped',unsubscribed_at=?,archived_at=? WHERE id=? AND user_id=?",(stamp,stamp,source_id,user['id']))
+            db.execute("UPDATE jobs SET status='cancelled',stage='cancelled',error='Pending setup removed by user',payload=NULL WHERE source_id=? AND user_id=? AND status='queued' AND kind NOT IN ('ask_ai','visual')",(source_id,user['id']))
+            db.execute("UPDATE newsletter_confirmations SET status='cancelled',action_url='' WHERE source_id=? AND user_id=? AND status IN ('pending','opened')",(source_id,user['id']))
 
     @app.post("/v1/me/sources/{source_id}/unsubscribe")
     def unsubscribe_source(source_id: str, user=Depends(current_user)):
@@ -612,7 +664,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         return {**account_json(user), "alias_deliverable": user.get("alias_status") == "active"}
 
     def require_receiving(user):
-        if not relay or user.get("alias_scope") != "resend":
+        if not relay or user.get("alias_scope") not in ("resend", "cloudflare"):
             raise HTTPException(404, "Receiving is not enabled for this account")
 
     @app.get("/v1/relay")
@@ -693,6 +745,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         if auth:
             auth.delete(user["id"])
         with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            revoke_account_aliases(db,user['id'])
             db.execute("DELETE FROM users WHERE id=?", (user["id"],))
             db.execute("DELETE FROM generation_artifacts WHERE scope=?", ("user:" + user["id"],))
 
@@ -754,7 +808,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def sources(user=Depends(current_user)):
         with store.connect() as db:
             maintain_sources(db, user['id'])
-            rows = db.execute('SELECT * FROM sources WHERE user_id=? AND archived_at IS NULL ORDER BY name', (user['id'],)).fetchall()
+            rows = db.execute("SELECT s.*,EXISTS(SELECT 1 FROM newsletter_confirmations c WHERE c.source_id=s.id AND c.user_id=s.user_id AND c.status='confirmed') AS subscription_confirmed FROM sources s WHERE s.user_id=? AND s.archived_at IS NULL ORDER BY s.name", (user['id'],)).fetchall()
             return [management_source(row, db.execute('SELECT COUNT(*) FROM posts WHERE source_id=? AND user_id=?', (row['id'], user['id'])).fetchone()[0]) for row in rows]
 
     @app.get("/v1/inbox/candidates")
@@ -762,6 +816,55 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             rows=db.execute("SELECT id,sender,sender_name,provider,subject,status FROM inbox_candidates WHERE user_id=? AND status IN ('pending','dismissed') ORDER BY updated_at DESC LIMIT 20",(user["id"],)).fetchall()
             return [dict(row) for row in rows]
+
+    @app.get('/v1/newsletter-confirmations')
+    def newsletter_confirmations(user=Depends(current_user)):
+        from .newsletter_confirmations import expire_confirmations
+        with store.connect() as db:
+            expire_confirmations(db)
+            rows=db.execute("SELECT c.id,c.subject,c.sender_domain,c.status,c.source_id,s.name AS source_name "
+                            "FROM newsletter_confirmations c LEFT JOIN sources s ON s.id=c.source_id "
+                            "WHERE c.user_id=? AND c.status IN ('pending','opened') "
+                            "AND (c.source_id IS NULL OR s.subscription_status NOT IN ('unsubscribed','unsubscribe_pending','unsubscribing')) "
+                            "ORDER BY c.created_at DESC LIMIT 20",(user['id'],)).fetchall()
+            return JSONResponse([dict(row) for row in rows],headers={'Cache-Control':'private, no-store'})
+
+    def own_confirmation(db,confirmation_id,user):
+        from .newsletter_confirmations import expire_confirmations
+        expire_confirmations(db)
+        row=db.execute("SELECT c.*,s.subscription_status FROM newsletter_confirmations c "
+                       "LEFT JOIN sources s ON s.id=c.source_id WHERE c.id=? AND c.user_id=?",(confirmation_id,user['id'])).fetchone()
+        if not row:
+            raise HTTPException(404,'Confirmation not found')
+        if row['status'] not in ('pending','opened') or row['subscription_status'] in ('unsubscribed','unsubscribe_pending','unsubscribing'):
+            raise HTTPException(409,'Confirmation is unavailable; use the publisher website to request a fresh email')
+        return row
+
+    @app.post('/v1/newsletter-confirmations/{confirmation_id}/open')
+    def open_newsletter_confirmation(confirmation_id:str,user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=own_confirmation(db,confirmation_id,user)
+            url=public_url(row['action_url'])
+            if urlsplit(url).scheme!='https':
+                raise HTTPException(409,'Confirmation link is unavailable')
+            db.execute("UPDATE newsletter_confirmations SET status='opened' WHERE id=?",(confirmation_id,))
+            if row['source_id']:
+                # Only the user's explicit handoff approves this authenticated
+                # sending domain for the existing requested newsletter.
+                db.execute("UPDATE sources SET expected_sender_domain=?,subscription_status='confirmation_required',subscription_detail='Confirmation link opened by you; finish on the publisher website.' WHERE id=? AND user_id=?",(row['sender_domain'],row['source_id'],user['id']))
+            return JSONResponse({'url':url},headers={'Cache-Control':'private, no-store','Referrer-Policy':'no-referrer'})
+
+    @app.post('/v1/newsletter-confirmations/{confirmation_id}/complete',status_code=204)
+    def complete_newsletter_confirmation(confirmation_id:str,user=Depends(current_user)):
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=own_confirmation(db,confirmation_id,user)
+            if row['status']!='opened':
+                raise HTTPException(409,'Open the confirmation link on the publisher website first')
+            db.execute("UPDATE newsletter_confirmations SET status='confirmed',action_url='' WHERE id=?",(confirmation_id,))
+            if row['source_id']:
+                db.execute("UPDATE sources SET subscription_status='submitted',subscription_detail='Confirmation marked complete by you; waiting for the first newsletter edition.' WHERE id=? AND user_id=?",(row['source_id'],user['id']))
 
     @app.post("/v1/inbox/candidates/{candidate_id}/dismiss", status_code=204)
     def dismiss_email_candidate(candidate_id: str, user=Depends(current_user)):
@@ -824,7 +927,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                     raise HTTPException(422, "Use a public HTTP(S) signup URL")
                 db.execute("UPDATE sources SET signup_url=? WHERE id=?", (url, source_id))
             if body.muted is not None:
-                db.execute("UPDATE sources SET muted=? WHERE id=?", (body.muted, source_id))
+                db.execute("UPDATE sources SET muted=? WHERE id=?", (int(body.muted), source_id))
             return dict(db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone())
 
     @app.get("/v1/review")
@@ -930,6 +1033,11 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = dict(get_post(db, user, post_id))
+            advice=handoff_reason(body.question)
+            if advice:
+                return {'answer':advice+' Use Open in to send the source to another AI app, then add your question there.',
+                        'evidence_ids':[],'source_url':row['original_url'],'model':'handoff',
+                        'handoff_suggested':True,'handoff_reason':advice}
             # Permit one concurrent question and ten questions/minute per account.
             recent = db.execute("SELECT status,created_at FROM jobs WHERE user_id=? AND kind='ask_ai' ORDER BY created_at DESC LIMIT 10", (user["id"],)).fetchall()
             stamp = datetime.now(timezone.utc)

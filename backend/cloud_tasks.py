@@ -75,11 +75,13 @@ class CloudDispatcher:
             logger.warning('Task dispatch deferred; durable outbox retained')
             return 0
 
-    def enqueue_receiving(self):
+    def enqueue_receiving(self, delivery_id=None):
         from google.api_core.exceptions import AlreadyExists
         from google.cloud import tasks_v2
         from google.protobuf.duration_pb2 import Duration
-        digest = hashlib.sha256(('receiving:' + str(int(time.time() // 60))).encode()).hexdigest()
+        # Webhook deliveries each wake processing immediately, even when a
+        # previous receiving task already completed within the same minute.
+        digest = hashlib.sha256(('receiving:' + str(delivery_id or int(time.time() // 60))).encode()).hexdigest()
         task = {'name': self.parent + '/tasks/' + digest,
                 'dispatch_deadline': Duration(seconds=300),
                 'http_request': {'http_method': tasks_v2.HttpMethod.POST,

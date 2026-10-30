@@ -32,9 +32,66 @@ def reusable_license(url):
     )
 
 
+BRANDING = re.compile(r"\b(?:logo|logotype|wordmark|masthead|brandmark|favicon|avatar)\b", re.I)
+
+
+def image_identity(value, base):
+    url = safe_url(urljoin(base, value))
+    if not url:
+        return None
+    parts = urlsplit(url)
+    # Keep asset-identifying query values on image proxies; ignore renditions.
+    query = sorted((k,v) for k,v in parse_qsl(parts.query) if k.lower() not in
+                   ('w','width','h','height','q','quality','dpr','fit','crop','auto','fm','format','resize'))
+    return parts.netloc.lower(), parts.path, tuple(query)
+
+
+def branding_images(soup, base):
+    result, nodes = set(), []
+    for script in soup.find_all('script', attrs={'type':'application/ld+json'}, limit=30):
+        try:
+            pending = [json.loads(script.string or script.get_text())]
+        except (ValueError,TypeError):
+            continue
+        for _ in range(500):
+            if not pending:
+                break
+            node = pending.pop()
+            if isinstance(node,dict):
+                nodes.append(node)
+                pending.extend(v for v in node.values() if isinstance(v,(dict,list)))
+            elif isinstance(node,list):
+                pending.extend(node[:100])
+    by_id = {n['@id']:n for n in nodes if isinstance(n.get('@id'),str) and (n.get('url') or n.get('contentUrl'))}
+    def add(value):
+        for _ in range(4):
+            if isinstance(value,dict):
+                value = by_id.get(value.get('@id'),value)
+                value = value.get('url') or value.get('contentUrl') or value.get('@id','')
+            elif isinstance(value,str) and value in by_id:
+                value = by_id[value].get('url') or by_id[value].get('contentUrl','')
+            else:
+                break
+        if isinstance(value,str) and value and value not in by_id and not value.startswith('#'):
+            key = image_identity(value,base)
+            if key:result.add(key)
+    for node in nodes:
+        logo = node.get('logo')
+        for value in logo if isinstance(logo,list) else [logo]:
+            add(value)
+    for image in soup.find_all('img',limit=200):
+        label = ' '.join(str(image.get(k,'')) for k in ('alt','title','class','id'))
+        if BRANDING.search(label) or image.find_parent(['nav','header','footer']):
+            add(image.get('data-src') or image.get('src',''))
+    for icon in soup.find_all('link',rel=lambda value:value and 'icon' in str(value).lower(),limit=20):
+        add(icon.get('href',''))
+    return result
+
+
 def html_figures(resource, document_license):
     soup = BeautifulSoup(resource.body, "html.parser")
     main = content_root(soup)
+    branding = branding_images(soup,resource.url)
     figures, seen = [], set()
     for image in main.find_all(["img", "object", "embed", "svg"], limit=50):
         ancestry = list(image.parents)
@@ -46,12 +103,14 @@ def html_figures(resource, document_license):
             continue
         raw = image.get("data-src") or image.get("data-lazy-src") or image.get("nitro-lazy-src") or image.get("data") or image.get("src", "")
         url = resource.url + "#" + str(image.find_parent("figure").get("id", "figure")) if inline_svg and image.find_parent("figure") else safe_url(urljoin(resource.url, raw))
-        if not url or url in seen or re.search(r"logo|avatar|tracking|pixel|favicon|badge", url, re.I):
+        if not url or url in seen or image_identity(url,resource.url) in branding or re.search(r"logo|avatar|tracking|pixel|favicon|badge", url, re.I):
             continue
         seen.add(url)
         figure = image.find_parent("figure")
         caption_node = figure.find("figcaption") if figure else None
         caption = caption_node.get_text(" ", strip=True) if caption_node else image.get("alt", "")
+        if BRANDING.search(caption):
+            continue
         uncaptioned_photo = False
         if len(caption) < 15:
             # Editorial photos often have empty alt text (notably Substack).
@@ -85,7 +144,8 @@ def html_figures(resource, document_license):
     kind = soup.find("meta", attrs={"property": "og:type"})
     if hero and (main.name == "article" or (kind and kind.get("content") == "article")):
         url = safe_url(urljoin(resource.url, hero.get("content", "")))
-        if url and url not in {figure['url'] for figure in figures} and not re.search(r"logo|avatar|tracking|pixel|favicon|wordmark|badge", url, re.I):
+        alt = soup.find('meta',attrs={'property':'og:image:alt'})
+        if url and image_identity(url,resource.url) not in branding and not BRANDING.search(alt.get('content','') if alt else '') and url not in {figure['url'] for figure in figures} and not re.search(r"logo|avatar|tracking|pixel|favicon|wordmark|badge", url, re.I):
             title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
             figures.append({"id": "article-hero", "url": url, "caption": "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article"),
                             "license_url": document_license, "page": None, "selection_basis": "article_hero_metadata", "caption_origin": "article_title"})
@@ -183,6 +243,8 @@ def rank_figures(document, draft):
         # An unknown license is NOT evidence that the source has no image.
         # Keep rights metadata for review, independently of visual selection.
         caption = figure["caption"]
+        if BRANDING.search(caption) or re.search(r'logo|wordmark|favicon|avatar',figure.get('url',''),re.I):
+            continue
         overlap = len(words(caption) & context)
         if overlap < 2 and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
             continue
