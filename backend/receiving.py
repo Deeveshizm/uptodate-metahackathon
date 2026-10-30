@@ -156,7 +156,12 @@ def newsletter_payload(message):
     # EmailMessage generates random MIME boundaries. Deduplicate normalized
     # content too, including redeliveries with a different provider message ID.
     parsed["fingerprint"] = hashlib.sha256(json.dumps({key: parsed[key] for key in ("sender", "subject", "text", "urls")}, sort_keys=True).encode()).hexdigest()
-    return (parsed, "queued") if links or (len(parsed["text"]) >= 160 and len(parsed["text"].split()) >= 25) else (None, "received")
+    substantive = len(parsed['text']) >= 160 and len(parsed['text'].split()) >= 25
+    if not substantive and not links and len(parsed['text'].split()) >= 10:
+        from .email_content import email_documents
+        document, _ = email_documents(parsed)
+        substantive = bool(document.metadata.get('places'))
+    return (parsed, "queued") if links or substantive else (None, "received")
 
 
 def unsubscribe_action(message):

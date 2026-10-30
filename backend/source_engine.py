@@ -19,6 +19,8 @@ from .artifacts import Artifacts, GenerationPending
 from .budgets import JobBudget
 from .email_content import email_documents, use_email_body
 from .email_adaptation import preserve_short_email
+from .story_groups import group_story_links
+from .venue_reviews import VenueReviews
 from .retrieval import PublicFetcher, SourceError
 from .visuals import choose_visual, source_gallery
 from .assets import AssetStore
@@ -41,6 +43,17 @@ class SourceEngine:
         self.subscription_agent = subscription_agent
         self.illustrator = illustrator
         self.photo_searcher = None
+        self.review_searcher = None
+
+    def enrich_recommendation(self, document, job):
+        if self.custom_generator or document.metadata.get('format') != 'email' or not document.metadata.get('places'):
+            return document
+        self.stage(job['id'], 'checking_venue_reviews')
+        if os.environ.get('GENERATION_PROVIDER','meta') == 'meta' and os.environ.get('MODEL_API_KEY'):
+            if self.review_searcher is None:
+                from .venue_photo_search import VenuePhotoSearch
+                self.review_searcher = VenuePhotoSearch(self.store, purpose='reviews')
+        return VenueReviews(self.fetcher, self.review_searcher).enrich(document, JobBudget(self.store, job['id']))
 
     def photo_lookup(self,job):
         if self.custom_generator or os.environ.get('GENERATION_PROVIDER','meta')!='meta' or not os.environ.get('MODEL_API_KEY'):
@@ -286,8 +299,9 @@ class SourceEngine:
                 with self.store.connect() as db:
                     self.assets.save_gallery(db, visual["asset_id"], post["artifact_key"], image)
                 return visual
-            image_variant = "muse-image-1.0-low-v1" if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "comfyui"
-            _, visual, reused = self.artifacts.obtain(document, job["user_id"], "visual:" + image_variant + ":" + post["artifact_key"], produce_visual)
+            from .image_generation import image_variant
+            visual_variant = image_variant() if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "comfyui"
+            _, visual, reused = self.artifacts.obtain(document, job["user_id"], "visual:" + visual_variant + ":" + post["artifact_key"], produce_visual)
             with self.store.connect() as db:
                 stored = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()
             if not stored:
@@ -313,7 +327,12 @@ class SourceEngine:
 
     def generate_posts(self, job, payload):
         self.stage(job["id"], "fetching_source")
+        if payload.get('remaining_candidates') and payload.get('story_selection_version') != 'related-sources-v1':
+            # Rebuild stale URL-per-story retry targets after a routing change.
+            # Existing published posts are still protected by duplicate checks.
+            payload = {key:value for key,value in payload.items() if key not in ('remaining_candidates','processed_items')}
         inline_documents={}
+        fetched_documents={}
         if job["kind"] == "received_email":
             # A new input adapter, using the same original-source selection,
             # local model, verifier and source-first image handling as URL jobs.
@@ -327,7 +346,10 @@ class SourceEngine:
         if inline_documents:
             candidates=[{'url':doc.url,'title':doc.title} for doc in inline_documents.values()]
         elif mode == "digest":
-            candidates = digest_links(root, limit=None)
+            if payload.get('remaining_candidates'):
+                candidates = payload['remaining_candidates']
+            else:
+                candidates, fetched_documents = group_story_links(root, self.fetcher)
             if not candidates:
                 raise SourceError("No article links found in this edition; use Article mode for a single source")
         else:
@@ -347,10 +369,13 @@ class SourceEngine:
                 continue
             try:
                 self.stage(job["id"], "extracting_original")
-                document = inline_documents.get(url) or (root if url == root.url else parse_document(self.fetcher.fetch(url)))
+                document = inline_documents.get(url) or fetched_documents.get(url) or (root if url == root.url else parse_document(self.fetcher.fetch(url)))
                 self.save_document(job, document)
                 secondary = document
-                document = self.original_document(job, document)
+                if document.metadata.get('format') != 'email' or not document.metadata.get('places'):
+                    document = self.original_document(job, document)
+                document = self.enrich_recommendation(document, job)
+                self.save_document(job, document)
                 parts = urlsplit(document.url)
                 query = parse_qsl(parts.query, keep_blank_values=True)
                 cleaned = [(key, value) for key, value in query if not key.lower().startswith("utm_") and key.lower() not in ("ref", "source")]
@@ -392,8 +417,16 @@ class SourceEngine:
                     return self.generator(document,model=configured,stage=lambda stage:self.stage(job['id'],stage))
                 artifact_key, cached, reused = self.artifacts.obtain(document, job["user_id"], variant,produce_draft)
                 draft = copy.deepcopy(cached)
+                if document.metadata.get('review_lookup'):
+                    draft['analysis']['review_lookup'] = copy.deepcopy(document.metadata['review_lookup'])
+                    draft['analysis']['review_sources'] = list(dict.fromkeys(item['url'] for item in document.metadata.get('venue_reviews', [])))
                 from .post_actions import source_actions
-                draft['analysis']['link_actions'] = source_actions(document, draft['analysis'])
+                action_document = copy.deepcopy(document)
+                action_document.links = candidate.get('supporting_links', []) + action_document.links
+                action_document.links += [{'url':url,'title':'Reviews'} for url in draft['analysis'].get('review_sources', [])]
+                draft['analysis']['link_actions'] = source_actions(action_document, draft['analysis'])
+                draft['analysis']['story_group'] = {'primary_url':document.url,
+                    'supporting_links':candidate.get('supporting_links', [])}
                 draft["analysis"]["cache"] = {"reused": reused, "new_inference_cost_usd": 0 if reused else draft["analysis"].get("usage", {}).get("estimated_cost_usd", 0)}
                 draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] == "received_email" else root.url, "secondary_url": secondary.url,
                                                     "original_url": document.url, "content_author": document.metadata.get("author", "")}
@@ -466,7 +499,8 @@ class SourceEngine:
             previous_results = payload.get("processed_items", [])
             completed_results = previous_results + [item for item in results if item["status"] != "waiting"]
             if remaining:
-                payload = {**payload, "remaining_candidates": remaining, "processed_items": completed_results}
+                payload = {**payload, "remaining_candidates": remaining, "processed_items": completed_results,
+                           "story_selection_version":"related-sources-v1"}
                 db.execute("UPDATE jobs SET status='queued',stage='waiting_for_shared_generation',payload=?,result=? WHERE id=?",
                            (json.dumps(payload), json.dumps({"items": completed_results, "remaining_stories": len(remaining), "link_limit_reached": bool(payload.get("link_limit_reached"))}), job["id"]))
                 return

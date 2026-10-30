@@ -327,12 +327,14 @@ def parse_pdf(resource):
         raise SourceError("PDF text extraction failed; try a public HTML version") from exc
 
 
-def digest_links(document, limit=3):
+def digest_links(document, limit=3, allow_companions=False):
     seen, candidates = {document.url}, []
     for link in document.links:
         url, title = link["url"], link["title"]
         description = title + " " + link.get("context", "")
-        if url in seen or len(description.strip()) < 15:
+        companion = allow_companions and (urlsplit(url).hostname in ('arxiv.org','doi.org','github.com') or re.fullmatch(
+            r'(?:paper|full paper|repository|repo|code|github|project(?: page| website)?|demo|supplement(?:ary)?(?: material)?)', title.strip(), re.I))
+        if url in seen or (len(description.strip()) < 15 and not companion):
             continue
         if re.search(r"^(?:home|about|contact|advertis|sponsor|unsubscribe|preferences|sign.?in|subscribe|forward|share)\b", title, re.I):
             continue

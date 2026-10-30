@@ -238,6 +238,8 @@ def words(text):
 
 def rank_figures(document, draft):
     context = words(document.title + " " + draft["title"] + " " + draft["finding"])
+    story = words(draft['title'] + ' ' + draft['finding'])
+    paper = (draft.get('analysis') or {}).get('content_type') == 'paper' or bool(document.metadata.get('abstract') or document.metadata.get('doi'))
     eligible = []
     for figure in document.figures:
         # An unknown license is NOT evidence that the source has no image.
@@ -249,7 +251,7 @@ def rank_figures(document, draft):
         if overlap < 2 and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
             continue
         methodological = bool(re.search(r"architectur|method|framework|pipeline|schematic|overview|diagram", caption, re.I))
-        eligible.append((overlap + 3 * methodological + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0), figure))
+        eligible.append((overlap + 2 * len(words(caption) & story) + 3 * (methodological and paper) + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0), figure))
     return [figure for _, figure in sorted(eligible, key=lambda item: item[0], reverse=True)]
 
 
@@ -463,11 +465,13 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
         visual, data = selected
         return {**visual, "source_role": "article", "primary_source_checks": checks}, data
     venues = linked_venue_gallery(document, draft, fetcher, stage)
+    if not venues and document.metadata.get('venue_reference_pages'):
+        venues = linked_venue_gallery(document, draft, fetcher, stage, pages=document.metadata['venue_reference_pages'])
     if not venues:
         venues = searched_venue_gallery(document,draft,fetcher,stage,photo_search)
     if venues:
         return venues[0]
-    style = os.environ.get("POST_IMAGE_STYLE", "Restrained editorial illustration, off-white background, dark ink, muted blue and green palette, uncluttered composition")
+    style = os.environ.get("POST_IMAGE_STYLE", "Subject-led editorial art: choose a distinctive medium, natural or expressive colors, lighting and texture appropriate to this story; one clear focal subject, readable at small size")
     # CLIP-based workflows need the subject before the longer exclusions.
     prompt = ("Editorial illustration of " + draft["title"] + ". " + draft["finding"] +
               "\nStyle: " + style + ". A single focused visual metaphor of this subject, generous whitespace, "
@@ -573,6 +577,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                 parts=urlsplit(image_url or '')
                 identity=urlunsplit((parts.scheme,parts.netloc,parts.path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
                 if not image_url or identity in seen or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                if re.search(r'(?:^|[/_.-])(?:maps?|staticmap|openstreetmap|googlemaps)(?:[/_.-]|$)|maps\.(?:google|apple)|\b(?:street map|map of|directions map)\b', image_url+' '+candidate['alt'], re.I):continue
                 seen.add(identity)
                 figures.append({'id':'venue-photo-'+str(len(figures)), 'url':image_url,'caption':matching[0]['name']+' · photo from '+resource.url,
                                 'license_url':'','page':None,'selection_basis':'venue_website_photo'})
@@ -636,4 +641,6 @@ def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, phot
         if fallback:
             return [fallback]
     venues=linked_venue_gallery(document,draft,fetcher,stage,limit)
+    if not venues and document.metadata.get('venue_reference_pages'):
+        venues=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=document.metadata['venue_reference_pages'])
     return venues or searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit)

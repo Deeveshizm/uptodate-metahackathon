@@ -110,6 +110,7 @@ def main():
         'GENERATION_PROVIDER':'meta','META_MODEL':values.get('META_MODEL','muse-spark-1.3'),
         'META_REASONING_EFFORT':values.get('META_REASONING_EFFORT','low'),
         'IMAGE_GENERATION_PROVIDER':'meta','NEWSLETTER_SIGNUP_MODE':'browser',
+        'MUSE_IMAGE_REASONING':values.get('MUSE_IMAGE_REASONING','high'),
         'POST_IMAGE_BUCKET':'post-images','CLOUD_TASKS_LOCATION':args.region,
         'CLOUD_TASKS_QUEUE':'uptodate-generation','CLOUD_TASKS_SERVICE_ACCOUNT':account('tasks'),
         'GENERATION_DAILY_BUDGET_USD':values.get('GENERATION_DAILY_BUDGET_USD','2'),

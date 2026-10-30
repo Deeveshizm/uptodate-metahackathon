@@ -144,10 +144,19 @@ struct EmailNewsletterPrompt: View {
             Text("Use it as a newsletter?").font(.subheadline)
             Text(candidate.subject).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             HStack {
-                Button("Yes, add newsletter") { naming = true }.buttonStyle(.borderedProminent)
+                Button { naming = true } label: {
+                    Text("Yes").modifier(CapsuleButtonLabelSizing())
+                }
+                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                    .tint(Color(red: 0.12, green: 0.45, blue: 0.25)).foregroundStyle(.white)
                     .accessibilityIdentifier("inbox.useNewsletter")
                 if candidate.status == "pending" {
-                    Button("Not now") { Task { await model.dismissEmailNewsletter(candidate) } }.buttonStyle(.borderless)
+                    Button { Task { await model.dismissEmailNewsletter(candidate) } } label: {
+                        Text("Later").modifier(CapsuleButtonLabelSizing())
+                    }
+                        .buttonStyle(.borderedProminent).buttonBorderShape(.capsule)
+                        .tint(Color(red: 0.70, green: 0.15, blue: 0.15)).foregroundStyle(.white)
+                        .accessibilityIdentifier("inbox.later")
                 }
             }.disabled(model.busy || model.offline)
         }.padding(20).frame(maxWidth: .infinity, alignment: .leading)

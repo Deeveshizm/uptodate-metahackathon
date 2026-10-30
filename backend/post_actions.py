@@ -10,7 +10,7 @@ PHONE_LABEL = r'(?:phone|telephone|tel\.?|call(?: us)?|contact number)'
 PHONE = re.compile(r'(?<![\w])(?:\+\d[\d ().-]{6,23}\d|\(\d{2,4}\)[ .-]*\d{3,4}[ .-]\d{3,4}|\d{3}[ .-]\d{3}[ .-]\d{4})(?![\w])')
 URL = re.compile(r'https?://[^\s<>"\]]+|\bwww\.[^\s<>"\]]+', re.I)
 EXCLUDED = re.compile(r'unsubscribe|manage.?preferences|email.?preferences|view.?in.?browser|/(?:privacy|terms|signin|login)(?:[/?#]|$)|reset.?password|verify.?email|confirmation.?token|tracking.?pixel', re.I)
-LINK_LABELS = {'website', 'web site', 'official website', 'github', 'repository', 'repo', 'source code', 'project website', 'link'}
+LINK_LABELS = {'website', 'web site', 'official website', 'website / location', 'website/location', 'github', 'repository', 'repo', 'source code', 'project website', 'link'}
 CONTACT_LABELS = LINK_LABELS | {'phone', 'telephone', 'tel', 'call', 'call us', 'contact number', 'address', 'postal address', 'location', 'where', 'map', 'maps', 'directions', 'location link'}
 
 

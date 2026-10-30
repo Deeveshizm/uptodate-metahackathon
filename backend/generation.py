@@ -36,7 +36,7 @@ class GroundedText(StrictModel):
 
 
 class SummaryText(GroundedText):
-    text: str = Field(min_length=100, max_length=1000)
+    text: str = Field(min_length=40, max_length=1000)
 
 
 class IngredientRecord(StrictModel):
@@ -74,13 +74,13 @@ class Draft(StrictModel):
 
 
 class Verdict(StrictModel):
-    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "detail_1", "detail_2", "detail_3"]
+    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "relevance", "detail_1", "detail_2", "detail_3"]
     reason: str = Field(max_length=400)
     supported: bool
 
 
 class Verification(StrictModel):
-    verdicts: list[Verdict] = Field(min_length=3, max_length=12)
+    verdicts: list[Verdict] = Field(min_length=3, max_length=16)
 
 
 BLOCKS = ("hook", "summary", "problem", "approach", "finding", "impact", "limitations")
@@ -278,7 +278,7 @@ def check_evidence(draft: Draft, document: Document):
             quote = spans[citation.span_id]
             quotes.append(quote)
             span = next(s for s in document.spans if s["id"] == citation.span_id)
-            evidence.append({"field": field, "source": "original source", "quote": quote, "url": document.url,
+            evidence.append({"field": field, "source": span.get('source_kind', "original source"), "quote": quote, "url": span.get('source_url', document.url),
                              "span_id": citation.span_id, "section": span["section"], "page": span["page"]})
         if numbers(block.text) - numbers(" ".join(quotes)):
             errors.append(f"{field}: every numerical claim must occur in its cited evidence")

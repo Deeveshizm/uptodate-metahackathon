@@ -12,7 +12,7 @@ NAME_LABELS={"pick","today's pick","today’s pick","recommendation","recommende
 def labelled_fields(text):
     # Match each field's starting boundary independently so adjacent inline
     # fields are not swallowed by the previous value.
-    starts=list(re.finditer(r"(?:(?:^|\n)[ \t]*(?:[-–—•|][ \t]+)?|(?<=[.!?])[ \t]+|[ \t]+[-–—•|][ \t]+)([A-Za-z][A-Za-z '’]{0,40})\s*:[ \t]*",text))
+    starts=list(re.finditer(r"(?:(?:^|\n)[ \t]*(?:[-–—•|][ \t]+)?|(?<=[.!?])[ \t]+|[ \t]+[-–—•|][ \t]+)([A-Za-z][A-Za-z /'’]{0,40})\s*:[ \t]*",text))
     result=[]
     for i,match in enumerate(starts):
         newline=text.find('\n',match.end())
@@ -49,7 +49,7 @@ def maps_search(name,address):
 
 def website_reference(document,text):
     for label,value in labelled_fields(text):
-        if label in ('website','web site','official website'):
+        if label in ('website','web site','official website','website / location','website/location'):
             found=re.search(r'https?://[^\s<>]+',value)
             value=safe_url(found[0].rstrip('.,);')) if found else ''
             if value and not map_link(value):return value

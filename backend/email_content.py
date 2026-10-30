@@ -62,8 +62,10 @@ def email_documents(payload):
 
 
 def use_email_body(document):
+    # A venue's website supplies contact details/photos, not a replacement for
+    # a recommendation already written in the email. This includes deep URLs.
+    if document.metadata.get('places') or document.metadata.get('location_links'):return True
     if not document.links:return True
     if any(urlsplit(link['url']).hostname in ('arxiv.org','doi.org') for link in document.links):return False
-    if document.metadata.get('location_links'):return True
     eligible=[link for link in document.links if not map_link(link['url']) and urlsplit(link['url']).path.rstrip('/')]
     return not eligible

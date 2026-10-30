@@ -8,6 +8,9 @@ from .locations import email_places, labelled_address, place_prose
 def preserve_short_email(document):
     if document.metadata.get('format') != 'email':
         return None
+    if document.metadata.get('venue_reviews'):
+        # New review evidence needs a grounded draft and an independent check.
+        return None
     blocks=[]
     evidence=[]
     for span in document.spans:
@@ -35,7 +38,8 @@ def preserve_short_email(document):
         else:paragraphs.append(block)
     body='\n\n'.join(paragraphs)
     # Long or incomplete editions still use story selection and grounded drafting.
-    if not 25 <= len(body.split()) <= 160 or not re.search(r'[.!?]',body):return None
+    minimum = 10 if document.metadata.get('places') else 25
+    if not minimum <= len(body.split()) <= 160 or not re.search(r'[.!?]',body):return None
     title=document.title
     suffix=title.split(':',1)[-1].strip() if ':' in title else ''
     if suffix and suffix.casefold() in body.casefold():title=suffix
