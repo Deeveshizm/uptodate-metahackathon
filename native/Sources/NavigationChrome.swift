@@ -78,7 +78,7 @@ struct NativeTabNavigation: UIViewControllerRepresentable {
         controller.selectedIndex = min(selection, 3)
         controller.delegate = context.coordinator
         controller.tabBar.tintColor = .label
-        if #available(iOS 26, *) { controller.tabBarMinimizeBehavior = .onScrollDown }
+        if #available(iOS 26, *) { controller.tabBarMinimizeBehavior = .never }
         context.coordinator.updateAvatar(avatarData)
         return controller
     }
