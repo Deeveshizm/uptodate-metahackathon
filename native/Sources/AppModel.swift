@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published var error: String?
     @Published var notice: String?
     @Published var busy = false
+    @Published private(set) var completedGuides: Set<AppGuide> = []
+    @Published private(set) var guideProgressReady = false
     @Published var offline = false
     @Published var authConfiguration: AuthConfiguration?
     @Published private(set) var recoveryReady = false
@@ -29,6 +31,9 @@ final class AppModel: ObservableObject {
     private var authSession: AuthSession?
     private var refreshTask: Task<AuthSession, Error>?
     private var sessionEpoch = 0
+    private var guideOwner: String?
+    private var guideLoadTask: Task<GuideProgress?, Never>?
+    private var guideSyncTask: Task<Void, Never>?
     private var lastIdleJobPoll = Date.distantPast
     private var imageCache: [String: Data] = [:]
     private let base: URL = {
@@ -375,6 +380,65 @@ final class AppModel: ObservableObject {
 
     func refreshAccount() async {
         await perform { self.account = try await self.get("v1/me"); await self.refreshAvatar(); try await self.reload() }
+    }
+
+    private func guideCacheKey(_ owner: String) -> String { "guide-progress-" + owner }
+
+    private func cacheGuideProgress(_ owner: String) {
+        guard let data = try? JSONEncoder().encode(GuideProgress(completed: completedGuides)) else { return }
+        try? Session.save(String(decoding: data, as: UTF8.self), account: guideCacheKey(owner))
+    }
+
+    func prepareGuides() async {
+        guard let owner = account?.id else { return }
+        if guideOwner == owner, guideProgressReady { return }
+        let epoch = sessionEpoch
+        if guideOwner != owner {
+            guideOwner = owner
+            guideProgressReady = false
+            completedGuides = []
+            if let saved = Session.read(account: guideCacheKey(owner)),
+               let progress = try? JSONDecoder().decode(GuideProgress.self, from: Data(saved.utf8)) {
+                completedGuides = progress.completed
+            }
+        }
+        if guideLoadTask == nil, let session = authSession, let client = try? authClient() {
+            guideLoadTask = Task { try? await client.guideProgress(owner: owner, session: session) }
+        }
+        let remote = await guideLoadTask?.value
+        guard epoch == sessionEpoch, account?.id == owner else { return }
+        if let remote { completedGuides.formUnion(remote.completed) }
+        guideLoadTask = nil
+        guideProgressReady = true
+        cacheGuideProgress(owner)
+        if let remote, !completedGuides.isSubset(of: remote.completed) { syncGuideProgress() }
+    }
+
+    func finishGuide(_ guide: AppGuide) {
+        guard let owner = account?.id else { return }
+        completedGuides.insert(guide)
+        cacheGuideProgress(owner)
+        syncGuideProgress()
+    }
+
+    private func syncGuideProgress() {
+        guard guideSyncTask == nil, !completedGuides.isEmpty,
+              let owner = account?.id, let session = authSession, let client = try? authClient() else { return }
+        let epoch = sessionEpoch
+        let completed = completedGuides
+        guideSyncTask = Task {
+            do {
+                let progress = try await client.completeGuides(completed, owner: owner, session: session)
+                guard epoch == sessionEpoch, account?.id == owner else { return }
+                completedGuides.formUnion(progress.completed)
+                cacheGuideProgress(owner)
+                guideSyncTask = nil
+                if !completedGuides.isSubset(of: progress.completed) { syncGuideProgress() }
+            } catch {
+                // Local completion still prevents repeats; retry at the next sign-in.
+                if epoch == sessionEpoch { guideSyncTask = nil }
+            }
+        }
     }
 
     private func reload() async throws {
@@ -740,7 +804,9 @@ final class AppModel: ObservableObject {
 
     func deleteAccount() async {
         await perform {
+            let owner = self.account?.id
             _ = try await self.request("v1/me", method: "DELETE")
+            if let owner { Session.clear(account: self.guideCacheKey(owner)) }
             self.clearLocalSession()
         }
     }
@@ -749,6 +815,9 @@ final class AppModel: ObservableObject {
         cancelEmailFlow()
         deferredAuthURL = nil
         sessionEpoch += 1
+        guideLoadTask?.cancel(); guideLoadTask = nil
+        guideSyncTask?.cancel(); guideSyncTask = nil
+        guideOwner = nil; guideProgressReady = false; completedGuides = []
         refreshTask?.cancel(); refreshTask = nil; authSession = nil
         Session.clear()
         token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []; newsletterConfirmations = []

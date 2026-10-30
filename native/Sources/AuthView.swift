@@ -12,7 +12,7 @@ struct AuthView: View {
 
     private var address: String { email.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var newPasswordValid: Bool {
-        password.count >= 12 && password.utf8.count <= 72 && password == repeatedPassword
+        PasswordPolicy.accepts(password, confirmation: repeatedPassword)
     }
     private var title: String {
         switch step {
@@ -72,13 +72,9 @@ struct AuthView: View {
                                 SecureField("Confirm password", text: $repeatedPassword)
                                     .textContentType(.newPassword).focused($focused, equals: .confirmation)
                             }
-                            Text("Use at least 12 characters.")
-                                .font(.system(size: 12)).foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8)
-                            if password.utf8.count > 72 {
-                                validation("Use a shorter passphrase.")
-                            } else if !repeatedPassword.isEmpty && password != repeatedPassword {
-                                validation("Passwords do not match.")
+                            passwordChecklist
+                            if password.utf8.count > PasswordPolicy.maximumUTF8Bytes {
+                                validation("This password is too long. Use a shorter passphrase.")
                             }
                         }
                     }
@@ -106,6 +102,22 @@ struct AuthView: View {
             else if model.pendingAuthKind == .signup { step = .confirm }
         }
         .onChange(of: model.recoveryReady) { _, ready in if ready { changeStep(.reset) } }
+    }
+
+    private var passwordChecklist: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(PasswordRequirement.allCases) { requirement in
+                let satisfied = requirement.isMet(password: password, confirmation: repeatedPassword)
+                HStack(spacing: 8) {
+                    Image(systemName: satisfied ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 12)).frame(width: 15)
+                    Text(requirement.title).font(.system(size: 12))
+                }.foregroundStyle(satisfied ? Color.green : Color.secondary)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(requirement.title + (satisfied ? ", met" : ", not yet met"))
+                    .accessibilityIdentifier("auth.password.\(requirement.rawValue)")
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).padding(.top, 2)
     }
 
     @ViewBuilder private var actions: some View {

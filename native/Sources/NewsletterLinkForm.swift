@@ -37,9 +37,9 @@ struct NewsletterLinkForm: View {
                 Button(action: submit) {
                     Image(systemName: "arrow.right")
                         .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.background)
+                        .foregroundStyle(Color.blue.opacity(model.busy || model.offline || normalizedLink == nil ? 0.45 : 1))
                         .frame(width: 46, height: 46)
-                        .background(Color.primary.opacity(model.busy || model.offline || normalizedLink == nil ? 0.2 : 1), in: Circle())
+                        .background(Color.blue.opacity(model.busy || model.offline || normalizedLink == nil ? 0.06 : 0.12), in: Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(model.busy || model.offline || normalizedLink == nil)

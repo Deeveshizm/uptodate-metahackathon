@@ -6,6 +6,70 @@ struct AuthConfiguration: Decodable {
     let publishableKey: String?
 }
 
+enum PasswordRequirement: String, CaseIterable, Identifiable {
+    case length, uppercase, lowercase, number, symbol, confirmation
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .length: "At least \(PasswordPolicy.minimumLength) characters"
+        case .uppercase: "An uppercase letter (A–Z)"
+        case .lowercase: "A lowercase letter (a–z)"
+        case .number: "A number (0–9)"
+        case .symbol: "A symbol, such as !, @, or #"
+        case .confirmation: "Passwords match"
+        }
+    }
+    func isMet(password: String, confirmation: String) -> Bool {
+        switch self {
+        case .length: password.count >= PasswordPolicy.minimumLength
+        case .uppercase: password.range(of: "[A-Z]", options: .regularExpression) != nil
+        case .lowercase: password.range(of: "[a-z]", options: .regularExpression) != nil
+        case .number: password.range(of: "[0-9]", options: .regularExpression) != nil
+        case .symbol: password.unicodeScalars.contains {
+            (33...47).contains($0.value) || (58...64).contains($0.value) ||
+            (91...96).contains($0.value) || (123...126).contains($0.value)
+        }
+        case .confirmation: !password.isEmpty && !confirmation.isEmpty && password == confirmation
+        }
+    }
+}
+
+enum PasswordPolicy {
+    static let minimumLength = 8
+    static let maximumUTF8Bytes = 72
+
+    static func accepts(_ password: String, confirmation: String) -> Bool {
+        password.utf8.count <= maximumUTF8Bytes && PasswordRequirement.allCases.allSatisfy {
+            $0.isMet(password: password, confirmation: confirmation)
+        }
+    }
+}
+
+enum AppGuide: String, Codable, CaseIterable, Sendable {
+    case welcome, createNewsletter
+
+    var metadataKey: String {
+        switch self {
+        case .welcome: "uptodate_welcome_guide_completed"
+        case .createNewsletter: "uptodate_newsletter_guide_completed"
+        }
+    }
+}
+
+struct GuideProgress: Codable, Equatable, Sendable {
+    var completed: Set<AppGuide> = []
+
+    static func fromUser(_ data: Data, owner: String) throws -> GuideProgress {
+        guard let user = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = user["id"] as? String, id.lowercased() == owner.lowercased() else {
+            throw APIError.response(401, "Guide progress belongs to a different account.")
+        }
+        let metadata = user["user_metadata"] as? [String: Any] ?? [:]
+        return GuideProgress(completed: Set(AppGuide.allCases.filter { metadata[$0.metadataKey] as? Bool == true }))
+    }
+}
+
 struct AuthSession: Codable, Sendable {
     let accessToken: String
     let refreshToken: String
@@ -43,7 +107,7 @@ struct AuthClient: Sendable {
         self.session = session
     }
 
-    private func call(_ path: String, method: String = "POST", fields: [String: String] = [:], token: String? = nil, redirect: URL? = nil) async throws -> Data {
+    private func call(_ path: String, method: String = "POST", fields: [String: String] = [:], token: String? = nil, redirect: URL? = nil, payload: Data? = nil) async throws -> Data {
         guard let initialURL = URL(string: "auth/v1/" + path, relativeTo: origin.appendingPathComponent("/")),
               var components = URLComponents(url: initialURL, resolvingAgainstBaseURL: true) else {
             throw URLError(.badURL)
@@ -58,7 +122,7 @@ struct AuthClient: Sendable {
         request.setValue(publishableKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        request.httpBody = try JSONSerialization.data(withJSONObject: fields)
+        if method != "GET" { request.httpBody = try payload ?? JSONSerialization.data(withJSONObject: fields) }
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard 200..<300 ~= response.statusCode else {
@@ -69,7 +133,14 @@ struct AuthClient: Sendable {
             case "invalid_credentials": message = "The email or password is incorrect."
             case "email_not_confirmed": message = "Verify your email before signing in."
             case "otp_expired": message = "The code is invalid or expired. Request a new code."
-            case "weak_password": message = "Choose a stronger password that meets the account requirements."
+            case "weak_password":
+                let weakness = object?["weak_password"] as? [String: Any]
+                let reasons = weakness?["reasons"] as? [String] ?? object?["reasons"] as? [String] ?? []
+                if reasons.contains("pwned") {
+                    message = "This password was found in a data breach. Choose a different password."
+                } else {
+                    message = "Use at least \(PasswordPolicy.minimumLength) characters with an uppercase letter, lowercase letter, number, and symbol."
+                }
             case "over_email_send_rate_limit", "over_request_rate_limit": message = "Too many attempts. Wait before trying again."
             default: message = "The account request could not be completed. Check your details and try again."
             }
@@ -122,5 +193,15 @@ struct AuthClient: Sendable {
     }
     func signOut(_ session: AuthSession) async throws {
         _ = try await call("logout?scope=local", token: session.accessToken)
+    }
+
+    func guideProgress(owner: String, session: AuthSession) async throws -> GuideProgress {
+        try GuideProgress.fromUser(await call("user", method: "GET", token: session.accessToken), owner: owner)
+    }
+
+    func completeGuides(_ guides: Set<AppGuide>, owner: String, session: AuthSession) async throws -> GuideProgress {
+        let flags = Dictionary(uniqueKeysWithValues: guides.map { ($0.metadataKey, true) })
+        let payload = try JSONSerialization.data(withJSONObject: ["data": flags])
+        return try GuideProgress.fromUser(await call("user", method: "PUT", token: session.accessToken, payload: payload), owner: owner)
     }
 }

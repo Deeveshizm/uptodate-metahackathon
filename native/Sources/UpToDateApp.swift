@@ -64,6 +64,7 @@ struct RootView: View {
             }
         }
         .modifier(NewsletterConfirmationPresenter())
+        .modifier(WelcomeGuidePresenter())
         .task(id: model.account?.id) {
             guard model.account != nil else { return }
             while !Task.isCancelled {
@@ -158,6 +159,7 @@ struct FeedView: View {
     @State private var sourceFilter: String?
     @State private var selectedPost: Post?
     @State private var showingPost = false
+    @State private var creatingNewsletter = false
     private var needsNewsletterPrompt: Bool {
         (model.readFeed?.total ?? 0) == 0 && (model.feed?.posts ?? []).allSatisfy { $0.isDemo }
     }
@@ -194,8 +196,24 @@ struct FeedView: View {
                             .frame(maxWidth: .infinity, alignment: .center).multilineTextAlignment(.center)
                         Text(hasNewsletter ? "Follow signup and confirmation progress in Manage. Posts will appear here as editions are processed." : "Paste a newsletter link. We'll use your private newsletter address for signup and create posts from incoming editions.")
                             .multilineTextAlignment(.center).foregroundStyle(.secondary)
-                        NewsletterLinkForm()
-                        Text("You can also import an .eml file from Manage.").font(.caption).foregroundStyle(.secondary)
+                        NewsletterLinkForm().padding(.top, 8)
+                        if !hasNewsletter {
+                            VStack(spacing: 40) {
+                                Text("or").font(.system(size: 14)).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                Button { creatingNewsletter = true } label: {
+                                    VStack(spacing: 12) {
+                                        Image(systemName: "square.and.pencil").font(.system(size: 30, weight: .medium))
+                                            .frame(width: 84, height: 84)
+                                            .background(.primary.opacity(0.07), in: Circle())
+                                            .overlay(Circle().stroke(.primary.opacity(0.12), lineWidth: 0.5))
+                                        Text("Create your own newsletter").font(.system(size: 15, weight: .medium))
+                                            .multilineTextAlignment(.center)
+                                    }.foregroundStyle(.primary)
+                                }.buttonStyle(.plain).disabled(model.busy || model.offline)
+                                    .accessibilityIdentifier("home.createNewsletter")
+                            }.frame(maxWidth: .infinity).padding(.top, 24)
+                        }
                     }.padding(.horizontal, 24).padding(.vertical, 36)
                 }
                 ForEach(Array(model.sources.filter { ["manual_action", "needs_agent", "failed", "confirmation_required"].contains($0.subscriptionStatus ?? "") }.prefix(3))) { source in
@@ -222,11 +240,20 @@ struct FeedView: View {
                 }
             }.frame(maxWidth: FeedStyle.feedWidth).frame(maxWidth: .infinity)
         }.background(.background)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if needsNewsletterPrompt {
+                Text("You can also import .eml in Manage.").font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: .infinity)
+                    .padding(.horizontal, 24).padding(.top, 8).padding(.bottom, 12)
+                    .background(.background)
+            }
+        }
         #if os(iOS)
         .scrollDismissesKeyboard(.interactively)
         #endif
         .toolbar(.hidden)
         .refreshable { await model.refresh() }
+        .sheet(isPresented: $creatingNewsletter) { NewsletterComposerView() }
         .navigationDestination(isPresented: $showingPost) {
             if let selectedPost { PostDetail(post: selectedPost) }
         }
@@ -440,7 +467,7 @@ struct ManageView: View {
                 HStack(alignment: .top, spacing: 12) {
                     topAction("Add newsletter", symbol: "plus") { addingLink = true }
                     topAction("Import .eml", symbol: "square.and.arrow.down", action: importEmail)
-                    topAction("Create newsletter", symbol: "sparkles") { creatingNewsletter = true }
+                    topAction("Create newsletter", symbol: "square.and.pencil") { creatingNewsletter = true }
                 }.frame(maxWidth: .infinity).padding(.horizontal, FeedStyle.gutter).padding(.vertical, 18)
                 ForEach(model.newsletterConfirmations) { confirmation in
                     NewsletterConfirmationPrompt(confirmation: confirmation)
