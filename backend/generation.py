@@ -74,7 +74,7 @@ class Draft(StrictModel):
 
 
 class Verdict(StrictModel):
-    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "relevance", "detail_1", "detail_2", "detail_3"]
+    field: Literal["title", "hook", "summary", "problem", "approach", "finding", "impact", "limitations", "ingredients", "places", "relevance", "scope", "detail_1", "detail_2", "detail_3"]
     reason: str = Field(max_length=400)
     supported: bool
 
