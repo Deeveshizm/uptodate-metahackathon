@@ -300,7 +300,7 @@ class SourceEngine:
                     self.assets.save_gallery(db, visual["asset_id"], post["artifact_key"], image)
                 return visual
             from .image_generation import image_variant
-            visual_variant = image_variant() if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "comfyui"
+            visual_variant = image_variant()
             _, visual, reused = self.artifacts.obtain(document, job["user_id"], "visual:" + visual_variant + ":" + post["artifact_key"], produce_visual)
             with self.store.connect() as db:
                 stored = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()

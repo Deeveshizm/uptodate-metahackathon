@@ -1,22 +1,15 @@
-.PHONY: api api-local api-comfy api-tailnet comfy browser-install test build-ios app smoke model engine-test
+.PHONY: api api-local api-tailnet browser-install test build-ios app smoke model engine-test
 
 API_URL ?= https://uptodate-api-spx7xuvzfq-uk.a.run.app
 
-COMFYUI_DIR ?= $(abspath ../ComfyUI)
 TAILNET_OLLAMA_HOST ?=
 TAILNET_OLLAMA_MODEL ?= llama3.1:8b
 
 api-tailnet:
-	GENERATION_PROVIDER=ollama OLLAMA_URL="http://$(TAILNET_OLLAMA_HOST):11434" OLLAMA_TRUSTED_HOST="$(TAILNET_OLLAMA_HOST)" OLLAMA_MODEL="$(TAILNET_OLLAMA_MODEL)" $(MAKE) api-comfy
+	GENERATION_PROVIDER=ollama OLLAMA_URL="http://$(TAILNET_OLLAMA_HOST):11434" OLLAMA_TRUSTED_HOST="$(TAILNET_OLLAMA_HOST)" OLLAMA_MODEL="$(TAILNET_OLLAMA_MODEL)" $(MAKE) api
 
 api-local:
-	GENERATION_PROVIDER=ollama $(MAKE) api-comfy
-
-comfy:
-	cd "$(COMFYUI_DIR)" && .venv/bin/python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch --disable-all-custom-nodes --offline --cache-none
-
-api-comfy:
-	IMAGE_GENERATION_PROVIDER=comfyui LOCAL_MODEL_MEMORY_SAVING=1 COMFYUI_TIMEOUT=600 COMFYUI_WORKFLOW="$(CURDIR)/backend/workflows/sdxl-lightning-api.json" $(MAKE) api
+	GENERATION_PROVIDER=ollama $(MAKE) api
 
 api:
 	.venv/bin/python -m uvicorn backend.app:create_app --factory --host 127.0.0.1 --port 8000

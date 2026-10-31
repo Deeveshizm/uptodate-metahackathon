@@ -459,7 +459,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     def engine_status(user=Depends(current_user)):
         return {**generation_model().status(), "signup_agent_configured": engine.subscription_agent is not None,
                 "image_generation": {"provider": os.environ.get("IMAGE_GENERATION_PROVIDER", "meta"),
-                                     "model": "muse-image-1.0" if os.environ.get("IMAGE_GENERATION_PROVIDER", "meta") == "meta" else "local-workflow"},
+                                     "model": "muse-image-1.0"},
                 "receiving_alias_ready": bool(user["alias"]) and user.get("alias_status") == "active"}
 
     def validate_source_url(value):

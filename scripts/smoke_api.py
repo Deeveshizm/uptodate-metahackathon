@@ -18,7 +18,7 @@ def wait_for_job(client, job_id):
         if job["status"] not in ("queued", "processing"):
             return job
         time.sleep(1)
-    raise AssertionError("Local test exceeded 15 minutes; check backend jobs and ComfyUI queue")
+    raise AssertionError("Local test exceeded 15 minutes; check backend jobs and image-generation status")
 
 
 def main():

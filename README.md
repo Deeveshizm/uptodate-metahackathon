@@ -53,7 +53,7 @@ make api
 
 Meta API calls consume credits. Text generation, photo lookup and fallback illustrations share the job/account/project spend ledger. Local defaults are $0.50 per job, $5 per account per UTC day and $10 per project per UTC day; the cloud deployment applies the lower defaults described above. Configure `GENERATION_JOB_BUDGET_USD`, `GENERATION_USER_DAILY_BUDGET_USD` and `GENERATION_DAILY_BUDGET_USD` to change them. Reservations and estimated charges are not a provider-enforced billing cap. See [Meta API pricing](https://dev.meta.ai/docs/pricing-rate-limits).
 
-Optional local inference remains available through Ollama and ComfyUI. Run `make comfy` after installing ComfyUI and its image checkpoint in the sibling `../ComfyUI` directory, then run `make api-local`. `COMFYUI_DIR` can point to another installation. The bundled workflow is `backend/workflows/sdxl-lightning-api.json`; model weights and Python environments are not included. `make api-tailnet TAILNET_OLLAMA_HOST=YOUR_AUTHORIZED_PEER` uses an explicitly authorized Tailscale Ollama host. No collaborator address is embedded in this export.
+Optional local text inference remains available through Ollama. Start an installed model with `make model`, then use `make api-local`. Image fallback uses Muse Image with the backend Meta key after source-photo selection. `make api-tailnet TAILNET_OLLAMA_HOST=YOUR_AUTHORIZED_PEER` uses an explicitly authorized Tailscale Ollama host. No collaborator address is embedded in this export.
 
 ## Accounts and receiving email
 
