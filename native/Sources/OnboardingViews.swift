@@ -16,7 +16,7 @@ struct WelcomeGuidePresenter: ViewModifier {
                 }
                 await model.prepareGuides()
                 guard !Task.isCancelled, model.account?.id == owner,
-                      !model.completedGuides.contains(.welcome) else { return }
+                      !model.completedGuides.contains(.welcome) || model.account?.needsPersonalization == true else { return }
                 presented = GuideAccount(id: owner)
             }
     }
@@ -29,11 +29,17 @@ struct WelcomeGuidePresenter: ViewModifier {
         #endif
     }
 
-    private func welcome(for account: GuideAccount) -> some View {
-        WelcomeGuideView {
-            if model.account?.id == account.id { model.finishGuide(.welcome) }
-            presented = nil
-        }.interactiveDismissDisabled()
+    @ViewBuilder private func welcome(for account: GuideAccount) -> some View {
+        if model.completedGuides.contains(.welcome), model.account?.needsPersonalization == true {
+            NavigationStack {
+                PersonalizationView(isOnboarding: true) { presented = nil }
+            }.interactiveDismissDisabled()
+        } else {
+            WelcomeGuideView {
+                if model.account?.id == account.id { model.finishGuide(.welcome) }
+                if model.account?.needsPersonalization != true { presented = nil }
+            }.interactiveDismissDisabled()
+        }
     }
 }
 

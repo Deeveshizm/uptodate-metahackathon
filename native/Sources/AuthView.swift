@@ -3,14 +3,25 @@ import SwiftUI
 struct AuthView: View {
     @EnvironmentObject private var model: AppModel
     private enum Step { case signIn, signUp, confirm, recovery, reset }
-    private enum Field { case email, password, confirmation }
+    private enum Field { case name, email, password, confirmation }
     @State private var step: Step = .signIn
     @State private var email = ""
     @State private var password = ""
     @State private var repeatedPassword = ""
+    @State private var name = ""
+    @State private var dateOfBirth: Date?
+    @State private var choosingBirthday = false
     @FocusState private var focused: Field?
 
     private var address: String { email.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var birthdayText: String? {
+        guard let dateOfBirth else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: dateOfBirth)
+    }
     private var newPasswordValid: Bool {
         PasswordPolicy.accepts(password, confirmation: repeatedPassword)
     }
@@ -46,6 +57,13 @@ struct AuthView: View {
                             .font(.system(size: 14)).foregroundStyle(.secondary).lineSpacing(4)
                     }
                     VStack(spacing: 14) {
+                        if step == .signUp {
+                            field(symbol: "person") {
+                                TextField("Your name", text: $name).textContentType(.name)
+                                    .focused($focused, equals: .name).submitLabel(.next)
+                                    .onSubmit { focused = .email }
+                            }
+                        }
                         if [.signIn, .signUp, .recovery].contains(step) {
                             field(symbol: "envelope") {
                                 TextField("Email address", text: $email)
@@ -55,6 +73,16 @@ struct AuthView: View {
                                     #endif
                                     .submitLabel(.next).onSubmit { focused = .password }
                             }
+                        }
+                        if step == .signUp {
+                            Button { focused = nil; choosingBirthday = true } label: {
+                                field(symbol: "calendar") {
+                                    Text(dateOfBirth?.formatted(date: .abbreviated, time: .omitted) ?? "Date of birth")
+                                        .foregroundStyle(dateOfBirth == nil ? Color.secondary : Color.primary)
+                                    Spacer()
+                                    Image(systemName: "chevron.down").font(.caption)
+                                }
+                            }.buttonStyle(.plain).accessibilityIdentifier("auth.dateOfBirth")
                         }
                         if [.signIn, .signUp].contains(step) || (step == .reset && model.recoveryReady) {
                             field(symbol: "lock") {
@@ -94,6 +122,20 @@ struct AuthView: View {
             .frame(maxWidth: 420).padding(.horizontal, 26).padding(.top, 72).padding(.bottom, 36)
             .frame(maxWidth: .infinity)
         }
+        .sheet(isPresented: $choosingBirthday) {
+            VStack(spacing: 20) {
+                Text("Date of birth").font(.title3.weight(.semibold))
+                DatePicker("Date of birth", selection: Binding(get: {
+                    dateOfBirth ?? Calendar.current.date(byAdding: .year, value: -18, to: Date())!
+                }, set: { dateOfBirth = $0 }),
+                in: Calendar(identifier: .gregorian).date(from: DateComponents(year: 1900, month: 1, day: 1))!...Date(), displayedComponents: .date)
+                    .datePickerStyle(.graphical).labelsHidden()
+                Button("Done") {
+                    if dateOfBirth == nil { dateOfBirth = Calendar.current.date(byAdding: .year, value: -18, to: Date()) }
+                    choosingBirthday = false
+                }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(.blue)
+            }.padding(24).presentationDetents([.medium, .large])
+        }
         .scrollDismissesKeyboard(.interactively).background(.background)
         .onDisappear { password = ""; repeatedPassword = "" }
         .onAppear {
@@ -128,10 +170,10 @@ struct AuthView: View {
                 primary("Sign in", disabled: address.isEmpty || password.isEmpty) { signIn() }
                 secondary("Create an account") { changeStep(.signUp) }
             case .signUp:
-                primary("Create account", disabled: address.isEmpty || !newPasswordValid) {
+                primary("Create account", disabled: address.isEmpty || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.count > 100 || dateOfBirth == nil || !newPasswordValid) {
                     focused = nil
                     Task {
-                        if await model.signUp(email: address, password: password) { changeStep(.confirm) }
+                        if await model.signUp(email: address, password: password, name: name.trimmingCharacters(in: .whitespacesAndNewlines), dateOfBirth: birthdayText) { changeStep(.confirm) }
                         password = ""; repeatedPassword = ""
                     }
                 }

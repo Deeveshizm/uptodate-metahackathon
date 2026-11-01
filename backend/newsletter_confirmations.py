@@ -55,9 +55,12 @@ def confirmation_url(message):
         return None
     soup = BeautifulSoup(message.get('html') or '', 'html.parser')
     links = set()
+    context=subject+' '+soup.get_text(' ',strip=True)+' '+str(message.get('text') or '')
+    explicit=bool(re.search(r'(?:confirm|verif|activat)[^.!?]{0,80}(?:subscription|newsletter)|(?:subscription|newsletter)[^.!?]{0,80}(?:confirm|verif|activat)',context,re.I))
     for a in soup.find_all('a', href=True):
         label = a.get_text(' ', strip=True)
-        if not re.search(r'confirm|verif|activat', label, re.I) or re.search(r'unsubscrib|password|account|sign[ -]?in|log[ -]?in', label, re.I):
+        generic=explicit and bool(re.fullmatch(r'(?:click here|yes(?:,?\s*(?:subscribe|sign me up))?|subscribe|activate|continue)',label.strip(),re.I))
+        if (not re.search(r'confirm|verif|activat', label, re.I) and not generic) or re.search(r'unsubscrib|password|account|sign[ -]?in|log[ -]?in', label, re.I):
             continue
         try:
             url = public_url(a['href'])
@@ -65,6 +68,12 @@ def confirmation_url(message):
             continue
         if urlsplit(url).scheme == 'https':
             links.add(url)
+    if explicit and not links:
+        for candidate in re.findall(r'https://[^\s<>"\]]+',str(message.get('text') or '')):
+            candidate=candidate.rstrip('.,);')
+            if re.search(r'unsubscrib|preferences|privacy|terms|password|account|login|signin',candidate,re.I):continue
+            try:links.add(public_url(candidate))
+            except SourceError:pass
     return next(iter(links)) if len(links) == 1 else None
 
 

@@ -3,16 +3,46 @@ import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
-def publisher_sender_rank(source, sender):
+def publisher_sender_rank(source, sender, message=None):
     """Prefer a bound mailbox, then a publication subdomain, then its domain."""
     source=dict(source)
     local, separator, domain=sender.lower().rpartition('@')
     if not separator:return 0
+    host=(urlsplit(source.get('url') or source.get('signup_url') or '').hostname or '').removeprefix('www.')
+    if host=='tldr.tech' and domain=='tldrnewsletter.com':
+        # TLDR publishes on a different domain and several editions share a
+        # mailbox. An explicit edition header outranks a generic sender match.
+        channel=urlsplit(source.get('url') or source.get('signup_url')).path.strip('/').split('/')[0] or 'tech'
+        if message:
+            text=str(message.get('text') or '')
+            if not text and message.get('html'):
+                from bs4 import BeautifulSoup
+                text=BeautifulSoup(message['html'],'html.parser').get_text('\n',strip=True)
+            import re
+            found=re.search(r'(?m)^\s*TLDR(?:\s+([A-Za-z][A-Za-z &-]{0,30}?))?\s+\d{4}-\d{2}-\d{2}\s*$',text)
+            if found:
+                actual=(found[1] or 'tech').strip().lower().replace(' ','-')
+                return 4 if actual==channel.lower() else 0
+        return 1
     bound=source.get('email_sender','').lower()
     if bound:return 3 if sender.lower()==bound else 0
     expected=source.get('expected_sender_domain','').lower()
     if expected and expected==local+'.'+domain:return 2
     return int(bool(expected and (domain==expected or domain.endswith('.'+expected))))
+
+
+def publisher_details(url,name):
+    """Publisher-specific transport identity, without guessing a signup API."""
+    parts=urlsplit(url)
+    if (parts.hostname or '').removeprefix('www.')=='tldr.tech':
+        channel=parts.path.strip('/').split('/')[0]
+        if channel in ('','tech'):return 'TLDR','tldrnewsletter.com'
+        if channel in ('ai','dev','devops','design','marketing','crypto','infosec','product','founders','data'):
+            return 'TLDR '+('AI' if channel=='ai' else channel.title()),'tldrnewsletter.com'
+    domain=parts.hostname or ''
+    for prefix in ('www.','newsletter.','newsletters.'):
+        if domain.startswith(prefix):domain=domain[len(prefix):];break
+    return name,domain
 
 
 def newsletter_identity(url):

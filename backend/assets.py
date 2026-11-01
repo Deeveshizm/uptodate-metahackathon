@@ -52,6 +52,13 @@ class AssetStore:
         return path
 
     def save_gallery(self, db, asset_id, artifact_key, image):
+        from .google_places_photos import parse_reference, REFERENCE_TYPE
+        if parse_reference(image) is not None:
+            columns=',storage_path' if self.remote else ''
+            value=',NULL' if self.remote else ''
+            db.execute('INSERT INTO gallery_assets(id,artifact_key,image,content_type'+columns+') VALUES(?,?,?,?'+value+') ON CONFLICT(id) DO NOTHING',
+                       (asset_id,artifact_key,image,REFERENCE_TYPE))
+            return
         if self.remote:
             path = self.upload(db, image)
             db.execute('INSERT INTO gallery_assets(id,artifact_key,image,content_type,storage_path) VALUES(?,?,?, ?,?) ON CONFLICT(id) DO NOTHING',
@@ -60,6 +67,14 @@ class AssetStore:
             db.execute("INSERT OR IGNORE INTO gallery_assets(id,artifact_key,image,content_type) VALUES(?,?,?,'image/png')", (asset_id, artifact_key, image))
 
     def save_post(self, db, asset_id, post_id, image):
+        from .google_places_photos import parse_reference, REFERENCE_TYPE
+        if parse_reference(image) is not None:
+            columns=',storage_path' if self.remote else ''
+            value=',NULL' if self.remote else ''
+            clear=',storage_path=NULL' if self.remote else ''
+            db.execute('INSERT INTO post_assets(id,post_id,image,content_type'+columns+') VALUES(?,?,?,?'+value+') ON CONFLICT(post_id) DO UPDATE SET id=excluded.id,image=excluded.image,content_type=excluded.content_type'+clear,
+                       (asset_id,post_id,image,REFERENCE_TYPE))
+            return
         if self.remote:
             path = self.upload(db, image)
             db.execute("INSERT INTO post_assets(id,post_id,image,content_type,storage_path) VALUES(?,?,?,'image/png',?) ON CONFLICT(post_id) DO UPDATE SET id=excluded.id,image=excluded.image,content_type=excluded.content_type,storage_path=excluded.storage_path", (asset_id, post_id, b'', path))
@@ -67,6 +82,9 @@ class AssetStore:
             db.execute("INSERT INTO post_assets(id,post_id,image,content_type) VALUES(?,?,?,'image/png') ON CONFLICT(post_id) DO UPDATE SET id=excluded.id,image=excluded.image,content_type=excluded.content_type", (asset_id, post_id, image))
 
     def read(self, row):
+        from .google_places_photos import parse_reference
+        if parse_reference(bytes(row['image'])) is not None:
+            raise SourceError('Google Maps photos require live attribution')
         path = row['storage_path'] if 'storage_path' in row.keys() else None
         if not path:
             return bytes(row['image'])

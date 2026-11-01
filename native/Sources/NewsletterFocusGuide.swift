@@ -16,7 +16,7 @@ enum NewsletterGuideTarget: String, CaseIterable, Identifiable {
         case .kind: "Pick a newsletter type and give it a name you will recognize. Each type gets a prompt suited to its content."
         case .details: "Describe what it should cover and the posts you want. For research papers, you can also choose the explanation style and supporting links."
         case .schedule: "Choose daily, weekly, every two weeks, or monthly. Add a preferred day or time if you have one."
-        case .handoff: "Once the form is filled in, preview the prompt. Your newsletter address is included. Share or copy it into Muse, then finish creating the recurring task there."
+        case .handoff: "Once the form is filled in, preview the prompt. Share or copy it into Muse, then finish creating the recurring task there. Direct connection setup is in Profile."
         }
     }
 }

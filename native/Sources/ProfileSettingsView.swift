@@ -112,9 +112,14 @@ struct AccountOptionRow: View {
     let title: String
     let symbol: String
     var destructive = false
+    var imageName: String? = nil
     var body: some View {
         HStack(spacing: 14) {
-            Image(systemName: symbol).font(.system(size: 18)).frame(width: 24)
+            if let imageName {
+                Image(imageName).resizable().renderingMode(.original).scaledToFit().frame(width: 24, height: 24)
+            } else {
+                Image(systemName: symbol).font(.system(size: 18)).frame(width: 24)
+            }
             Text(title).font(.system(size: 15))
             Spacer()
             Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
@@ -170,6 +175,12 @@ struct ProfileSettingsView: View {
                 } else {
                     Text(model.account?.displayName?.isEmpty == false ? model.account!.displayName! : "Add your name")
                         .font(.system(size: 18, weight: .medium))
+                }
+                if let birthday = model.account?.dateOfBirth {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Date of birth").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                        Text(birthday).font(.system(size: 15))
+                    }
                 }
                 Text("Email").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                 AccountEmailRow()

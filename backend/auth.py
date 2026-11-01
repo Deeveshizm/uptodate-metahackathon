@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import uuid
+from datetime import date
 from urllib.parse import urlsplit
 
 import httpx
@@ -77,16 +78,52 @@ class SupabaseAuth:
                                         "select": "id,alias,alias_status,timezone,display_name"}).json()
         if not isinstance(profiles, list) or len(profiles) != 1 or profiles[0].get("id") != user_id:
             raise HTTPException(503, "Your account profile is not ready; check the Supabase migrations")
-        return {**profiles[0], "id": user_id, "email": user.get("email", "")}
+        from .newsletter_recommendations import preferences
+        metadata=user.get('user_metadata') or {}
+        if not isinstance(metadata,dict):metadata={}
+        choices=preferences(metadata)
+        birthday=None
+        try:
+            value=date.fromisoformat(metadata.get('date_of_birth',''))
+            if date(1900,1,1)<=value<=date.today():birthday=value.isoformat()
+        except (ValueError,TypeError):pass
+        name=profiles[0].get('display_name') or metadata.get('display_name') or ''
+        name=name.strip()[:100] if isinstance(name,str) else ''
+        return {**profiles[0], "id": user_id, "email": user.get("email", ""),
+                'display_name':name,'date_of_birth':birthday,
+                'live_venue_client':metadata.get('uptodate_live_venue_client_v1') is True,
+                'preferences':choices,'needs_personalization':metadata.get('uptodate_personalization_pending') is True and not choices['complete']}
 
     def delete(self, user_id):
         if not self.secret:
             raise HTTPException(503, "Account deletion needs server-side Supabase administration configuration")
         self.request("DELETE", "/auth/v1/admin/users/" + str(uuid.UUID(user_id)), self.secret, admin=True)
 
+    def connector_identity(self, user_id):
+        """A narrow connector key never substitutes for a full user session."""
+        if not self.secret:
+            raise HTTPException(503, 'Private connector account validation is unavailable')
+        user=self.request('GET','/auth/v1/admin/users/'+str(uuid.UUID(user_id)),self.secret,admin=True).json()
+        if user.get('id') != user_id or not user.get('email_confirmed_at') or user.get('is_anonymous'):
+            raise HTTPException(403,'A verified account is required for this connection')
+        if user.get('banned_until'):
+            from datetime import datetime, timezone
+            try:banned=datetime.fromisoformat(user['banned_until'].replace('Z','+00:00')) > datetime.now(timezone.utc)
+            except (ValueError,TypeError):banned=True
+            if banned:raise HTTPException(403,'This account is unavailable')
+        return {'id':user['id'],'email':user.get('email','')}
+
     def update_profile(self, token, user_id, fields):
         self.request("PATCH", "/rest/v1/profiles", token,
                      params={"id": "eq." + user_id}, json=fields)
+
+    def update_preferences(self, token, fields):
+        self.request('PUT','/auth/v1/user',token,json={'data':{
+            'uptodate_preferences':fields,
+            'uptodate_personalization_pending':not fields['complete']}})
+
+    def update_client_features(self, token):
+        self.request('PUT','/auth/v1/user',token,json={'data':{'uptodate_live_venue_client_v1':True}})
 
     def ensure_relay(self, token, profile):
         if not self.relay_aliases:
@@ -94,4 +131,4 @@ class SupabaseAuth:
         rows = self.request("POST", "/rest/v1/rpc/ensure_relay_alias", token, json={}).json()
         if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("id") != profile["id"]:
             raise HTTPException(503, "Newsletter address setup is unavailable; try again later")
-        return {**rows[0], "email": profile.get("email", "")}
+        return {**profile, **rows[0], "email": profile.get("email", "")}

@@ -6,3 +6,8 @@ enum APIError: LocalizedError {
         switch self { case .response(let status, let message): return "\(message) (\(status))" }
     }
 }
+
+enum AuthAccountError: LocalizedError {
+    case unverifiedEmail
+    var errorDescription: String? { "Verify your account first." }
+}

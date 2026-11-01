@@ -18,6 +18,7 @@ from .documents import normalize
 from .pipeline import safe_url
 from .retrieval import FETCH_DEADLINE, SourceError
 from .visuals import venue_street
+from .venue_identity import name_matches
 
 
 def number(value):
@@ -53,7 +54,7 @@ def review_evidence(resource, place):
     host = urlsplit(resource.url).hostname or 'the review source'
     records = []
     for business in nodes:
-        if not isinstance(business.get('name'), str) or identity(business['name']) != identity(place['name']):continue
+        if not isinstance(business.get('name'), str) or not name_matches(place['name'],business['name'],address_matches=True):continue
         address = resolve(business.get('address'))
         if not isinstance(address, dict):continue
         street = address.get('streetAddress', '')
@@ -106,7 +107,7 @@ class VenueReviews:
         places = document.metadata.get('places', [])
         # One short recommendation per lookup; a multi-venue edition should
         # first be split into venue stories rather than mixed in one query.
-        if len(places) != 1 or len(document.metadata.get('email_text', '').split()) > 160:return document
+        if len(places) != 1 or document.metadata.get('venue_reviews_needed') is False:return document
         place = places[0]
         if not place.get('address') or place.get('identity_known') is False:return document
         pages = [place.get('website_url')] if place.get('website_url') else []

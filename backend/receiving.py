@@ -136,15 +136,16 @@ def newsletter_payload(message):
         return None, "received"
     links = []
     parsed['image_urls']=[]
+    from .newsletter_links import article_url, sponsored
+    destinations={}
+    sponsored_urls={link['url'] for link in parsed.get('links',[]) if sponsored(link.get('title',''))}
     for value in parsed["urls"]:
-        url = safe_url(value)
+        if value in sponsored_urls:continue
+        url = article_url(value)
         if not url:
             continue
         parts = urlsplit(url)
-        if re.search(r"unsub|subscrib|confirm|verif|activat|sign.?in|login|logout|password|preferences|privacy|terms|tracking|click\.", url, re.I):
-            continue
-        if any(re.search(r"token|code|signature|secret|email|auth", key, re.I) for key, _ in parse_qsl(parts.query)):
-            continue
+        destinations[value]=url
         if parts.hostname in ("x.com", "twitter.com", "facebook.com", "instagram.com", "linkedin.com"):
             continue
         if re.search(r"\.(png|jpg|jpeg|gif|svg|webp|ico)(?:$|\?)", url, re.I):
@@ -152,8 +153,14 @@ def newsletter_payload(message):
             continue
         links.append(url)
     parsed["urls"] = links[:50]
-    parsed["links"] = [link for link in parsed.get("links", []) if link["url"] in parsed["urls"]]
-    parsed["html"] = str(message.get("html") or "")[:200000]
+    parsed["links"] = [{**link,'url':destinations[link['url']]} for link in parsed.get("links", []) if link['url'] in destinations and destinations[link['url']] in parsed['urls']]
+    from bs4 import BeautifulSoup
+    soup=BeautifulSoup(str(message.get('html') or '')[:200000],'html.parser')
+    for anchor in soup.find_all('a',href=True):
+        target=destinations.get(anchor['href'])
+        if target:anchor['href']=target
+        else:del anchor['href']
+    parsed["html"] = str(soup) if message.get('html') else ''
     # EmailMessage generates random MIME boundaries. Deduplicate normalized
     # content too, including redeliveries with a different provider message ID.
     parsed["fingerprint"] = hashlib.sha256(json.dumps({key: parsed[key] for key in ("sender", "subject", "text", "urls")}, sort_keys=True).encode()).hexdigest()
@@ -319,7 +326,7 @@ class ResendRelay:
                 channel=email_channel(sender,str(message.get('subject') or ''))
                 sources = db.execute("SELECT * FROM sources WHERE user_id=? AND subscription_alias=? AND expected_sender_domain!='' AND sender LIKE 'newsletter:%'",
                                      (owner_id, relay["address"])).fetchall()
-                ranked=[(publisher_sender_rank(source,sender),source) for source in sources]
+                ranked=[(publisher_sender_rank(source,sender,message),source) for source in sources]
                 best=max((rank for rank,_ in ranked),default=0)
                 matches = [source for rank,source in ranked if rank==best and rank>0]
                 matched = matches[0] if len(matches) == 1 else None

@@ -86,6 +86,8 @@ def parse_newsletter(raw: bytes, require_links=True) -> dict:
                 parent = anchor.find_parent(["p", "li", "article"])
                 labeled_links.append({"url": url, "title": re.sub(r"\s+", " ", anchor.get_text(" ", strip=True))[:200],
                                       "context": re.sub(r"\s+", " ", parent.get_text(" ", strip=True) if parent else "")[:500]})
+                from .newsletter_links import story_heading
+                labeled_links[-1]['story_heading']=story_heading(anchor,labeled_links[-1]['title'])
     else:
         text = content
         urls = [safe_url(x.rstrip(".,);>")) for x in re.findall(r"https?://[^\s<>\"]+", text)]

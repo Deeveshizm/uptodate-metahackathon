@@ -20,10 +20,10 @@ class VenuePhotoSearch:
         self.purpose=purpose
         self.last_usage={}
 
-    def pages(self,places,budget=None):
+    def pages(self,places,budget=None,*,recovery=False,exclude_urls=()):
         venues=[{'name':p['name'][:200],'address':p.get('address','')[:400]} for p in places[:3] if p.get('name') and p.get('identity_known') is not False]
         if not venues:return []
-        key=hashlib.sha256(('venue-search-v4-address:'+self.purpose+json.dumps(venues,sort_keys=True).casefold()).encode()).hexdigest()
+        key=hashlib.sha256(('venue-search-v5-verified:'+self.purpose+json.dumps([venues,bool(recovery),sorted(exclude_urls)],sort_keys=True).casefold()).encode()).hexdigest()
         now=time.time()
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -34,16 +34,18 @@ class VenuePhotoSearch:
                 return json.loads(previous['pages'])
             db.execute("INSERT INTO venue_photo_searches(cache_key,status,pages,expires_at) VALUES(?,'processing','[]',?) ON CONFLICT(cache_key) DO UPDATE SET status='processing',pages='[]',expires_at=excluded.expires_at",(key,now+150))
         try:
-            pages=self._lookup(venues,budget)
+            pages=self._lookup(venues,budget,recovery=recovery,exclude_urls=exclude_urls)
         except SourceError:
             with self.store.connect() as db:
                 db.execute("UPDATE venue_photo_searches SET status='failed',expires_at=? WHERE cache_key=?",(time.time()+300,key))
             raise
         with self.store.connect() as db:
-            db.execute("UPDATE venue_photo_searches SET status='ready',pages=?,expires_at=? WHERE cache_key=?",(json.dumps(pages),time.time()+(86400*7 if pages else 900),key))
+            # A list of search hits is not evidence that any photo was usable.
+            lifetime=86400*7 if pages and self.purpose=='reviews' else 900
+            db.execute("UPDATE venue_photo_searches SET status='ready',pages=?,expires_at=? WHERE cache_key=?",(json.dumps(pages),time.time()+lifetime,key))
         return pages
 
-    def _lookup(self,venues,budget):
+    def _lookup(self,venues,budget,*,recovery=False,exclude_urls=()):
         key=os.environ.get('MODEL_API_KEY','').strip()
         model=os.environ.get('META_MODEL','muse-spark-1.3')
         if not key or model not in MetaModel.PRICES:
@@ -58,13 +60,18 @@ class VenuePhotoSearch:
                         'Run exactly one live web search query including the business name, supplied street address and city, plus photos. '
                         'Use the supplied address to identify the exact branch; omit pages for other addresses of the same brand. '
                         'Prefer official business websites and city tourism photo listings over gift-card and review directories. '
+                        'Find the canonical business or location page, not a menu-only, comments-only, or individual broken photo URL. '
+                        'Include distinct source sites rather than several links from one directory. '
                         'Do not invent URLs or photos, rewrite content, generate images, or search for a person. Return a short cited list of up to three matching venue pages.')
+        if recovery:
+            instructions += (' The previous pages did not yield a usable photograph. Search again for the official website or a different business listing with a photo gallery. '
+                             'Use quoted business name and city, allow Co/Company or category suffix variations, and verify the exact street address. Avoid the supplied rejected pages.')
         request={'model':model,'store':False,'max_output_tokens':1400,'max_tool_calls':1,
                  'parallel_tool_calls':False,'reasoning':{'effort':'low'},
                  'tools':[{'type':'web_search','search_context_size':'low'}],
                  'include':['web_search_call.results'],
                  'instructions':instructions,
-                 'input':json.dumps(venues)}
+                 'input':json.dumps({'venues':venues,'rejected_pages':list(exclude_urls)[:8]} if recovery else venues)}
         reservation=budget.reserve(0.05) if budget else None
         try:
             with httpx.Client(timeout=httpx.Timeout(90,connect=10),trust_env=False,transport=self.transport) as client:
@@ -98,7 +105,7 @@ class VenuePhotoSearch:
             for hit in hits:
                 url=safe_url(hit.get('url',''))
                 host=(urlsplit(url).hostname or '').lower() if url else ''
-                if url and url not in urls and not (self.purpose=='reviews' and host in hosts):
+                if url and url not in exclude_urls and url not in urls and host not in hosts:
                     urls.append(url);hosts.add(host)
             return urls[:4]
         except httpx.HTTPError:

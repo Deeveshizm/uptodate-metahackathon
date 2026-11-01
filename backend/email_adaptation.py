@@ -7,7 +7,7 @@ from .venue_facts import venue_facts
 
 
 def preserve_short_email(document):
-    if document.metadata.get('format') != 'email':
+    if document.metadata.get('format') not in ('email','connector'):
         return None
     if document.metadata.get('venue_reviews'):
         # New review evidence needs a grounded draft and an independent check.

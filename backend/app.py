@@ -32,6 +32,7 @@ from .relay_aliases import ACTIVE_ALIASES, revoke_account_aliases
 from .signup import FormSignup
 from .subscriptions import Subscriptions
 from .post_chat import ChatInput, answer_post, handoff_reason
+from .newsletter_recommendations import PreferencesInput, TOPICS, recommendations
 from .budgets import JobBudget
 from .source_identity import newsletter_identity
 from .source_lifecycle import category, maintain_sources, management_source
@@ -77,6 +78,10 @@ class SourcePatch(BaseModel):
 class Approval(BaseModel):
     reviewed: bool
     rights: Literal["private", "public"] = "private"
+
+
+class PostShareInput(BaseModel):
+    publish_post: bool = False
 
 
 class EmailNewsletterInput(BaseModel):
@@ -337,11 +342,15 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             db.execute("UPDATE users SET alias=?,timezone=? WHERE id=?", (alias, profile["timezone"], profile["id"]))
         return {**profile, "alias": profile.get("alias") or ""}
 
-    def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+    def current_user(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if not credentials or credentials.scheme.lower() != "bearer":
             raise HTTPException(401, "A local account token is required")
         if auth:
             profile = auth.identity(credentials.credentials)
+            if request.headers.get('X-UpToDate-Photo-Attribution')=='1' and not profile.get('live_venue_client'):
+                with suppress(HTTPException):
+                    auth.update_client_features(credentials.credentials)
+                    profile['live_venue_client']=True
             # Stable Supabase UUID owns local content. No email, password, JWT,
             # or refresh token is persisted in the local content database.
             return remember_verified_user(profile)
@@ -353,13 +362,18 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         return dict(row)
 
     def account_json(user):
+        from .muse_connector import available_to
         with store.connect() as db:
             avatar = db.execute("SELECT revision FROM profile_avatars WHERE user_id=?", (user["id"],)).fetchone()
         return {"avatar_revision": avatar["revision"] if avatar else None,**{key: user[key] for key in ("id", "alias", "timezone")},
                 "alias": user.get("alias") or "",
                 "email": user.get("email"), "display_name": user.get("display_name"),
                 "alias_status": user.get("alias_status", "unconfigured"),
-                "alias_scope": user.get("alias_scope", "permanent")}
+                "alias_scope": user.get("alias_scope", "permanent"),
+                "date_of_birth":user.get('date_of_birth'),
+                "preferences":user.get('preferences',{'interests':[],'complete':False}),
+                "needs_personalization":user.get('needs_personalization',False),
+                'private_muse_enabled':available_to(user)}
 
     def local_day(user):
         return datetime.now(ZoneInfo(user["timezone"])).date().isoformat()
@@ -494,14 +508,14 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
 
     @app.post("/v1/me/sources/{source_id}/subscribe", status_code=202)
     def subscribe_source(source_id: str, background: BackgroundTasks, user=Depends(current_user)):
-        if user.get("alias_status") != "active" or not user.get("alias") or user["alias"].endswith(".invalid"):
-            raise HTTPException(409, "Your account's receiving alias must be active before signup")
         with store.connect() as db:
             source = db.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (source_id, user["id"])).fetchone()
             if not source:
                 raise HTTPException(404, "Newsletter not found")
+            if source['source_kind']!='connector' and (user.get('alias_status')!='active' or not user.get('alias') or user['alias'].endswith('.invalid')):
+                raise HTTPException(409, "Your account's receiving alias must be active before signup")
             if category(dict(source)) == 'custom':
-                db.execute("UPDATE sources SET subscription_status='receiving',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='New email editions will create posts again' WHERE id=?",(source_id,))
+                db.execute("UPDATE sources SET subscription_status='receiving',muted=0,unsubscribed_at=NULL,archived_at=NULL,subscription_detail='New editions will create posts again' WHERE id=?",(source_id,))
                 return {"status":"receiving","source_id":source_id}
             if source["subscription_status"] in ("submitted", "confirmation_required", "email_received", "receiving", "submitting"):
                 raise HTTPException(409, "Signup was already submitted; check confirmation or incoming mail")
@@ -706,6 +720,21 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         if fields:
             auth.update_profile(credentials.credentials, user["id"], fields)
         return account_json(remember_verified_user(auth.identity(credentials.credentials)))
+
+    @app.put('/v1/me/preferences')
+    def save_preferences(body:PreferencesInput,user=Depends(current_user),credentials=Depends(bearer)):
+        if not auth:raise HTTPException(409,'Personalization requires a verified account')
+        fields=body.model_dump()
+        fields['interests']=list(dict.fromkeys(fields['interests']))
+        auth.update_preferences(credentials.credentials,fields)
+        return account_json(remember_verified_user(auth.identity(credentials.credentials)))
+
+    @app.get('/v1/newsletters/recommendations')
+    def starter_newsletters(user=Depends(current_user)):
+        with store.connect() as db:
+            sources=[dict(row) for row in db.execute('SELECT signup_url,url,subscription_status,archived_at FROM sources WHERE user_id=?',(user['id'],)).fetchall()]
+        selected=user.get('preferences',{}).get('interests',[])
+        return {'topics':TOPICS,'newsletters':recommendations(selected,sources)}
 
     @app.get("/v1/me/avatar")
     def get_avatar(user=Depends(current_user)):
@@ -971,7 +1000,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             row = get_post(db, user, post_id)
             if body.rights == "public":
-                if row["original_url"].startswith("email:"):
+                if row["original_url"].startswith(("email:","connector:")):
                     raise HTTPException(409, "Posts based on private email editions cannot be published publicly")
                 source = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()
                 if not source["signup_url"]:
@@ -1046,14 +1075,46 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             metadata=json.loads(document['metadata'])
             return {'title':metadata.get('email_subject',document['title']),'text':metadata.get('email_text') or '\n\n'.join(span['text'] for span in json.loads(document['spans'])),'author':metadata.get('author','')}
 
+    @app.get('/v1/posts/{post_id}/venue-details')
+    def venue_details(post_id:str,user=Depends(current_user)):
+        from .google_places_photos import GooglePlacesPhotos
+        from .venue_enrichment import live_venue_details
+        from .budgets import JobBudget
+        with store.connect() as db:post=get_post(db,user,post_id)
+        analysis=json.loads(post['analysis'])
+        reference=analysis.get('live_venue') or {}
+        places=(analysis.get('action') or {}).get('data',[])
+        if not reference or len(places)!=1:return JSONResponse({'fields':{},'sources':{}},headers={'Cache-Control':'private, no-store'})
+        try:details=live_venue_details(reference,places[0],GooglePlacesPhotos(store=store),JobBudget(store,post['job_id'],purpose='venue_read'))
+        except SourceError as exc:raise HTTPException(503,str(exc)) from None
+        return JSONResponse(details,headers={'Cache-Control':'private, no-store'})
+
+    def image_response(asset, post, request):
+        from .google_places_photos import parse_reference, GooglePlacesPhotos
+        from .budgets import JobBudget
+        import base64
+        headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"}
+        if parse_reference(bytes(asset['image'])) is not None:
+            # Older clients permanently cache every image and cannot render
+            # live author/source attribution. Require the updated image client.
+            if request.headers.get('X-UpToDate-Photo-Attribution')!='1':
+                raise HTTPException(426,'Update UpToDate to view Google Maps photos')
+            try:
+                data,credit=GooglePlacesPhotos().read(bytes(asset['image']),JobBudget(store,post['job_id'],purpose='image_read'))
+            except SourceError as exc:
+                raise HTTPException(503,str(exc)) from None
+            headers['X-UpToDate-Photo-Credit']=base64.b64encode(json.dumps(credit,ensure_ascii=False).encode()).decode()
+            return Response(data,media_type='image/png',headers=headers)
+        return Response(engine.assets.read(asset),media_type=asset['content_type'],headers=headers)
+
     @app.get("/v1/posts/{post_id}/image")
-    def post_image(post_id: str, user=Depends(current_user)):
+    def post_image(post_id: str, request: Request, user=Depends(current_user)):
         with store.connect() as db:
-            get_post(db, user, post_id)
+            post = get_post(db, user, post_id)
             asset = db.execute("SELECT * FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
             if not asset:
                 raise HTTPException(404, "Post has no ready visual")
-            return Response(engine.assets.read(asset), media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+        return image_response(asset,post,request)
 
     @app.post("/v1/posts/{post_id}/chat")
     def post_chat(post_id: str, body: ChatInput, user=Depends(current_user)):
@@ -1099,7 +1160,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 db.execute("UPDATE jobs SET status='failed',error='Answer interrupted; please retry' WHERE id=? AND status='processing'", (job_id,))
 
     @app.get("/v1/posts/{post_id}/images/{asset_id}")
-    def gallery_image(post_id: str, asset_id: str, user=Depends(current_user)):
+    def gallery_image(post_id: str, asset_id: str, request: Request, user=Depends(current_user)):
         with store.connect() as db:
             post = get_post(db, user, post_id)
             visuals = json.loads(post["analysis"]).get("visuals", [])
@@ -1110,7 +1171,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 asset = db.execute("SELECT * FROM post_assets WHERE post_id=?", (post_id,)).fetchone()
             if not asset:
                 raise HTTPException(404, "Image not found")
-            return Response(engine.assets.read(asset), media_type=asset["content_type"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+        return image_response(asset,post,request)
 
     @app.post("/v1/posts/{post_id}/image/retry", status_code=202)
     def retry_visual(post_id: str, background: BackgroundTasks, body: VisualRetryInput | None = None, user=Depends(current_user)):
@@ -1161,10 +1222,12 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             db.execute("INSERT OR IGNORE INTO reads VALUES(?,?)", (user["id"], post_id))
 
     @app.post("/v1/posts/{post_id}/share")
-    def share(post_id: str, request: Request, user=Depends(current_user)):
+    def share(post_id: str, request: Request, body: PostShareInput | None = None, user=Depends(current_user)):
+        if body and body.publish_post:
+            return shared_posts.create(user,post_id,request)
         with store.connect() as db:
             row = published_post(db, user, post_id)
-            if row['original_url'].startswith('email:'):raise HTTPException(409,'This original source is a private email, not a public link')
+            if row['original_url'].startswith(('email:','connector:')):raise HTTPException(409,'This original source is private content, not a public link')
             signup = db.execute("SELECT signup_url FROM sources WHERE id=?", (row["source_id"],)).fetchone()["signup_url"]
             if row["rights"] != "public" or not signup:
                 return {"url": row["original_url"], "mode": "original-source", "local_only": False}
@@ -1193,4 +1256,13 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             <hr><a class="cta" href="{e('signup_url')}" rel="noreferrer noopener">Sign up for this newsletter</a>
             </body></html>""", headers={"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
 
+    from .muse_connector import install as install_muse_connector
+    install_muse_connector(app,store,auth,current_user,schedule_job)
+    from .post_sharing import SharedPosts
+    shared_posts=SharedPosts(store,get_post,post_json,image_response,venue_details)
+    shared_posts.install(app,current_user)
+    from .public_policies import install as install_public_policies
+    install_public_policies(app)
+    from .public_site import install as install_public_site
+    install_public_site(app)
     return app

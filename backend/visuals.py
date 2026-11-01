@@ -81,8 +81,12 @@ def branding_images(soup, base):
     return result
 
 
-def html_figures(resource, document_license):
+def html_figures(resource, document_license, metadata=None):
     soup = BeautifulSoup(resource.body, "html.parser")
+    if metadata is None:
+        from .documents import source_metadata
+        metadata=source_metadata(soup,resource.url)
+    recipe=metadata.get('recipe') or {}
     main = content_root(soup)
     branding = branding_images(soup,resource.url)
     figures, seen = [], set()
@@ -90,6 +94,12 @@ def html_figures(resource, document_license):
         ancestry = list(image.parents)
         attributes = " ".join(str(node.get("class", "")) + " " + str(node.get("id", "")) for node in [image, *ancestry[:6]])
         if any(node.name in ("nav", "header", "footer", "aside", "form") for node in ancestry) or re.search(r"(?:^|[\W_])(?:ad|ads|advertisement|sponsored|sponsor|promo|related|recommendations|subscribe|avatar|logo|wordmark)(?:$|[\W_])", attributes, re.I):
+            continue
+        if re.search(r'(?:^|[\W_])(?:affiliate|tasty-links?|tasty-link-card|product-card|shop-the-post)(?:$|[\W_])',attributes,re.I):
+            continue
+        if recipe and re.search(r'(?:^|[\W_])(?:equipment|cooking-tools|recommended-products)(?:$|[\W_])',attributes,re.I):
+            continue
+        if image.find_parent('a',rel=lambda rel:rel and 'sponsored' in rel):
             continue
         inline_svg = image.name == "svg"
         if image.name in ("object", "embed") and not image.find_parent("figure"):
@@ -142,6 +152,15 @@ def html_figures(resource, document_license):
             title = next((heading for heading in soup.find_all("h1") if heading.get_text(strip=True)), soup.title)
             figures.append({"id": "article-hero", "url": url, "caption": "Source photo · " + (title.get_text(" ", strip=True) if title else "Original article"),
                             "license_url": document_license, "page": None, "selection_basis": "article_hero_metadata", "caption_origin": "article_title"})
+    for index,value in enumerate(recipe.get('images',[])[:1]):
+        url=safe_url(urljoin(resource.url,value))
+        if not url or image_identity(url,resource.url) in branding:continue
+        existing=next((figure for figure in figures if figure['url']==url),None)
+        if existing:
+            existing['selection_basis']='recipe_hero_metadata'
+        else:
+            figures.append({'id':f'recipe-hero-{index}','url':url,'caption':'Finished dish · '+recipe.get('name','Recipe'),
+                'license_url':document_license,'page':None,'selection_basis':'recipe_hero_metadata'})
     return figures
 
 
@@ -205,7 +224,7 @@ def pdf_figures(resource):
         return figures, license_url
 
 
-def decode_image(data):
+def decode_image(data, max_edge=1600):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -214,7 +233,7 @@ def decode_image(data):
                     raise SourceError("Source image is too small or exceeds the pixel limit")
                 image.seek(0)
                 image = image.convert("RGB")
-                image.thumbnail((1600, 1600))
+                image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
                 output = io.BytesIO()
                 image.save(output, format="PNG")
                 return output.getvalue()
@@ -233,6 +252,7 @@ def rank_figures(document, draft):
     context = words(document.title + " " + draft["title"] + " " + draft["finding"])
     story = words(draft['title'] + ' ' + draft['finding'])
     paper = (draft.get('analysis') or {}).get('content_type') == 'paper' or bool(document.metadata.get('abstract') or document.metadata.get('doi'))
+    recipe = (draft.get('analysis') or {}).get('content_type') == 'recipe' or bool(document.metadata.get('recipe'))
     eligible = []
     for figure in document.figures:
         # An unknown license is NOT evidence that the source has no image.
@@ -243,10 +263,11 @@ def rank_figures(document, draft):
         overlap = len(words(caption) & context)
         methodological = bool(re.search(r"architectur|method|framework|pipeline|schematic|overview|diagram", caption, re.I))
         generic_method = paper and methodological and len(caption.split()) <= 12 and not re.search(r'baseline|prior work|related work',caption,re.I)
-        if overlap < 2 and not generic_method and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "email_photo_reference", "venue_website_photo"):
+        if overlap < 2 and not generic_method and figure.get("selection_basis") not in ("article_photo_dimensions", "article_hero_metadata", "recipe_hero_metadata", "email_photo_reference", "venue_website_photo"):
             continue
         primary_method = paper and methodological and not re.search(r'baseline|prior work|related work',caption,re.I)
-        eligible.append(((bool(primary_method), overlap + 2 * len(words(caption) & story) + (1 if figure.get("selection_basis") == "article_photo_dimensions" else 0)), figure))
+        recipe_hero=(2 if figure.get('selection_basis')=='recipe_hero_metadata' else 1 if figure.get('selection_basis')=='article_hero_metadata' else 0) if recipe else 0
+        eligible.append(((bool(primary_method),recipe_hero,overlap + 2 * len(words(caption) & story)), figure))
     return [figure for _, figure in sorted(eligible, key=lambda item: item[0], reverse=True)]
 
 
@@ -280,7 +301,7 @@ def source_visual(document, draft, fetcher, allow_pdf=True):
                     "license_name": document.metadata.get("license_name", "") if license_url == document.metadata.get("license_url") else "",
                     "rights_status": "needs_review" if rights_review else "recognized_reuse_license",
                     "requires_rights_review": rights_review,
-                    "selection": "caption_relevance", "source_format": source_format}, data
+                    "selection": candidate.get('selection_basis','caption_relevance'), "source_format": source_format}, data
         except SourceError:
             continue
     pdf_url = document.metadata.get("pdf_url")
@@ -298,7 +319,7 @@ def source_visual(document, draft, fetcher, allow_pdf=True):
     return None
 
 
-def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None, text_model=None, budget=None, photo_search=None):
+def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None, text_model=None, budget=None, photo_search=None, google_photos=None, venue_photos_checked=False):
     # Prefer the paper/original linked by a secondary article before using its
     # own hero image. No recursive discovery, signup, or arbitrary site crawl.
     checks = []
@@ -319,10 +340,12 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
     if selected:
         visual, data = selected
         return {**visual, "source_role": "article", "primary_source_checks": checks}, data
-    venues = linked_venue_gallery(document, draft, fetcher, stage)
-    if not venues and document.metadata.get('venue_reference_pages'):
+    venues = [] if venue_photos_checked else google_venue_gallery(draft,stage,google_photos)
+    if not venue_photos_checked and not venues:
+        venues=linked_venue_gallery(document,draft,fetcher,stage)
+    if not venue_photos_checked and not venues and document.metadata.get('venue_reference_pages'):
         venues = linked_venue_gallery(document, draft, fetcher, stage, pages=document.metadata['venue_reference_pages'])
-    if not venues:
+    if not venue_photos_checked and not venues:
         venues = searched_venue_gallery(document,draft,fetcher,stage,photo_search)
     if venues:
         return venues[0]
@@ -365,19 +388,92 @@ def venue_street(address):
     return venue_address_text(street)
 
 
+def structured_venue_photos(soup, places):
+    """Use full-size photos declared by the exact business, never nearby listings."""
+    from .venue_identity import matches_place
+    found, matching = [], []
+    pending = []
+    for script in soup.find_all('script', type='application/ld+json', limit=25):
+        try:
+            pending.append(json.loads(script.string or script.get_text()))
+        except (ValueError, TypeError):
+            continue
+    for _ in range(600):
+        if not pending:break
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node[:100]);continue
+        if not isinstance(node, dict):continue
+        pending.extend(value for value in node.values() if isinstance(value, (dict, list)))
+        address = node.get('address')
+        if not address or not isinstance(node.get('name'), str):continue
+        identity = node['name'] + ' ' + (json.dumps(address) if isinstance(address, dict) else str(address))
+        place = next((place for place in places if matches_place(place, identity)), None)
+        if not place:continue
+        matching.append(place)
+        values = []
+        for key in ('image', 'photo'):
+            value = node.get(key, [])
+            values.extend(value if isinstance(value, list) else [value])
+        for value in values[:20]:
+            if isinstance(value, dict):value = value.get('contentUrl') or value.get('url')
+            if isinstance(value, str):found.append({'url':value, 'alt':place['name']})
+    return matching, found
+
+
+def venue_photo_candidates(soup, region, structured):
+    candidates = list(structured)
+    if region is soup:
+        hero = soup.find('meta', attrs={'property':'og:image'})
+        if hero:candidates.append({'url':hero.get('content',''), 'alt':''})
+    for node in region.find_all(['img','source'], limit=100):
+        if any(parent.name in ('nav','header','footer','aside') for parent in node.parents):continue
+        attributes = ' '.join(str(node.get(key,'')) for key in ('class','id','alt'))
+        if BRANDING.search(attributes):continue
+        parent = node.find_parent('a')
+        if parent and re.search(r'\.(?:jpe?g|png|webp)(?:\?|$)', parent.get('href',''), re.I):
+            candidates.append({'url':parent['href'], 'alt':node.get('alt','')})
+        # Responsive and lazy-loaded markup often exposes only a tiny src.
+        srcset = node.get('data-srcset') or node.get('srcset','')
+        variants = []
+        for entry in srcset.split(','):
+            parts = entry.strip().split()
+            if not parts:continue
+            try:rank = float(parts[-1].rstrip('wx')) if len(parts)>1 else 0
+            except ValueError:rank = 0
+            variants.append((rank,parts[0]))
+        for _, url in sorted(variants, reverse=True)[:1]:
+            candidates.append({'url':url, 'alt':node.get('alt','')})
+        raw = node.get('data-src') or node.get('data-original') or node.get('data-lazy-src') or node.get('nitro-lazy-src') or node.get('src','')
+        if raw and not variants:candidates.append({'url':raw, 'alt':node.get('alt','')})
+    for node in region.select('[style*="background"]')[:30]:
+        if any(parent.name in ('nav','header','footer','aside') for parent in [node,*node.parents]):continue
+        if BRANDING.search(' '.join(str(node.get(key,'')) for key in ('class','id'))):continue
+        for url in re.findall(r'url\(\s*[\"\']?([^\"\')]+)', node.get('style','')):
+            candidates.append({'url':url.strip(), 'alt':node.get('aria-label','')})
+    return candidates
+
+
+def contains_multiple_venue_addresses(region):
+    pattern=r'\b\d{1,6}\s+(?:[A-Za-z0-9.\'-]+\s+){1,7}?(?:St(?:reet)?|Rd|Road|Ave(?:nue)?|Blvd|Boulevard|Dr(?:ive)?|Ln|Lane|Ct|Court|Pkwy|Parkway|Hwy|Highway)\b'
+    addresses=re.findall(pattern,region.get_text(' ',strip=True),re.I)
+    return len({venue_address_text(value) for value in addresses})>1
+
+
 def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, pages=None):
     """Check explicit venue websites/verified photo pages, without rewriting email content."""
     places=draft.get('analysis',{}).get('action',{}).get('data',[])
     if draft.get('analysis',{}).get('action',{}).get('kind')!='places' or not places:return []
     from .email_content import map_link
     from .documents import Document,normalize
+    from .venue_identity import matches_place
     urls=pages if pages is not None else [link['url'] for link in document.links if not map_link(link['url'])]
     urls=list(dict.fromkeys(url for url in urls if safe_url(url) and not re.search(r'unsubscribe|confirm|activate|login|sign.?in',url,re.I)))[:4 if pages is not None else 2]
     visited=set()
     for url in urls:
         if url in visited:continue
         visited.add(url)
-        if len(visited)>5:break
+        if len(visited)>8:break
         stage('checking_venue_website_photos')
         try:
             resource=fetcher.fetch(url)
@@ -385,11 +481,9 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             soup=BeautifulSoup(resource.body,'html.parser')
             text=normalize(soup.get_text(' ',strip=True)).casefold()
             address_text=' '+venue_address_text(text)+' '
-            matching=[]
-            for place in places:
-                name=normalize(place['name']).casefold().removeprefix('the ')
-                street=venue_street(place.get('address',''))
-                if name in text and (not street or ' '+street+' ' in address_text):matching.append(place)
+            structured_matching, structured = structured_venue_photos(soup, places)
+            matching=[place for place in places if matches_place(place,text)]
+            matching.extend(place for place in structured_matching if place not in matching)
             if not matching:
                 if pages is None:
                     # A linked official homepage often delegates venue evidence
@@ -411,23 +505,23 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                 regions=[]
                 for node in soup.find_all(['address','article','section','div','li']):
                     if any(parent.name in ('nav','header','footer','aside') for parent in node.parents):continue
-                    if not node.find('img'):continue
+                    if not node.find(['img','source']) and not node.select_one('[style*="background"]'):continue
                     content=normalize(node.get_text(' ',strip=True))
                     if len(content)<=2500 and ' '+street+' ' in ' '+venue_address_text(content)+' ':
                         regions.append((len(content),node))
                 if regions:region=min(regions,key=lambda item:item[0])[1]
             figures=[]
-            hero=soup.find('meta',attrs={'property':'og:image'}) if region is soup else None
-            candidates=[{'url':hero.get('content',''),'alt':''}] if hero else []
-            candidates.extend({'url':node.get('data-src') or node.get('data-lazy-src') or node.get('nitro-lazy-src') or node.get('src',''),
-                               'alt':node.get('alt','')} for node in region.find_all('img',limit=50)
-                              if not any(p.name in ('nav','footer','aside') for p in node.parents))
+            # A brand homepage's product/hero photos cannot establish which
+            # location is pictured. Require branch-scoped images on such pages.
+            candidates=structured if contains_multiple_venue_addresses(region) else venue_photo_candidates(soup,region,structured)
+            branding=branding_images(soup,resource.url)
             seen=set()
             for candidate in candidates:
                 image_url=safe_url(urljoin(resource.url,candidate['url']))
                 parts=urlsplit(image_url or '')
-                identity=urlunsplit((parts.scheme,parts.netloc,parts.path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
-                if not image_url or identity in seen or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                image_path=re.sub(r'-\d{2,4}x\d{2,4}(?=\.(?:png|jpe?g|webp)$)','',parts.path,flags=re.I)
+                identity=urlunsplit((parts.scheme,parts.netloc,image_path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
+                if not image_url or identity in seen or image_identity(image_url,resource.url) in branding or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
                 if re.search(r'(?:^|[/_.-])(?:maps?|staticmap|openstreetmap|googlemaps)(?:[/_.-]|$)|maps\.(?:google|apple)|\b(?:street map|map of|directions map)\b', image_url+' '+candidate['alt'], re.I):continue
                 seen.add(identity)
                 figures.append({'id':'venue-photo-'+str(len(figures)), 'url':image_url,'caption':matching[0]['name']+' · photo from '+resource.url,
@@ -445,6 +539,12 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                 if len(selected)>=limit:return selected
             if selected:return selected
         except SourceError:
+            # Retry a supplied legacy www/HTTP URL through its HTTPS host form.
+            # PublicFetcher still validates DNS, redirects, robots and size.
+            parts=urlsplit(url)
+            if parts.scheme=='http' or (parts.hostname or '').startswith('www.'):
+                alternate=urlunsplit(('https',parts.netloc.removeprefix('www.'),parts.path,parts.query,''))
+                if alternate not in urls and alternate not in visited:urls.append(alternate)
             continue
     return []
 
@@ -459,10 +559,27 @@ def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4):
         raise
     except SourceError:
         return []
-    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=pages)
+    gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=pages)
+    if gallery:return gallery
+    stage('retrying_real_venue_photo_search')
+    try:
+        recovered=photo_search(action['data'],recovery=True,exclude_urls=pages)
+    except GenerationPending:
+        raise
+    except (SourceError,TypeError):
+        return []
+    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=recovered)
 
 
-def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, photo_search=None):
+def google_venue_gallery(draft,stage,google_photos):
+    action=draft.get('analysis',{}).get('action',{})
+    if not google_photos or action.get('kind')!='places':return []
+    stage('checking_google_maps_photos')
+    try:return google_photos(action.get('data',[]))
+    except SourceError:return []
+
+
+def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, photo_search=None, google_photos=None):
     """Ordered source figures only. Never generate filler images for a gallery."""
     sources = [document]
     for url in primary_visual_urls(document):
@@ -491,7 +608,8 @@ def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, phot
         fallback = source_visual(source, draft, fetcher) if source.metadata.get('pdf_url') else None
         if fallback:
             return [fallback]
-    venues=linked_venue_gallery(document,draft,fetcher,stage,limit)
+    venues=google_venue_gallery(draft,stage,google_photos)
+    if not venues:venues=linked_venue_gallery(document,draft,fetcher,stage,limit)
     if not venues and document.metadata.get('venue_reference_pages'):
         venues=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=document.metadata['venue_reference_pages'])
     return venues or searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit)

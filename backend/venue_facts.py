@@ -9,9 +9,10 @@ def venue_facts(document):
     if len(document.metadata.get('places',[]))!=1:return None
     prefix='Email subject: '+document.metadata.get('email_subject','')+'\n'
     text='\n'.join(span['text'].removeprefix(prefix) for span in document.spans if not span.get('source_kind'))
-    fields=labelled_fields(text)
-    rating=None
-    for record in document.metadata.get('venue_reviews',[]):
+    fields=labelled_fields(document.metadata.get('email_text',text) if '#' not in document.url else text)
+    value=next((value for label,value in fields if label in ('rating','ratings')),None)
+    rating='Rating: '+value if value and len(value)<=200 else None
+    for record in ([] if rating else document.metadata.get('venue_reviews',[])):
         if record.get('kind')!='rating' or not {'rating','scale','count','count_kind','url'} <= record.keys():continue
         host=urlsplit(record['url']).hostname or 'the review source'
         rating=f"Rating: {record['rating']:g}/{record['scale']:g} · {record['count']} {record['count_kind']} ({host})"

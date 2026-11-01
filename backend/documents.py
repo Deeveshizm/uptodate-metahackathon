@@ -108,6 +108,12 @@ def content_root(soup):
             primary = next((article for article in articles if article.find("h1")), None)
             return primary if primary is not None else main
         return main
+    articles=soup.find_all('article',limit=30)
+    if len(articles)>1:
+        primary=next((article for article in articles if article.find('h1')),None)
+        if primary is not None:return primary
+        for parent in articles[0].parents:
+            if len(parent.find_all('article',limit=len(articles)))>=len(articles):return parent
     return soup.find("article") or soup.body or soup
 
 
@@ -179,6 +185,22 @@ def source_metadata(soup, url):
             ingredients = [normalize(v)[:300] for v in obj["recipeIngredient"][:60] if isinstance(v, str) and normalize(v)]
             if ingredients:
                 result["recipe"] = {"name": normalize(str(obj.get("name", "Recipe")))[:200], "ingredients": ingredients, "source_url": url}
+                raw_images=obj.get('image',[])
+                raw_images=raw_images if isinstance(raw_images,list) else [raw_images]
+                by_id={node['@id']:node for node in objects if isinstance(node.get('@id'),str)}
+                images=[]
+                for value in raw_images[:12]:
+                    if isinstance(value,dict):
+                        value=by_id.get(value.get('@id'),value)
+                        value=value.get('contentUrl') or value.get('url') or ''
+                    if isinstance(value,str):
+                        candidate=safe_url(urljoin(url,value))
+                        if candidate and candidate not in images:images.append(candidate)
+                if images:
+                    # Recipe plugins often provide several cropped thumbnails
+                    # followed by the original. Prefer that original as one hero.
+                    images.sort(key=lambda image:bool(re.search(r'-\d+x\d+\.[a-z]+$',urlsplit(image).path,re.I)))
+                    result['recipe']['images']=images[:1]
                 instructions=recipe_instructions(obj.get('recipeInstructions'))
                 if len(instructions)<=30 and sum(len(step) for step in instructions)<=12000:
                     result['recipe']['instructions']=instructions
@@ -204,6 +226,10 @@ def parse_document(resource: Resource) -> Document:
         spans = make_spans([(line, "Text", None) for line in text.splitlines() if normalize(line)])
         return Document(resource.url, urlsplit(resource.url).hostname, spans)
     soup = BeautifulSoup(resource.body, "html.parser")
+    from .newsletter_links import sponsored,story_heading
+    for article in soup.find_all('article'):
+        heading=article.find(['h1','h2','h3','h4'])
+        if heading is not None and sponsored(heading.get_text(' ',strip=True)):article.decompose()
     title_node=soup.title or soup.find('h1')
     title = normalize(title_node.get_text(" ")) if title_node else (urlsplit(resource.url).hostname or 'Email edition')
     author_nodes = soup.find_all("meta", attrs={"name": re.compile(r"^(?:author|citation_author|dc\.creator)$", re.I)}, limit=12)
@@ -247,7 +273,7 @@ def parse_document(resource: Resource) -> Document:
         url = safe_url(urljoin(resource.url, anchor["href"]))
         label = normalize(anchor.get_text(" "))
         if url and label and not re.search(r"unsubscribe|subscribe|signin|login|privacy|terms|preferences|mailto:", url, re.I):
-            links.append({"url": url, "title": label[:200]})
+            links.append({"url": url, "title": label[:200], 'story_heading':story_heading(anchor,label)})
     section, chunks, grouped_lists = "Body", [], set()
     for node in main.find_all(["h1", "h2", "h3", "p", "li", "blockquote", "pre"]):
         # Avoid copying nested list/blockquote paragraphs twice.
@@ -274,14 +300,14 @@ def parse_document(resource: Resource) -> Document:
     spans = make_spans(chunks)
     content="\n".join(normalize(chunk[0]) for chunk in chunks)
     if metadata.get('recipe'):
-        content+='\n'+json.dumps({key:value for key,value in metadata['recipe'].items() if key!='source_url'},sort_keys=True,ensure_ascii=False)
+        content+='\n'+json.dumps({key:value for key,value in metadata['recipe'].items() if key not in ('source_url','images')},sort_keys=True,ensure_ascii=False)
     metadata["source_content_hash"] = hashlib.sha256(content.encode()).hexdigest()
     metadata["extraction"] = {"strategy": "section_balanced", "available_characters": sum(len(c[0]) for c in chunks),
                               "selected_characters": sum(len(s["text"]) for s in spans)}
     if sum(len(s["text"]) for s in spans) < 100:
         raise SourceError("Not enough accessible source text; try a public issue or article rather than the signup page")
     from .visuals import html_figures
-    figures = html_figures(resource, metadata.get("license_url", ""))
+    figures = html_figures(resource, metadata.get("license_url", ""), metadata=metadata)
     return Document(resource.url, title[:250], spans, links, metadata, figures)
 
 
@@ -362,11 +388,14 @@ def parse_pdf(resource):
 
 def digest_links(document, limit=3, allow_companions=False):
     seen, candidates = {document.url}, []
+    from .newsletter_links import sponsored
+    structured=sum(bool(link.get('story_heading')) for link in document.links)>=2
     for link in document.links:
         url, title = link["url"], link["title"]
         description = title + " " + link.get("context", "")
         companion = allow_companions and (urlsplit(url).hostname in ('arxiv.org','doi.org','github.com') or re.fullmatch(
             r'(?:paper|full paper|repository|repo|code|github|project(?: page| website)?|demo|supplement(?:ary)?(?: material)?)', title.strip(), re.I))
+        if sponsored(title) or (structured and not link.get('story_heading') and not companion):continue
         if url in seen or (len(description.strip()) < 15 and not companion):
             continue
         if re.search(r"^(?:home|about|contact|advertis|sponsor|unsubscribe|preferences|sign.?in|subscribe|forward|share)\b", title, re.I):

@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS reads (
 CREATE TABLE IF NOT EXISTS shares (
  token TEXT PRIMARY KEY, post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS post_share_pages (
+ token TEXT PRIMARY KEY, post_id TEXT NOT NULL UNIQUE REFERENCES posts(id) ON DELETE CASCADE,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ snapshot TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS documents (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -176,6 +181,8 @@ class Store:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            from .muse_connector import SCHEMA as CONNECTOR_SCHEMA
+            db.executescript(CONNECTOR_SCHEMA)
             for table, columns in ADDITIONS.items():
                 existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                 for name, definition in columns.items():

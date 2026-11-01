@@ -5,10 +5,10 @@ import UIKit
 #endif
 
 struct PostContextActionView: View {
+    @EnvironmentObject private var model: AppModel
     let post: Post
     var isFeed = false
     @State private var showing = false
-    @State private var showingBiggie = false
     @State private var sharing = false
     @Environment(\.openURL) private var openURL
     @State private var phoneUnavailable = false
@@ -144,7 +144,6 @@ struct PostContextActionView: View {
             #endif
         }
         #if os(iOS)
-        .fullScreenCover(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         .sheet(isPresented: $sharing) {
             PostAIShareSheet(post: post)
                 .presentationDetents([.medium, .large])
@@ -152,13 +151,12 @@ struct PostContextActionView: View {
                 .presentationCornerRadius(28)
         }
         #else
-        .sheet(isPresented: $showingBiggie) { BiggieChatView(post: post) }
         .sheet(isPresented: $sharing) { PostAIShareSheet(post: post) }
         #endif
     }
     private var aiControl: some View {
         Menu {
-            Button { showingBiggie = true } label: { Label("Ask Biggie", systemImage: "sparkles") }
+            Button { model.activeBiggiePost = post } label: { Label("Ask Biggie", systemImage: "sparkles") }
                 .accessibilityIdentifier("post.ai.biggie")
             Button { sharing = true } label: { Label("Open in…", systemImage: "arrow.up.forward.app") }
                 .accessibilityIdentifier("post.ai.openIn")
@@ -241,7 +239,7 @@ private struct IngredientsSheet: View {
     @State private var working = false
     @State private var message: String?
     @State private var saved = false
-    private var ingredients: [String] { post.contentAction?.recipe?.ingredients ?? [] }
+    private var ingredients: [String] { post.contentAction?.recipe?.groceryItems ?? [] }
 
     var body: some View {
         NavigationStack {
@@ -302,20 +300,31 @@ private struct IngredientsSheet: View {
     }
 }
 
+struct BiggieChatPresenter: ViewModifier {
+    @EnvironmentObject private var model: AppModel
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content.fullScreenCover(item: $model.activeBiggiePost) { post in
+            BiggieChatView(post: post, conversation: model.biggieConversation(for: post))
+        }
+        #else
+        content.sheet(item: $model.activeBiggiePost) { post in
+            BiggieChatView(post: post, conversation: model.biggieConversation(for: post))
+        }
+        #endif
+    }
+}
+
 private struct BiggieChatView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let post: Post
-    @State private var turns: [PostChatTurn] = []
-    @State private var question = ""
-    @State private var sending = false
-    @State private var error: String?
+    @ObservedObject var conversation: BiggieConversation
     @State private var sharing = false
-    @State private var task: Task<Void, Never>?
-    @State private var suggestOpenIn = false
     @FocusState private var questionFocused: Bool
     private var canSend: Bool {
-        !sending && !model.offline && !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !conversation.sending && !model.offline && !conversation.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     private var avatar: Image {
         #if SWIFT_PACKAGE
@@ -329,23 +338,34 @@ private struct BiggieChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(turns) { turn in
+                        ForEach(conversation.turns) { turn in
                             BiggieMessageBubble(turn: turn).id(turn.id)
                         }
-                        if sending { BiggieThinkingBubble().id("replyStatus") }
-                        if let error { Text(error).foregroundStyle(.red).font(.callout).id("replyError") }
+                        if conversation.sending { BiggieThinkingBubble().id("replyStatus") }
+                        if let error = conversation.error {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(error).foregroundStyle(.red).font(.callout)
+                                if conversation.canRetry {
+                                    Button("Try again", action: retry).font(.callout)
+                                        .buttonStyle(.bordered).buttonBorderShape(.capsule)
+                                        .disabled(model.offline).accessibilityIdentifier("post.chat.retry")
+                                }
+                            }.id("replyError")
+                        }
                     }
                     .padding(.horizontal, 20).padding(.vertical, 16)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .defaultScrollAnchor(.bottom)
+                .accessibilityIdentifier("post.chat.history")
                 .scrollDismissesKeyboard(.interactively)
-                .onChange(of: turns.count) { _, _ in
-                    if let last = turns.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                .onChange(of: conversation.turns.count) { _, _ in
+                    if let last = conversation.turns.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
                 }
-                .onChange(of: sending) { _, value in
+                .onChange(of: conversation.sending) { _, value in
                     if value { withAnimation { proxy.scrollTo("replyStatus", anchor: .bottom) } }
                 }
-                .onChange(of: error) { _, value in
+                .onChange(of: conversation.error) { _, value in
                     if value != nil { withAnimation { proxy.scrollTo("replyError", anchor: .bottom) } }
                 }
             }
@@ -355,7 +375,6 @@ private struct BiggieChatView: View {
             .toolbar(.hidden)
         }
         .background(.background)
-        .onDisappear { task?.cancel() }
         #if os(iOS)
         .sheet(isPresented: $sharing) {
             PostAIShareSheet(post: post)
@@ -402,7 +421,7 @@ private struct BiggieChatView: View {
                 .accessibilityLabel("Open in another app")
             #endif
 
-            TextField("Ask about this post", text: $question, axis: .vertical)
+            TextField("Ask about this post", text: $conversation.question, axis: .vertical)
                 .lineLimit(1...3).textFieldStyle(.plain).focused($questionFocused)
                 .font(.system(size: 16))
                 .padding(.horizontal, 16).padding(.vertical, 8)
@@ -411,7 +430,7 @@ private struct BiggieChatView: View {
                 .overlay(Capsule().stroke(.primary.opacity(0.12), lineWidth: 0.5))
                 .frame(minHeight: 44, alignment: .bottom)
                 .accessibilityIdentifier("post.chat.question")
-                .onChange(of: question) { _, value in if value.count > 1000 { question = String(value.prefix(1000)) } }
+                .onChange(of: conversation.question) { _, value in if value.count > 1000 { conversation.question = String(value.prefix(1000)) } }
 
             Button { send() } label: {
                 Image(systemName: "arrow.up").font(.system(size: 16, weight: .semibold))
@@ -430,33 +449,24 @@ private struct BiggieChatView: View {
 
     private var openInIcon: some View {
         Image(systemName: "arrow.up.forward.app").font(.system(size: 15, weight: .medium))
-            .foregroundStyle(suggestOpenIn ? Color.blue : Color.primary).frame(width: 36, height: 36)
-            .background(suggestOpenIn ? Color.blue.opacity(0.12) : Color.primary.opacity(0.07), in: Circle())
-            .overlay(Circle().stroke(suggestOpenIn ? Color.blue : Color.primary.opacity(0.12), lineWidth: suggestOpenIn ? 2 : 0.5))
+            .foregroundStyle(conversation.suggestOpenIn ? Color.blue : Color.primary).frame(width: 36, height: 36)
+            .background(conversation.suggestOpenIn ? Color.blue.opacity(0.12) : Color.primary.opacity(0.07), in: Circle())
+            .overlay(Circle().stroke(conversation.suggestOpenIn ? Color.blue : Color.primary.opacity(0.12), lineWidth: conversation.suggestOpenIn ? 2 : 0.5))
             .frame(width: 44, height: 44, alignment: .bottom)
             .contentShape(Rectangle())
     }
 
     private func send() {
-        let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSend else { return }
-        let history = Array(turns.suffix(6))
-        turns.append(PostChatTurn(role: "user", text: text)); question = ""; sending = true; error = nil
-        task = Task {
-            defer { sending = false }
-            do {
-                let reply = try await model.ask(post, question: text, history: history)
-                guard !Task.isCancelled else { return }
-                suggestOpenIn = reply.handoffSuggested == true
-                let references = reply.evidenceIds.compactMap { index -> String? in
-                    guard post.evidence.indices.contains(index) else { return nil }
-                    return post.evidence[index].source
-                }
-                let suffix = references.isEmpty ? "" : "\n\nSource excerpts: " + references.joined(separator: "; ")
-                turns.append(PostChatTurn(role: "assistant", text: reply.answer + suffix, citations: reply.citations ?? []))
-            } catch {
-                if !Task.isCancelled { self.error = error.localizedDescription; question = text; turns.removeLast() }
-            }
+        conversation.send(evidenceSources: post.evidence.map(\.source)) { question, history in
+            try await model.ask(post, question: question, history: history)
+        }
+    }
+
+    private func retry() {
+        guard !model.offline else { return }
+        conversation.retry { question, history in
+            try await model.ask(post, question: question, history: history)
         }
     }
 }

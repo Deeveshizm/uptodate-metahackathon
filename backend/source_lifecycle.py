@@ -10,7 +10,7 @@ def category(source):
         return stored
     domain = source.get('email_sender', '').rsplit('@', 1)[-1] or source.get('sender', '').rsplit('@', 1)[-1]
     personal = domain in ('gmail.com','googlemail.com','outlook.com','hotmail.com','yahoo.com','icloud.com','me.com','proton.me','protonmail.com')
-    return 'custom' if source.get('source_kind') == 'email' or personal or source['name'].strip().casefold() in ('muse', 'claude') else 'newsletter'
+    return 'custom' if source.get('source_kind') in ('email','connector') or personal or source['name'].strip().casefold() in ('muse', 'claude') else 'newsletter'
 
 
 def maintain_sources(db, user_id=None, at=None):

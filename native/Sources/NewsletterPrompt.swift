@@ -145,6 +145,7 @@ enum NewsletterDeliveryFrequency: String, CaseIterable, Identifiable {
 }
 
 struct NewsletterPromptDraft {
+    let connectorKey = "n_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     static let emailFormat = """
     UpToDate parses these emails into readable posts. Make each edition self-contained so it does not need to discover the basic content on other pages. Send a normal rendered HTML email with one main body and one h2 heading per story, followed by that story's paragraphs, lists, links, and photos. Use inline labels, not extra headings, for ingredients, steps, contact details, or supporting links. If HTML email is unavailable, use readable plain text with the same labels; do not send raw HTML, JSON, code blocks, or an attachment-only edition.
 
@@ -159,12 +160,14 @@ struct NewsletterPromptDraft {
     var frequency = NewsletterDeliveryFrequency.daily
     var scheduleNotes = ""
 
-    func prompt(alias: String, timezone: String) -> String? {
+    func prompt(alias: String, timezone: String, useExistingMuseConnection: Bool = false) -> String? {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let topic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         let alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !topic.isEmpty,
-              alias.range(of: #"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$"#, options: .regularExpression) != nil else { return nil }
+        guard !name.isEmpty, !topic.isEmpty else { return nil }
+        if !useExistingMuseConnection {
+            guard alias.range(of: #"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$"#, options: .regularExpression) != nil else { return nil }
+        }
 
         let preferences = postPreferences.trimmingCharacters(in: .whitespacesAndNewlines)
         let schedule = scheduleNotes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -185,6 +188,30 @@ struct NewsletterPromptDraft {
         specifications.append("Frequency: \(frequency.instruction)")
         specifications.append("Timezone: \(timezone)")
         if !schedule.isEmpty { specifications.append("Preferred delivery schedule: \(schedule)") }
+
+        if useExistingMuseConnection {
+            return """
+            Create a new recurring newsletter using my existing UpToDate connector in Muse. Reuse that connection and the credential already stored securely in Muse. Deliver each edition directly into my private UpToDate feed.
+
+            This request creates only a newsletter and its schedule. Do not create another connector, restart connection setup, ask for a connection key, replace credentials, or ask me to reconnect as part of this request. If the existing connector is unavailable or authentication fails, report the actual connection error and pause this request without changing the connection or claiming the schedule was created. Connection management is handled separately in UpToDate Profile.
+
+            The newsletter specifications are:
+            \(specifications.joined(separator: "\n"))
+
+            Content requirements:
+            \(kind.instructions.replacingOccurrences(of: "email body", with: "story content"))
+            \(kind.emailFields)
+
+            Stable newsletter_key: \(connectorKey)
+            newsletter_name: \(name)
+
+            Before researching each scheduled edition, use getNewsletterProcessingStatus with this newsletter_key. If should_process is false, skip research and delivery. Do not change keys or resume a stopped newsletter automatically.
+
+            Submit through deliverNewsletterEdition, using one edition_id per scheduled run. On a network retry, reuse the identical edition_id and payload. Each substantial story is one stories entry with title and content; add source_url, links, and real image references when available. Keep a paper, its code repository, and project page in the same story. Keep available venue contact details, recipes, and instructions within their own story. Missing details can be omitted; never invent them. Do not include conversation history or credentials in the payload.
+
+            Do not send editions by email. Ask me to clarify missing or conflicting schedule details, obtain any required approval, and confirm only after the recurring task is actually created using the existing connection. After each accepted delivery, check getNewsletterDelivery for processing status.
+            """
+        }
 
         return """
         I want you to create a recurring newsletter for me and send each edition only to my UpToDate newsletter address: \(alias).

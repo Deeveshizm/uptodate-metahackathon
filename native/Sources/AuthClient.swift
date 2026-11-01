@@ -128,10 +128,10 @@ struct AuthClient: Sendable {
         guard 200..<300 ~= response.statusCode else {
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             let code = object?["error_code"] as? String ?? object?["code"] as? String ?? ""
+            if code == "email_not_confirmed" { throw AuthAccountError.unverifiedEmail }
             let message: String
             switch code {
             case "invalid_credentials": message = "The email or password is incorrect."
-            case "email_not_confirmed": message = "Verify your email before signing in."
             case "otp_expired": message = "The code is invalid or expired. Request a new code."
             case "weak_password":
                 let weakness = object?["weak_password"] as? [String: Any]
@@ -149,9 +149,15 @@ struct AuthClient: Sendable {
         return data
     }
 
-    func signUp(email: String, password: String, flow: AuthFlow) async throws -> AuthSession? {
-        try await AuthSession.decodeResponse(call("signup", fields: ["email": email, "password": password,
-            "code_challenge": flow.challenge, "code_challenge_method": "s256"], redirect: AuthFlow.redirectURL))
+    func signUp(email: String, password: String, flow: AuthFlow, name: String = "", dateOfBirth: String? = nil) async throws -> AuthSession? {
+        var metadata: [String: Any] = ["uptodate_personalization_pending": true]
+        if !name.isEmpty { metadata["display_name"] = name }
+        if let dateOfBirth { metadata["date_of_birth"] = dateOfBirth }
+        let fields: [String: Any] = ["email": email, "password": password,
+            "code_challenge": flow.challenge, "code_challenge_method": "s256",
+            "data": metadata]
+        return try await AuthSession.decodeResponse(call("signup", redirect: AuthFlow.redirectURL,
+            payload: JSONSerialization.data(withJSONObject: fields)))
     }
 
     func signIn(email: String, password: String) async throws -> AuthSession {
@@ -179,8 +185,9 @@ struct AuthClient: Sendable {
         _ = try await call("recover", fields: ["email": email, "code_challenge": flow.challenge,
                                                "code_challenge_method": "s256"], redirect: AuthFlow.redirectURL)
     }
-    func resend(email: String) async throws {
-        _ = try await call("resend", fields: ["email": email, "type": "signup"], redirect: AuthFlow.redirectURL)
+    func resend(email: String, flow: AuthFlow) async throws {
+        _ = try await call("resend", fields: ["email": email, "type": "signup",
+            "code_challenge": flow.challenge, "code_challenge_method": "s256"], redirect: AuthFlow.redirectURL)
     }
     func exchange(code: String, flow: AuthFlow) async throws -> AuthSession {
         guard let session = try await AuthSession.decodeResponse(call("token?grant_type=pkce", fields: ["auth_code": code, "code_verifier": flow.verifier])) else {

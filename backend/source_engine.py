@@ -48,6 +48,12 @@ class SourceEngine:
     def enrich_recommendation(self, document, job):
         if self.custom_generator or document.metadata.get('format') != 'email' or not document.metadata.get('places'):
             return document
+        from .google_places_photos import GooglePlacesPhotos, supports_live_venue
+        from .venue_enrichment import VenueEnrichment
+        google=GooglePlacesPhotos(fetcher=self.fetcher,store=self.store) if GooglePlacesPhotos.enabled() and supports_live_venue(job['user_id']) else None
+        self.stage(job['id'], 'checking_missing_venue_details')
+        document=VenueEnrichment(self.fetcher,google).enrich(document,JobBudget(self.store,job['id']))
+        if document.metadata.get('venue_reviews_needed') is False:return document
         self.stage(job['id'], 'checking_venue_reviews')
         if os.environ.get('GENERATION_PROVIDER','meta') == 'meta' and os.environ.get('MODEL_API_KEY'):
             if self.review_searcher is None:
@@ -61,7 +67,29 @@ class SourceEngine:
         if self.photo_searcher is None:
             from .venue_photo_search import VenuePhotoSearch
             self.photo_searcher=VenuePhotoSearch(self.store)
-        return lambda places:self.photo_searcher.pages(places,JobBudget(self.store,job['id']))
+        return lambda places, **options:self.photo_searcher.pages(places,JobBudget(self.store,job['id']),**options)
+
+    def google_photo_lookup(self,job,document=None):
+        from .google_places_photos import GooglePlacesPhotos, supports_live_venue
+        if self.custom_generator or not GooglePlacesPhotos.enabled() or not supports_live_venue(job['user_id']):return None
+        provider=GooglePlacesPhotos(fetcher=self.fetcher,store=self.store)
+        if document and document.metadata.get('google_photo_checked'):
+            identifier=document.metadata.get('google_venue_id')
+            indices=document.metadata.get('google_photo_indices',[])
+            if not identifier or not indices:return lambda places:[]
+            def selected(places):
+                from .google_places_photos import reference
+                return [(self.google_visual(places[0],identifier),reference(identifier,index)) for index in indices[:3]] if places else []
+            return selected
+        return lambda places:provider.gallery(places,JobBudget(self.store,job['id']))
+
+    @staticmethod
+    def google_visual(place,identifier):
+        from urllib.parse import urlencode
+        return {'kind':'source','status':'ready','provider':'google_places','source_role':'venue_listing',
+                'caption':place['name']+' · Google Maps photo','attribution':'Google Maps',
+                'source_url':'https://www.google.com/maps/search/?'+urlencode({'api':1,'query':place['name'],'query_place_id':identifier}),
+                'requires_live_attribution':True,'cache_policy':'no-store'}
 
     def stage(self, job_id, stage):
         with self.store.connect() as db:
@@ -78,6 +106,9 @@ class SourceEngine:
             if not job or not db.execute("UPDATE jobs SET status='processing',error=NULL WHERE id=? AND status='queued'", (job_id,)).rowcount:
                 return
         try:
+            if job['kind']=='connector_edition':
+                from .muse_connector import ensure_job_allowed
+                with self.store.connect() as db:ensure_job_allowed(db,job['id'])
             payload = json.loads(job["payload"])
             if job["kind"] == "visual":
                 self.render_visual(job, payload)
@@ -118,6 +149,8 @@ class SourceEngine:
         soup = BeautifulSoup(resource.body, "html.parser")
         name = soup.title.get_text(" ", strip=True)[:150] if soup.title else payload["url"]
         name = publication_name(soup) or name
+        from .source_identity import publisher_details
+        name,sender_domain=publisher_details(resource.url,name)
         from urllib.parse import urljoin
         from .pipeline import safe_url
         feed = soup.find("link", attrs={"type": re.compile(r"application/(rss|atom)\+xml")})
@@ -139,11 +172,7 @@ class SourceEngine:
             status, detail = "needs_agent", "Receiving alias is ready; configure the signup agent to continue"
         else:
             self.stage(job["id"], "submitting_signup")
-            domain = urlsplit(resource.url).hostname or ""
-            for prefix in ("www.", "newsletter.", "newsletters."):
-                if domain.startswith(prefix):
-                    domain = domain[len(prefix):]
-                    break
+            domain = sender_domain
             with self.store.connect() as db:
                 claimed = db.execute("UPDATE sources SET subscription_status='submitting',subscription_alias=?,expected_sender_domain=? WHERE id=? AND user_id=? AND subscription_status NOT IN ('submitting','submitted','confirmation_required','email_received','receiving','unsubscribed','unsubscribe_pending','unsubscribing')",
                                      (user["alias"], domain, job["source_id"], job["user_id"])).rowcount
@@ -275,7 +304,7 @@ class SourceEngine:
         draft = dict(post)
         draft["analysis"] = json.loads(post["analysis"])
         draft["evidence"] = json.loads(post["evidence"])
-        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=None if payload.get('source_only') else self.photo_lookup(job))
+        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=None if payload.get('source_only') else self.photo_lookup(job),google_photos=None if payload.get('source_only') else self.google_photo_lookup(job,document))
         if original_gallery:
             visual,image=original_gallery[0]
         elif payload.get('source_only'):
@@ -292,7 +321,7 @@ class SourceEngine:
                     planner.budget = JobBudget(self.store, job["id"])
                 visual, image = choose_visual(document, draft, self.fetcher, self.illustrator,
                                               stage=lambda value: self.stage(job["id"], value), text_model=planner,
-                                              budget=JobBudget(self.store, job["id"]),photo_search=self.photo_lookup(job))
+                                              budget=JobBudget(self.store, job["id"]),photo_search=None,google_photos=None,venue_photos_checked=True)
                 if not image:
                     raise SourceError(visual["detail"])
                 visual["asset_id"] = hashlib.sha256((post["artifact_key"] + hashlib.sha256(image).hexdigest()).encode()).hexdigest()
@@ -306,10 +335,12 @@ class SourceEngine:
                 stored = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()
             if not stored:
                 raise SourceError("The visual is no longer available")
-            image = self.assets.read(stored)
+            from .google_places_photos import parse_reference
+            stored_bytes=bytes(stored['image'])
+            image = stored_bytes if parse_reference(stored_bytes) is not None else self.assets.read(stored)
         else:
             visual, image = choose_visual(document, draft, self.fetcher, self.illustrator,
-                                          stage=lambda value: self.stage(job["id"], value), budget=JobBudget(self.store, job["id"]),photo_search=self.photo_lookup(job))
+                                          stage=lambda value: self.stage(job["id"], value), budget=JobBudget(self.store, job["id"]),photo_search=None,google_photos=None,venue_photos_checked=True)
         with self.store.connect() as db:
             if image:
                 visual.setdefault("asset_id", uuid.uuid4().hex)
@@ -333,12 +364,30 @@ class SourceEngine:
             payload = {key:value for key,value in payload.items() if key not in ('remaining_candidates','processed_items')}
         inline_documents={}
         fetched_documents={}
-        if job["kind"] == "received_email":
+        if job['kind']=='connector_edition':
+            from .connector_content import connector_documents
+            root,originals=connector_documents(payload)
+            inline_documents={document.url:document for document in originals}
+        elif job["kind"] == "received_email":
             # A new input adapter, using the same original-source selection,
             # local model, verifier and source-first image handling as URL jobs.
             # The synthetic edition ID is never fetched or used as a post link.
             root, originals = email_documents(payload)
-            if use_email_body(root):inline_documents={document.url:document for document in originals}
+            recovered=False
+            if not root.links:
+                from .newsletter_links import public_issue_url
+                archive=public_issue_url(root)
+                if archive:
+                    try:
+                        issue=parse_document(self.fetcher.fetch(archive))
+                        expected=archive.rsplit('/',1)[-1]
+                        if expected in issue.title+' '+' '.join(span['text'] for span in issue.spans) and len(digest_links(issue,limit=None))>=2:
+                            root.links=issue.links
+                            root.metadata['public_issue_url']=issue.url
+                            self.save_document(job,issue)
+                            recovered=True
+                    except SourceError:pass
+            if not recovered and use_email_body(root):inline_documents={document.url:document for document in originals}
         else:
             root = parse_document(self.fetcher.fetch(payload["url"]))
         self.save_document(job, root)
@@ -372,7 +421,21 @@ class SourceEngine:
                 document = inline_documents.get(url) or fetched_documents.get(url) or (root if url == root.url else parse_document(self.fetcher.fetch(url)))
                 self.save_document(job, document)
                 secondary = document
-                if document.metadata.get('format') != 'email' or not document.metadata.get('places'):
+                if document.metadata.get('format')=='connector' and not document.metadata.get('places'):
+                    primary=document.metadata.get('connector_primary_url')
+                    if primary:
+                        try:
+                            original=parse_document(self.fetcher.fetch(primary))
+                            # Supplied media remains available after original
+                            # source extraction, with original-source priority.
+                            original.figures += document.figures
+                            original.links += document.links
+                            if document.figures:original.metadata['private']=True
+                            document=original
+                        except SourceError:
+                            if not document.spans:raise
+                            document.metadata['retrieval_caveat']='Original source unavailable; based on the submitted edition'
+                elif document.metadata.get('format') != 'email' or not document.metadata.get('places'):
                     document = self.original_document(job, document)
                 document = self.enrich_recommendation(document, job)
                 self.save_document(job, document)
@@ -417,6 +480,8 @@ class SourceEngine:
                     return self.generator(document,model=configured,stage=lambda stage:self.stage(job['id'],stage))
                 artifact_key, cached, reused = self.artifacts.obtain(document, job["user_id"], variant,produce_draft)
                 draft = copy.deepcopy(cached)
+                for field in ('live_venue','venue_website_fields'):
+                    if document.metadata.get(field):draft['analysis'][field]=copy.deepcopy(document.metadata[field])
                 if document.metadata.get('review_lookup'):
                     draft['analysis']['review_lookup'] = copy.deepcopy(document.metadata['review_lookup'])
                     draft['analysis']['review_sources'] = list(dict.fromkeys(item['url'] for item in document.metadata.get('venue_reviews', [])))
@@ -428,16 +493,16 @@ class SourceEngine:
                 draft['analysis']['story_group'] = {'primary_url':document.url,
                     'supporting_links':candidate.get('supporting_links', [])}
                 draft["analysis"]["cache"] = {"reused": reused, "new_inference_cost_usd": 0 if reused else draft["analysis"].get("usage", {}).get("estimated_cost_usd", 0)}
-                draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] == "received_email" else root.url, "secondary_url": secondary.url,
+                draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] in ("received_email","connector_edition") else root.url, "secondary_url": secondary.url,
                                                     "original_url": document.url, "content_author": document.metadata.get("author", "")}
-                gallery = source_gallery(document, draft, self.fetcher, stage=lambda value: self.stage(job["id"], value),photo_search=self.photo_lookup(job))
+                gallery = source_gallery(document, draft, self.fetcher, stage=lambda value: self.stage(job["id"], value),photo_search=self.photo_lookup(job),google_photos=self.google_photo_lookup(job,document))
                 if gallery:
                     visual, image = gallery[0]
                 elif document.metadata.get('email_images_pending'):
                     visual,image={'kind':'source','status':'failed','detail':'This email contains an embedded source image; attachment import is not available yet'},None
                 elif self.illustrator is not None:
                     visual, image = choose_visual(document, draft, self.fetcher, self.illustrator,
-                                                  stage=lambda value: self.stage(job["id"], value), budget=JobBudget(self.store, job["id"]),photo_search=self.photo_lookup(job))
+                                                  stage=lambda value: self.stage(job["id"], value), budget=JobBudget(self.store, job["id"]),photo_search=self.photo_lookup(job),google_photos=self.google_photo_lookup(job,document))
                     gallery = [(visual, image)] if image else []
                 else:
                     visual, image = {"kind": "pending", "status": "needs_image_generator", "caption": "Illustration pending",
@@ -523,6 +588,9 @@ class SourceEngine:
                        (state, state, error, json.dumps({"items": results, "link_limit_reached": bool(payload.get("link_limit_reached"))}), state, job["id"]))
 
     def insert_post(self, db, post_id, job, document, draft, visual):
+        if job['kind']=='connector_edition':
+            from .muse_connector import ensure_job_allowed
+            ensure_job_allowed(db,job['id'])
         source = db.execute("SELECT subscription_status FROM sources WHERE id=? AND user_id=?", (job["source_id"], job["user_id"])).fetchone()
         if not source or source["subscription_status"] in ("unsubscribed", "unsubscribe_pending", "unsubscribing"):
             raise SourceError("Newsletter was unsubscribed; no new post was published")

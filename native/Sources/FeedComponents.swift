@@ -279,6 +279,7 @@ struct FeedPostCard: View {
     let index: Int
     let openPost: () -> Void
     @State private var expanded = false
+    @State private var liveVenue: LiveVenueDetails?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -318,7 +319,7 @@ struct FeedPostCard: View {
             }
 
             HStack {
-                PostContextActionView(post: post, isFeed: true)
+                PostContextActionView(post: post.venueActionPost(live: liveVenue), isFeed: true)
                 Spacer()
                 Button { Task { await model.bookmark(post) } } label: {
                     Image(systemName: post.bookmarked ? "bookmark.fill" : "bookmark")
@@ -342,7 +343,8 @@ struct FeedPostCard: View {
                         .fixedSize(horizontal: false, vertical: true)
                     if expanded {
                         if let caveat = post.sourceCaveat { Text(caveat).font(.footnote).lineSpacing(3) }
-                        VenueFactsView(facts: post.analysis?.venueFacts)
+                        VenueFactsView(facts: post.displayVenueFacts(live: nil))
+                        LiveVenueDetailsView(details: liveVenue)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -362,6 +364,7 @@ struct FeedPostCard: View {
                 }
             }.padding(.horizontal, 16).padding(.top, 2)
         }
+        .task(id: post.id) { liveVenue = await model.venueDetails(post) }
         .background {
             // Catch blank areas without giving controls a parent tap gesture.
             Color.clear.contentShape(Rectangle()).onTapGesture(perform: openPost)

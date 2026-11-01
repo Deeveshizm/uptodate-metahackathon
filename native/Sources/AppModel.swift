@@ -20,12 +20,19 @@ final class AppModel: ObservableObject {
     @Published var notice: String?
     @Published var busy = false
     @Published private(set) var completedGuides: Set<AppGuide> = []
+    @Published private(set) var museConnectionStatus: MuseConnectionStatus?
+    @Published private var pendingMuseCredential: MuseConnectionCredential?
+    private var pendingMuseOwner: String?
+    @Published var activeBiggiePost: Post?
+    private let biggieConversations = BiggieConversationStore()
     @Published private(set) var guideProgressReady = false
     @Published var offline = false
+    @Published private(set) var photoCredits: [String: PhotoCredit] = [:]
     @Published var authConfiguration: AuthConfiguration?
     @Published private(set) var recoveryReady = false
     @Published private(set) var pendingEmail: String?
     @Published private(set) var pendingAuthKind: AuthFlow.Kind?
+    @Published private(set) var unverifiedProfileEmail: String?
     private var deferredAuthURL: URL?
     private var token: String?
     private var authSession: AuthSession?
@@ -77,6 +84,9 @@ final class AppModel: ObservableObject {
             if let text = Session.read(account: "auth-flow"),
                let flow = try? JSONDecoder().decode(AuthFlow.self, from: Data(text.utf8)), flow.isCurrent {
                 pendingEmail = flow.email; pendingAuthKind = flow.kind
+                if flow.kind == .signup, Session.read(account: "unverified-profile-email") == flow.email {
+                    unverifiedProfileEmail = flow.email
+                }
             }
             if let recovery = storedRecovery(), recovery.session.expiresAt > Date().timeIntervalSince1970 {
                 pendingEmail = recovery.email; recoveryReady = true
@@ -84,7 +94,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func request(_ path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", retryAuth: Bool = true, timeout: TimeInterval = 15, query: [URLQueryItem] = []) async throws -> Data {
+    private func request(_ path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", retryAuth: Bool = true, timeout: TimeInterval = 15, query: [URLQueryItem] = [], onResponse: ((HTTPURLResponse) -> Void)? = nil) async throws -> Data {
         let epoch = sessionEpoch
         if let session = authSession, session.expiresAt < Date().timeIntervalSince1970 + 60 {
             try await refreshSession()
@@ -96,6 +106,7 @@ final class AppModel: ObservableObject {
         request.timeoutInterval = timeout
         request.httpBody = body
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "X-UpToDate-Photo-Attribution")
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         let usedToken = token
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -105,11 +116,12 @@ final class AppModel: ObservableObject {
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             if response.statusCode == 401, authSession != nil, retryAuth {
                 if usedToken == token { try await refreshSession() }
-                return try await self.request(path, method: method, body: body, contentType: contentType, retryAuth: false, timeout: timeout, query: query)
+                return try await self.request(path, method: method, body: body, contentType: contentType, retryAuth: false, timeout: timeout, query: query, onResponse: onResponse)
             }
             if response.statusCode == 401 { clearLocalSession() }
             throw APIError.response(response.statusCode, object?["detail"] as? String ?? "The request failed")
         }
+        onResponse?(response)
         return data
     }
 
@@ -205,25 +217,40 @@ final class AppModel: ObservableObject {
     }
 
     func signIn(email: String, password: String) async {
-        await perform { try await self.completeSignIn(self.authClient().signIn(email: email, password: password)) }
+        await perform {
+            do { try await self.completeSignIn(self.authClient().signIn(email: email, password: password)) }
+            catch AuthAccountError.unverifiedEmail {
+                _ = try self.emailFlow(email: email, kind: .signup)
+                try self.showUnverifiedProfile(email: email)
+            }
+        }
     }
 
-    func signUp(email: String, password: String) async -> Bool {
+    func signUp(email: String, password: String, name: String = "", dateOfBirth: String? = nil) async -> Bool {
         var confirmationNeeded = false
         await perform {
             let flow = try self.emailFlow(email: email, kind: .signup)
-            if let session = try await self.authClient().signUp(email: email, password: password, flow: flow) {
+            if let session = try await self.authClient().signUp(email: email, password: password, flow: flow, name: name, dateOfBirth: dateOfBirth) {
                 try await self.completeSignIn(session)
-            } else { confirmationNeeded = true }
+            } else {
+                confirmationNeeded = true
+                try self.showUnverifiedProfile(email: email)
+            }
         }
         return confirmationNeeded
     }
 
     func resendConfirmation(email: String) async {
         await perform {
-            try await self.authClient().resend(email: email)
+            let flow = try self.emailFlow(email: email, kind: .signup)
+            try await self.authClient().resend(email: email, flow: flow)
             self.notice = "If confirmation is available for this address, a new link has been sent."
         }
+    }
+
+    private func showUnverifiedProfile(email: String) throws {
+        try Session.save(email, account: "unverified-profile-email")
+        unverifiedProfileEmail = email
     }
 
     func requestRecovery(email: String) async -> Bool {
@@ -267,6 +294,7 @@ final class AppModel: ObservableObject {
 
     func cancelEmailFlow() {
         Session.clear(account: "auth-flow"); Session.clear(account: "password-recovery")
+        Session.clear(account: "unverified-profile-email"); unverifiedProfileEmail = nil
         recoveryReady = false; pendingEmail = nil; pendingAuthKind = nil
     }
 
@@ -380,6 +408,77 @@ final class AppModel: ObservableObject {
 
     func refreshAccount() async {
         await perform { self.account = try await self.get("v1/me"); await self.refreshAvatar(); try await self.reload() }
+    }
+
+    func savePersonalization(interests: [String], complete: Bool) async -> Bool {
+        var saved = false
+        await perform {
+            let body = try JSONSerialization.data(withJSONObject: ["interests": interests, "complete": complete])
+            self.account = try self.decoder.decode(Account.self, from: await self.request("v1/me/preferences", method: "PUT", body: body))
+            saved = true
+        }
+        return saved
+    }
+
+    func newsletterRecommendations() async -> RecommendationCatalog? {
+        do { return try await get("v1/newsletters/recommendations") }
+        catch {
+            if !isCancellation(error) { self.error = error.localizedDescription }
+            return nil
+        }
+    }
+
+    func museConnection(reportFailure: Bool = true) async -> MuseConnectionStatus? {
+        let owner = account?.id
+        do {
+            let value: MuseConnectionStatus = try await get("v1/me/connectors/muse")
+            guard owner != nil, account?.id == owner else { return nil }
+            if value.isVerified, pendingMuseOwner == owner,
+               value.expiresAt == pendingMuseCredential?.expiresAt {
+                pendingMuseCredential = nil
+                pendingMuseOwner = nil
+            }
+            museConnectionStatus = value
+            return value
+        }
+        catch { if reportFailure, !isCancellation(error) { self.error = error.localizedDescription }; return nil }
+    }
+
+    func createMuseConnection() async -> MuseConnectionCredential? {
+        let owner = account?.id
+        do {
+            let credential = try decoder.decode(MuseConnectionCredential.self, from: await request("v1/me/connectors/muse", method: "POST"))
+            guard owner != nil, account?.id == owner else { return nil }
+            museConnectionStatus = nil
+            pendingMuseCredential = credential
+            pendingMuseOwner = owner
+            return credential
+        }
+        catch { if !isCancellation(error) { self.error = error.localizedDescription }; return nil }
+    }
+
+    func disconnectMuse() async -> Bool {
+        do {
+            _ = try await request("v1/me/connectors/muse", method: "DELETE")
+            museConnectionStatus = nil
+            pendingMuseCredential = nil
+            pendingMuseOwner = nil
+            return true
+        }
+        catch { if !isCancellation(error) { self.error = error.localizedDescription }; return false }
+    }
+
+    var museSetupCredential: MuseConnectionCredential? {
+        guard pendingMuseOwner == account?.id, let pendingMuseCredential,
+              pendingMuseCredential.expiresAt > Date().timeIntervalSince1970 else { return nil }
+        return pendingMuseCredential
+    }
+
+    func venueDetails(_ post: Post) async -> LiveVenueDetails? {
+        guard post.actionKind == "places", post.analysis?.liveVenue != nil, !offline else { return nil }
+        // Keep Google details in the displaying view's memory, never in the
+        // saved feed JSON or offline image/content caches.
+        return try? await get("v1/posts/\(post.id)/venue-details")
     }
 
     private func guideCacheKey(_ owner: String) -> String { "guide-progress-" + owner }
@@ -679,26 +778,50 @@ final class AppModel: ObservableObject {
 
     func share(_ post: Post) async -> ShareResult? {
         do {
-            return try decoder.decode(ShareResult.self, from: await request("v1/posts/\(post.id)/share", method: "POST"))
+            let body = try JSONSerialization.data(withJSONObject: ["publish_post": true])
+            let result = try decoder.decode(ShareResult.self, from: await request("v1/posts/\(post.id)/share", method: "POST", body: body))
+            guard result.mode == "shared-post" else {
+                throw APIError.response(409, "Post sharing needs the updated backend. Please try again after the service is updated.")
+            }
+            return result
         } catch {
             if !isCancellation(error) { self.error = error.localizedDescription }
             return nil
         }
     }
 
+    func stopSharing(_ post: Post) async -> Bool {
+        do {
+            _ = try await request("v1/posts/\(post.id)/share", method: "DELETE")
+            notice = "Post link disabled. Your post is still in your feed."
+            return true
+        } catch {
+            if !isCancellation(error) { self.error = error.localizedDescription }
+            return false
+        }
+    }
+
     func visualData(_ post: Post, visual: PostVisual? = nil) async -> Data? {
         guard let assetId = (visual ?? post.visual)?.assetId, let accountID = account?.id else { return nil }
+        let livePhoto = (visual ?? post.visual)?.provider == "google_places"
         let cacheKey = accountID + "-" + post.id + "-" + assetId
-        if let data = imageCache[cacheKey] { return data }
+        if !livePhoto, let data = imageCache[cacheKey] { return data }
         guard assetId.allSatisfy({ $0.isHexDigit }) else { return nil }
         let directory = cache.deletingLastPathComponent().appendingPathComponent("images")
         let path = directory.appendingPathComponent(cacheKey + ".png")
-        if let data = try? Data(contentsOf: path) { imageCache[cacheKey] = data; return data }
+        if !livePhoto, let data = try? Data(contentsOf: path) { imageCache[cacheKey] = data; return data }
         guard !offline else { return nil }
         do {
             let route = assetId == post.visual?.assetId ? "image" : "images/\(assetId)"
-            let data = try await request("v1/posts/\(post.id)/\(route)")
+            let data = try await request("v1/posts/\(post.id)/\(route)", timeout: livePhoto ? 60 : 15) { response in
+                if let value = response.value(forHTTPHeaderField: "X-UpToDate-Photo-Credit"),
+                   let encoded = Data(base64Encoded: value),
+                   let credit = try? self.decoder.decode(PhotoCredit.self, from: encoded) {
+                    self.photoCredits[assetId] = credit
+                }
+            }
             guard account?.id == accountID else { return nil }
+            if livePhoto { return data }
             if imageCache.count >= 20 { imageCache.removeAll() }
             imageCache[cacheKey] = data
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -788,6 +911,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func biggieConversation(for post: Post) -> BiggieConversation {
+        guard let owner = account?.id else { return BiggieConversation() }
+        return biggieConversations.conversation(owner: owner, post: post.id)
+    }
+
     func ask(_ post: Post, question: String, history: [PostChatTurn]) async throws -> PostChatReply {
         struct Input: Encodable { let question: String; let history: [PostChatTurn] }
         let bounded = history.suffix(6).map { PostChatTurn(role: $0.role, text: String($0.text.prefix(2000))) }
@@ -818,10 +946,16 @@ final class AppModel: ObservableObject {
         guideLoadTask?.cancel(); guideLoadTask = nil
         guideSyncTask?.cancel(); guideSyncTask = nil
         guideOwner = nil; guideProgressReady = false; completedGuides = []
+        museConnectionStatus = nil
+        pendingMuseCredential = nil
+        pendingMuseOwner = nil
+        activeBiggiePost = nil
+        biggieConversations.clear()
         refreshTask?.cancel(); refreshTask = nil; authSession = nil
         Session.clear()
         token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []; newsletterConfirmations = []
         imageCache.removeAll()
+        photoCredits.removeAll()
         avatarData = nil; loadedAvatarRevision = nil
         try? FileManager.default.removeItem(at: cache.deletingLastPathComponent().appendingPathComponent("avatar.png"))
         let images = cache.deletingLastPathComponent().appendingPathComponent("images")

@@ -62,6 +62,57 @@ struct Account: Codable {
     var aliasStatus: String? = nil
     var aliasScope: String? = nil
     var avatarRevision: String? = nil
+    var preferences: PersonalizationPreferences? = nil
+    var needsPersonalization: Bool? = nil
+    var dateOfBirth: String? = nil
+    var privateMuseEnabled: Bool? = nil
+}
+
+struct MuseConnectionStatus: Decodable {
+    let connected: Bool
+    let expiresAt: Double?
+    let lastDeliveryAt: Double?
+    let docsUrl: URL
+    let setupUrl: URL
+    let schemaUrl: URL
+    var verified: Bool? = nil
+    var verifiedAt: Double? = nil
+
+    var isVerified: Bool {
+        connected && (expiresAt.map { $0 > Date().timeIntervalSince1970 } ?? true)
+            && (verified ?? (lastDeliveryAt != nil))
+    }
+}
+
+struct MuseConnectionCredential: Decodable {
+    let credential: String
+    let expiresAt: Double
+}
+
+struct PersonalizationPreferences: Codable {
+    let interests: [String]
+    let complete: Bool
+}
+
+struct PersonalizationOption: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let symbol: String?
+}
+
+struct NewsletterRecommendation: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let description: String
+    let url: String
+    let interests: [String]
+    let matchedInterests: [String]
+    let alreadyAdded: Bool
+}
+
+struct RecommendationCatalog: Decodable {
+    let topics: [PersonalizationOption]
+    let newsletters: [NewsletterRecommendation]
 }
 
 struct NewsletterSource: Codable, Identifiable, Equatable {
@@ -286,6 +337,53 @@ struct RecipeAction: Codable {
     let ingredients: [String]
     let sourceUrl: String?
     var note: String? = nil
+
+    var groceryItems: [String] { GroceryIngredients.names(from: ingredients) }
+}
+
+enum GroceryIngredients {
+    private static let amount = #"(?:\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:[.,]\d+)?(?:\s*[¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])?|[.,]\d+|[¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]|one|two|three|four|five|six|seven|eight|nine|ten|a|an)"#
+    private static let unit = #"(?:fluid\s+ounces?|fl\.?\s*oz\.?|table\s*spoons?|tbsps?\.?|tbs\.?|tea\s*spoons?|tsps?\.?|cups?|kilograms?|milligrams?|grams?|kg|mg|g|millilit(?:er|re)s?|ml|lit(?:er|re)s?|l|ounces?|oz\.?|pounds?|lbs?\.?|pinch(?:es)?|dashes?|handfuls?|cloves?|sticks?|cans?|jars?|packets?|packages?|bunch(?:es)?|sprigs?|slices?|pieces?|heads?)"#
+
+    static func names(from ingredients: [String]) -> [String] {
+        var seen = Set<String>()
+        return ingredients.flatMap { $0.components(separatedBy: ";") }.compactMap { raw in
+            let alternatives = raw.components(separatedBy: " OR ")
+            let name = alternatives.compactMap(clean).joined(separator: " or ")
+            guard !name.isEmpty, seen.insert(name.lowercased()).inserted else { return nil }
+            return name
+        }
+    }
+
+    private static func clean(_ raw: String) -> String? {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = replace(#"^[•*\-]\s*"#, in: text)
+        text = replace(#"^(?:optional|for (?:the )?(?:garnish|topping|sauce|serving))\s*:\s*"#, in: text)
+        // Remove quantities and package sizes only at the beginning; keep
+        // ingredient identities such as 2% milk and five-spice powder intact.
+        for _ in 0..<3 {
+            let before = text
+            let prefix = "^" + amount + "(?:\\s*(?:-|–|to)\\s*" + amount + ")?(?=\\s|[- ]?" + unit + "\\b|\\()\\s*"
+            text = replace(prefix, in: text)
+            if text != before {
+                text = replace("^\\(\\s*" + amount + "\\s*[- ]?\\s*" + unit + "\\s*\\)\\s*", in: text)
+                text = replace(#"^(?:small|medium|large)\s+"#, in: text)
+                text = replace("^[- ]?" + unit + "\\b\\.?\\s*(?:of(?:\\s+|$))?", in: text)
+            }
+            if text == before { break }
+        }
+        text = replace(#"^(?:cans?|jars?|packets?|packages?)\s+(?:of\s+)?"#, in: text)
+        text = replace(#"\s*\([^)]*\)"#, in: text)
+        text = replace(#",\s*(?:(?:finely|roughly|freshly)\s+)?(?:chopped|diced|peeled|crushed|grated|sliced|drained|rinsed|divided|juiced|soaked|shredded|cleaned|to (?:taste|season)|for (?:garnish|serving)).*$"#, in: text)
+        text = text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.range(of: #"^(?:to taste|to season|as needed|optional|for serving)$"#, options: [.regularExpression, .caseInsensitive]) != nil { return nil }
+        return text.rangeOfCharacter(from: .letters) == nil ? nil : text
+    }
+
+    private static func replace(_ pattern: String, in text: String) -> String {
+        text.replacingOccurrences(of: pattern, with: "", options: [.regularExpression, .caseInsensitive])
+    }
 }
 
 struct PlaceAction: Codable, Identifiable {
@@ -351,6 +449,7 @@ struct ContentAction: Codable {
     let recipe: RecipeAction?
     let places: [PlaceAction]?
     enum CodingKeys: String, CodingKey { case kind, data }
+    init(places: [PlaceAction]) { kind = "places"; recipe = nil; self.places = places }
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         kind = try box.decode(String.self, forKey: .kind)
@@ -410,6 +509,19 @@ struct PostVisual: Codable {
     let detail: String?
     let sourceUrl: String?
     let licenseUrl: String?
+    var provider: String? = nil
+}
+
+struct PhotoCredit: Decodable {
+    let provider: String
+    let sourceUrl: String?
+    let authors: [PhotoAuthor]
+}
+
+struct PhotoAuthor: Decodable {
+    let displayName: String
+    let uri: String?
+    let photoUri: String?
 }
 
 struct PostAnalysis: Codable {
@@ -420,6 +532,91 @@ struct PostAnalysis: Codable {
     var sections: [PostSourceSection]? = nil
     var cookingSteps: [String]? = nil
     var venueFacts: VenueFacts? = nil
+    var liveVenue: LiveVenueReference? = nil
+    var venueWebsiteFields: WebsiteVenueFields? = nil
+}
+
+struct LiveVenueReference: Codable {
+    let placeId: String
+    let fields: [String]
+}
+
+struct WebsiteVenueFields: Codable {
+    let values: VenueFieldSet
+    let sourceUrl: String
+}
+
+struct VenueFieldSet: Codable {
+    var website: String? = nil
+    var phone: String? = nil
+    var location: String? = nil
+    var rating: String? = nil
+    var hours: String? = nil
+    var reviews: VenueReviewData? = nil
+}
+
+struct VenueReviewData: Codable {
+    var summary: String? = nil
+    var disclosure: String? = nil
+    var sourceUrl: String? = nil
+    var items: [VenueReviewItem]? = nil
+}
+
+struct VenueReviewItem: Codable {
+    let text: String
+    let author: String?
+    let authorUrl: String?
+    let avatarUrl: String?
+    let sourceUrl: String?
+}
+
+struct LiveVenueDetails: Decodable {
+    let fields: VenueFieldSet
+    let sources: [String: String]
+    let sourceUrl: String?
+}
+
+extension Post {
+    func venueFields(live: LiveVenueDetails?) -> VenueFieldSet {
+        var fields = analysis?.venueWebsiteFields?.values ?? VenueFieldSet()
+        if let extra = live?.fields {
+            fields.website = fields.website ?? extra.website
+            fields.phone = fields.phone ?? extra.phone
+            fields.location = fields.location ?? extra.location
+            fields.rating = fields.rating ?? extra.rating
+            fields.hours = fields.hours ?? extra.hours
+            fields.reviews = fields.reviews ?? extra.reviews
+        }
+        return fields
+    }
+
+    func venueActionPost(live: LiveVenueDetails?) -> Post {
+        var display = self
+        let fields = venueFields(live: live)
+        if let original = contentAction?.places?.first {
+            let address = original.address?.isEmpty == false ? original.address : fields.location
+            let place = PlaceAction(name: original.name, address: address, sourceUrl: original.sourceUrl,
+                mapUrl: original.address?.isEmpty == false ? original.mapUrl : (live?.sourceUrl ?? original.mapUrl),
+                websiteUrl: original.websiteUrl ?? fields.website, identityKnown: original.identityKnown)
+            display.contentAction = ContentAction(places: [place] + Array((contentAction?.places ?? []).dropFirst()))
+        }
+        var links = linkActions ?? []
+        if let website = fields.website { links.append(PostLinkAction(kind: "website", label: "Website", url: website)) }
+        if let phone = fields.phone, !links.contains(where: { $0.kind == "phone" }) {
+            let digits = phone.filter { $0.isNumber || $0 == "+" }
+            let action = PostLinkAction(kind: "phone", label: "Call", url: "tel:" + digits)
+            if action.destination != nil { links.append(action) }
+        }
+        display.linkActions = PostLinkAction.consolidated(links)
+        return display
+    }
+
+    func displayVenueFacts(live: LiveVenueDetails?) -> VenueFacts? {
+        let fields = venueFields(live: live)
+        let rating = analysis?.venueFacts?.rating ?? fields.rating
+        let hours = analysis?.venueFacts?.hours ?? fields.hours
+        return rating == nil && hours == nil ? nil : VenueFacts(rating: rating, hours: hours)
+    }
 }
 
 struct VenueFacts: Codable {

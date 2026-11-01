@@ -37,7 +37,8 @@ struct RootView: View {
     var body: some View {
         Group {
             if model.account == nil {
-                AuthView()
+                if let email = model.unverifiedProfileEmail { UnverifiedProfileView(email: email) }
+                else { AuthView() }
             } else {
                 nativeTabs
             }
@@ -64,6 +65,7 @@ struct RootView: View {
             }
         }
         .modifier(NewsletterConfirmationPresenter())
+        .modifier(BiggieChatPresenter())
         .modifier(WelcomeGuidePresenter())
         .task(id: model.account?.id) {
             guard model.account != nil else { return }
@@ -349,6 +351,7 @@ struct PostDetail: View {
     let post: Post
     @State private var share: ShareResult?
     @State private var abstractExpanded = true
+    @State private var liveVenue: LiveVenueDetails?
 
     private var current: Post {
         model.feed?.posts.first(where: { $0.id == post.id }) ?? model.readFeed?.posts.first(where: { $0.id == post.id }) ?? model.bookmarks.first(where: { $0.id == post.id }) ?? post
@@ -395,7 +398,8 @@ struct PostDetail: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let caveat = current.sourceCaveat { Text(caveat).foregroundStyle(.secondary) }
-                VenueFactsView(facts: current.analysis?.venueFacts)
+                VenueFactsView(facts: current.displayVenueFacts(live: nil))
+                LiveVenueDetailsView(details: liveVenue)
                 Text("From \(current.source.name)").font(.caption)
                 Divider()
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -407,14 +411,14 @@ struct PostDetail: View {
                         .disabled(current.read)
                         .accessibilityLabel(current.read ? "Marked as read" : "Mark as read")
                         .accessibilityIdentifier("post.markRead")
-                        if !current.isEmailSource {
+                        if current.status == "approved" {
                             Button { Task { share = await model.share(current) } } label: {
                                 Image(systemName: "square.and.arrow.up").modifier(PostActionPill())
                             }
-                            .accessibilityLabel("Share original source")
+                            .accessibilityLabel("Share post")
                             .accessibilityIdentifier("post.share")
                         }
-                        PostContextActionView(post: current)
+                        PostContextActionView(post: current.venueActionPost(live: liveVenue))
                         Button { Task { await model.bookmark(current) } } label: {
                             Image(systemName: current.bookmarked ? "bookmark.fill" : "bookmark")
                                 .modifier(BookmarkButtonSizing())
@@ -427,18 +431,25 @@ struct PostDetail: View {
         }
         .background(.background)
         .navigationTitle("Post")
+        .task(id: post.id) { liveVenue = await model.venueDetails(current) }
         .sheet(item: $share) { result in
             VStack(alignment: .leading, spacing: 18) {
-                Text(result.mode == "public-preview" ? "Share preview" : "Share original source").font(.title2.bold())
-                if result.localOnly { Text("This prototype link opens only on this Mac or its iPhone simulator. Public hosting comes later.").foregroundStyle(.secondary) }
-                else { Text("This post is private. Only its original source URL will be shared.") }
+                Text("Share post").font(.title2.bold())
+                Text("Anyone with this link can read this post and its images. Your emails, account details and Biggie chat stay private.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                if result.localOnly { Text("This link is hosted by your local test backend.").font(.caption).foregroundStyle(.secondary) }
                 Text(result.url).textSelection(.enabled)
                 if let url = URL(string: result.url) {
-                    ShareLink(item: url)
-                    Link("Open link", destination: url)
+                    HStack(spacing: 12) {
+                        ShareLink(item: url).buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(.blue)
+                        Link("Open link", destination: url).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    }
                 }
+                Button("Stop sharing", role: .destructive) {
+                    Task { if await model.stopSharing(current) { share = nil } }
+                }.buttonStyle(.bordered).buttonBorderShape(.capsule)
                 Button("Done") { share = nil }
-            }.padding(30).frame(minWidth: 320, minHeight: 280)
+            }.padding(26).frame(minWidth: 320, minHeight: 300)
         }
     }
 }
@@ -657,10 +668,21 @@ struct SourcesView: View {
                 AccountOptionRow(title: "Profile", symbol: "person.crop.circle")
             }.buttonStyle(.plain)
             RowDivider()
+            NavigationLink { PersonalizationView() } label: {
+                AccountOptionRow(title: "Interests & newsletter picks", symbol: "heart.text.square")
+            }.buttonStyle(.plain)
+            RowDivider()
             NavigationLink { ManageAccountView() } label: {
                 AccountOptionRow(title: "Manage account", symbol: "lock.shield")
             }.buttonStyle(.plain)
             RowDivider()
+            if model.account?.privateMuseEnabled == true {
+                SectionHeader("Connections")
+                NavigationLink { MuseConnectionView() } label: {
+                    AccountOptionRow(title: "Connect with Muse", symbol: "link", imageName: "MetaMark")
+                }.buttonStyle(.plain)
+                RowDivider()
+            }
             SectionHeader("Appearance")
             Toggle(isOn: Binding(get: {
                 appearance == "system" ? colorScheme == .dark : appearance == "dark"

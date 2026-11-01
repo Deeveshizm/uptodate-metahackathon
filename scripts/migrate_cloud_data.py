@@ -55,6 +55,9 @@ def main():
         target.execute((ROOT/'supabase/migrations/20261029000400_newsletter_confirmations.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261030000100_legacy_relay_aliases.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261030000200_revoked_relay_aliases.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261030000300_newsletter_signup_codes.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261101000100_private_muse_connector.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261101000300_post_share_pages.sql').read_text())
     headers={'apikey':values['SUPABASE_SECRET_KEY'],'Authorization':'Bearer '+values['SUPABASE_SECRET_KEY']}
     bucket=values.get('POST_IMAGE_BUCKET','post-images')
     origin=values['SUPABASE_URL'].rstrip('/')

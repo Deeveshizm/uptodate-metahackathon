@@ -6,12 +6,21 @@ import UIKit
 struct NewsletterComposerView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var draft = NewsletterPromptDraft()
-    @State private var sharedPrompt: NewsletterPromptShare?
     @State private var copyNotice: String?
+    @State private var noticeVersion = 0
     @State private var guideTarget: NewsletterGuideTarget?
+
+    private var museIsConnected: Bool {
+        model.account?.privateMuseEnabled == true && model.museConnectionStatus?.isVerified == true
+    }
+
+    private var directPrompt: String? {
+        guard museIsConnected else { return nil }
+        return draft.prompt(alias: "", timezone: TimeZone.current.identifier, useExistingMuseConnection: true)
+    }
 
     private var prompt: String? {
         guard model.account?.aliasStatus == "active", let alias = model.account?.alias else { return nil }
@@ -42,31 +51,53 @@ struct NewsletterComposerView: View {
                     }
                 }
             }
-            .sheet(item: $sharedPrompt) { item in
-                #if os(iOS)
-                NewsletterPromptActivity(text: item.text)
-                #else
-                ShareLink(item: item.text) { Label("Share prompt", systemImage: "square.and.arrow.up") }
-                    .padding(28)
-                #endif
+            .overlay(alignment: .bottom) {
+                if let copyNotice {
+                    Text(copyNotice)
+                        .font(.footnote.weight(.medium)).multilineTextAlignment(.center)
+                        .padding(.horizontal, 18).padding(.vertical, 12)
+                        .background(.regularMaterial, in: Capsule())
+                        .overlay(Capsule().stroke(.primary.opacity(0.1), lineWidth: 0.5))
+                        .padding(.horizontal, 20).padding(.bottom, 24)
+                        .phaseAnimator([0.0, -5, 5, -3, 3, 0], trigger: noticeVersion) { content, offset in
+                            content.offset(x: reduceMotion ? 0 : offset)
+                        } animation: { _ in .easeInOut(duration: 0.08) }
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        .accessibilityIdentifier("newsletter.create.notice")
+                        .allowsHitTesting(false)
+                }
+            }
+            .task(id: noticeVersion) {
+                guard copyNotice != nil else { return }
+                do { try await Task.sleep(for: .seconds(3.5)) }
+                catch { return }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) { copyNotice = nil }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active, model.account?.privateMuseEnabled == true {
+                    Task { _ = await model.museConnection() }
+                }
             }
     }
 
     private func formScroll(_ reader: ScrollViewProxy) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                Text("Describe your newsletter. We'll prepare a prompt for Muse using your private newsletter address.")
+                Text(model.account?.privateMuseEnabled == true ? "Describe your newsletter and choose its schedule. Connect Muse in Profile → Connections to receive editions directly in UpToDate." : "Describe your newsletter. We'll prepare a prompt for Muse using your private newsletter address.")
                     .font(.subheadline).foregroundStyle(.secondary)
                 typeAndNameSection
                 detailsSection
                 scheduleSection
-                if model.account?.aliasStatus != "active" {
+                if model.account?.privateMuseEnabled == true, model.museConnectionStatus?.isVerified != true {
+                    Text("Finish connecting Muse in Profile → Connections to enable direct delivery. You can still share a prompt using your newsletter address.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else if model.account?.privateMuseEnabled != true, model.account?.aliasStatus != "active" {
                     Text("Your newsletter address needs to be ready before you can prepare a prompt.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 promptPreview
                 handoffActions.newsletterGuideTarget(.handoff)
-                Text("Choose Muse in the share sheet if available, or copy the prompt and paste it into Muse. Finish creating the schedule there. When the first email arrives, UpToDate will ask to add it under Custom.")
+                Text(model.account?.privateMuseEnabled == true ? "Share opens Muse with a copied request for delivery to your newsletter email address. Create Directly uses your existing Muse connection without email. Paste the request in Muse and confirm the schedule there." : "Share opens Muse with your email newsletter request copied. Paste it there and confirm the schedule. You can also copy the request for another AI app. When the first email arrives, UpToDate will ask to add it under Custom.")
                     .font(.footnote).foregroundStyle(.secondary)
             }.padding(20).frame(maxWidth: FeedStyle.feedWidth).frame(maxWidth: .infinity)
         }
@@ -77,6 +108,7 @@ struct NewsletterComposerView: View {
             withAnimation(reduceMotion ? nil : .smooth(duration: 0.25)) { reader.scrollTo(target, anchor: .center) }
         }
         .task(id: model.account?.id) {
+            if model.account?.privateMuseEnabled == true { _ = await model.museConnection() }
             await model.prepareGuides()
             if !Task.isCancelled, model.account != nil, !model.completedGuides.contains(.createNewsletter) { guideTarget = .kind }
         }
@@ -128,7 +160,7 @@ struct NewsletterComposerView: View {
 
     @ViewBuilder private var promptPreview: some View {
         if let prompt {
-            DisclosureGroup("Preview prompt") {
+            DisclosureGroup("Preview email prompt") {
                 Text(prompt).font(.footnote).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)
             }.font(.subheadline).tint(.primary).accessibilityIdentifier("newsletter.create.preview")
@@ -176,60 +208,68 @@ struct NewsletterComposerView: View {
     }
 
     private var handoffActions: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            #if os(iOS)
+        HStack(spacing: 10) {
+            if model.account?.privateMuseEnabled == true {
+                Button(action: createDirectly) {
+                    HStack(spacing: 6) {
+                        Text("Create Directly with").lineLimit(1).minimumScaleFactor(0.75)
+                        Image("MuseMark").resizable().renderingMode(.template)
+                            .scaledToFit().frame(width: 20, height: 20)
+                            .opacity(museIsConnected ? 1 : 0.5)
+                    }.font(.system(size: 14, weight: .medium))
+                        .padding(.horizontal, 12).frame(maxWidth: .infinity, minHeight: 44)
+                        .foregroundStyle(museIsConnected ? Color.white : Color.secondary)
+                        .background(museIsConnected ? .blue : Color.primary.opacity(0.09), in: Capsule())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel("Create directly with Muse")
+                    .accessibilityValue(museIsConnected ? "Connected" : "Unavailable until Muse is connected")
+                    .accessibilityHint(museIsConnected ? "Copies your request and opens Muse to confirm the schedule" : "Connect with Muse in Profile, Connections first")
+                    .accessibilityIdentifier("newsletter.create.direct")
+            }
+            Button(action: shareEmailRequest) {
+                Image(systemName: "square.and.arrow.up").font(.system(size: 16, weight: .medium))
+                    .frame(width: 44, height: 44).foregroundStyle(.white).background(.blue, in: Circle())
+            }.buttonStyle(.plain).disabled(prompt == nil)
+                .opacity(prompt == nil ? 0.45 : 1)
+                .accessibilityLabel("Open Muse with an email newsletter request")
+                .accessibilityHint("Copies a prompt that sends editions to your UpToDate newsletter address")
+                .accessibilityIdentifier("newsletter.create.share")
             Button {
                 guard let prompt else { return }
-                sharedPrompt = NewsletterPromptShare(text: prompt)
+                copyText(prompt)
+                showNotice("Email newsletter prompt copied.")
             } label: {
-                Label("Share with Muse", systemImage: "square.and.arrow.up")
-                    .modifier(CapsuleButtonLabelSizing())
-            }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(.blue)
-                .disabled(prompt == nil).accessibilityIdentifier("newsletter.create.share")
-            #else
-            if let prompt {
-                ShareLink(item: prompt) {
-                    Label("Share prompt", systemImage: "square.and.arrow.up")
-                        .modifier(CapsuleButtonLabelSizing())
-                }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(.blue)
-            }
-            #endif
-            HStack(spacing: 12) {
-                Button {
-                    guard let prompt else { return }
-                    copyText(prompt)
-                    copyNotice = "Prompt copied. Paste it in Muse to finish setup."
-                } label: {
-                    Label("Copy prompt", systemImage: "doc.on.doc").modifier(CapsuleButtonLabelSizing(fontSize: 12))
-                }.accessibilityIdentifier("newsletter.create.copy")
-                Button {
-                    guard let prompt else { return }
-                    copyText(prompt)
-                    copyNotice = "Prompt copied. Paste it in Muse to finish setup."
-                    openURL(URL(string: "https://muse.ai/")!)
-                } label: {
-                    Label("Open Muse", systemImage: "arrow.up.forward.app").modifier(CapsuleButtonLabelSizing(fontSize: 12))
-                }.accessibilityIdentifier("newsletter.create.open")
-            }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(prompt == nil)
-            if let copyNotice {
-                Text(copyNotice).font(.caption).foregroundStyle(.secondary)
-                    .accessibilityIdentifier("newsletter.create.notice")
-            }
+                Image(systemName: "doc.on.doc").font(.system(size: 16, weight: .medium))
+                    .frame(width: 44, height: 44).background(.primary.opacity(0.07), in: Circle())
+            }.buttonStyle(.plain).disabled(prompt == nil).opacity(prompt == nil ? 0.45 : 1)
+                .accessibilityLabel("Copy email newsletter prompt")
+                .accessibilityIdentifier("newsletter.create.copy")
         }
     }
-}
 
-private struct NewsletterPromptShare: Identifiable {
-    let id = UUID()
-    let text: String
-}
-
-#if os(iOS)
-private struct NewsletterPromptActivity: UIViewControllerRepresentable {
-    let text: String
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    private func shareEmailRequest() {
+        guard let prompt else { return }
+        copyText(prompt)
+        showNotice("Email newsletter request copied. Paste it in Muse.")
+        MuseHandoff.openChat { showNotice("Request copied. Open Muse and paste it into a chat.") }
     }
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+
+    private func createDirectly() {
+        guard museIsConnected else {
+            showNotice("Connect with Muse first in Profile → Connections.")
+            return
+        }
+        guard let directPrompt else {
+            showNotice("Add a newsletter name and what it should cover first.")
+            return
+        }
+        copyText(directPrompt)
+        showNotice("Request copied. Paste it in Muse to create your newsletter.")
+        MuseHandoff.openChat { showNotice("Request copied. Open the Muse app and paste it into a chat.") }
+    }
+
+    private func showNotice(_ text: String) {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { copyNotice = text }
+        noticeVersion += 1
+    }
 }
-#endif

@@ -28,7 +28,7 @@ def email_documents(payload):
     author=payload.get('source_name') or payload.get('sender','Email sender')
     if author==payload.get('sender','').rsplit('@',1)[-1]:author=payload.get('sender','Email sender')
     document.metadata.update(private=True,format='email',author=author,
-                             email_text=payload['text'],email_subject=payload['subject'])
+                             email_text=payload['text'],email_subject=payload['subject'],email_sender=payload.get('sender',''))
     for index, image_url in enumerate(payload.get('image_urls',[])[:8]):
         document.figures.append({'id':f'email-photo-{index}','url':image_url,'caption':'Photo linked in '+payload['subject'],
                                 'license_url':'','page':None,'selection_basis':'email_photo_reference'})

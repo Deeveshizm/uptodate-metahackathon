@@ -92,7 +92,7 @@ def main():
     if not args.image or not args.image.startswith(repository+':'):
         raise RuntimeError('Supply --image with the exact tag produced by the build command')
     secrets={}
-    for name in [*required,'RESEND_API_KEY','CLOUDFLARE_INGEST_SECRET']:
+    for name in [*required,'RESEND_API_KEY','CLOUDFLARE_INGEST_SECRET','GOOGLE_PLACES_API_KEY']:
         if not values.get(name):continue
         # URL and publishable key are public configuration, not secret resources.
         if name in ['SUPABASE_URL','SUPABASE_PUBLISHABLE_KEY']:continue
@@ -120,6 +120,10 @@ def main():
     receiving_domain=values.get('RESEND_RECEIVING_DOMAIN') or values.get('RELAY_TEST_DOMAIN')
     if receiving_domain:plain['RESEND_RECEIVING_DOMAIN']=receiving_domain
     for name in ['CLOUDFLARE_RECEIVING_DOMAIN','CLOUDFLARE_RECEIVING_ENABLED']:
+        if values.get(name):plain[name]=values[name]
+    if values.get('GOOGLE_PLACES_API_KEY'):
+        plain['GOOGLE_PLACES_PHOTOS_ENABLED']=values.get('GOOGLE_PLACES_PHOTOS_ENABLED','0')
+    for name in ['PRIVATE_MUSE_CONNECTOR_ENABLED','PRIVATE_MUSE_USER_ID','PRIVATE_MUSE_EMAIL','PRIVATE_MUSE_ACCOUNTS','PUBLIC_POLICIES_ENABLED','PUBLIC_DEVELOPER_NAME','PUBLIC_SUPPORT_EMAIL','PUBLIC_SITE_ORIGIN','APP_INSTALL_URL']:
         if values.get(name):plain[name]=values[name]
     with tempfile.TemporaryDirectory(prefix='uptodate-run-') as directory:
         env_path=Path(directory)/'environment.json'
