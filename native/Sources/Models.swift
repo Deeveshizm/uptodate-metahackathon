@@ -512,13 +512,13 @@ struct PostVisual: Codable {
     var provider: String? = nil
 }
 
-struct PhotoCredit: Decodable {
+struct PhotoCredit: Decodable, Sendable, Equatable {
     let provider: String
     let sourceUrl: String?
     let authors: [PhotoAuthor]
 }
 
-struct PhotoAuthor: Decodable {
+struct PhotoAuthor: Decodable, Sendable, Equatable {
     let displayName: String
     let uri: String?
     let photoUri: String?

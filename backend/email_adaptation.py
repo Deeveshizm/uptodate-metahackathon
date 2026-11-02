@@ -9,6 +9,11 @@ from .venue_facts import venue_facts
 def preserve_short_email(document):
     if document.metadata.get('format') not in ('email','connector'):
         return None
+    from .editorial import source_category
+    if source_category(document)=='recipe':
+        # Short recipes still need separate ingredients and full directions;
+        # the prose-only recommendation fast path cannot supply those fields.
+        return None
     if document.metadata.get('venue_reviews'):
         # New review evidence needs a grounded draft and an independent check.
         return None
@@ -55,6 +60,8 @@ def preserve_short_email(document):
     minimum = 3 if any(place.get('name') and place.get('identity_known') is not False for place in document.metadata.get('places', [])) else 25
     if not minimum <= len(body.split()) <= 160 or not re.search(r'[.!?]',body):return None
     title=document.title
+    known=[place for place in document.metadata.get('places',[]) if place.get('name') and place.get('identity_known') is not False]
+    if len(known)==1:title=known[0]['name']
     suffix=title.split(':',1)[-1].strip() if ':' in title else ''
     if suffix and suffix.casefold() in body.casefold():title=suffix
     if not 5 <= len(title) <= 130:return None

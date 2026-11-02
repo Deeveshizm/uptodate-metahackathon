@@ -6,7 +6,26 @@ from urllib.parse import urlsplit
 
 from .documents import Document, make_spans, normalize, parse_document
 from .retrieval import Resource
-from .locations import email_places, map_link
+from .locations import email_places, map_link, labelled_fields, NAME_LABELS
+
+
+def single_venue_sections(document, sections, places):
+    """Supporting headings in one recommendation are not separate stories."""
+    if len(places) != 1 or places[0].get('identity_known') is False:return False
+    name=normalize(places[0].get('name','')).casefold()
+    if not name or not places[0].get('address'):return False
+    text='\n'.join(span['text'] for span in document.spans)
+    fields=labelled_fields(text)
+    # Repeated contact blocks or named venues indicate an actual list/digest.
+    addresses={normalize(value).casefold() for label,value in fields if label in ('address','where','location')}
+    names={normalize(value).casefold() for label,value in fields if label in NAME_LABELS}
+    if len(addresses)>1 or len(names)>1:return False
+    for heading in sections:
+        value=normalize(heading).casefold()
+        if name in value:continue
+        if re.fullmatch(r'(?:why (?:it|this|we)\b.*|(?:good morning[!,. ]*)?here is today.s\b.*|description|about(?: the (?:place|venue|recommendation))?|what to (?:try|expect)|(?:opening )?hours|contact(?: details)?|rating|reviews?|highlights?|details|the pick)',value):continue
+        return False
+    return True
 
 
 def email_documents(payload):
@@ -43,7 +62,9 @@ def email_documents(payload):
     substantial={name:spans for name,spans in groups.items() if name not in ('Body','Email',payload['subject']) and not re.search(r'^(?:sources?|references?|footer|disclaimer|introduction|overview)$',name,re.I)
                  and sum(len(s['text']) for s in spans)>=200 and sum(len(s['text'].split()) for s in spans)>=30}
     originals=[document]
-    if len(substantial)>1:
+    if single_venue_sections(document,substantial,locations):
+        document.metadata['story_grouping']='single_venue_recommendation'
+    if len(substantial)>1 and document.metadata.get('story_grouping')!='single_venue_recommendation':
         originals=[]
         for name,spans in substantial.items():
             child=Document(url+'#'+hashlib.sha256(name.encode()).hexdigest()[:12],name,copy.deepcopy(spans),copy.deepcopy(document.links),copy.deepcopy(document.metadata),

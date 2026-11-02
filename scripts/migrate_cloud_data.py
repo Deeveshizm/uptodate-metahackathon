@@ -17,7 +17,7 @@ from scripts.cloud_settings import configure
 ROOT = Path(__file__).resolve().parents[1]
 TABLES = ['users','sources','jobs','generation_artifacts','posts','bookmarks','reads','shares',
           'documents','test_relay_aliases','test_relay_receipts','source_mail_actions','inbox_candidates',
-          'venue_photo_searches','post_sources','model_spend','post_assets','gallery_assets']
+          'venue_photo_searches','post_sources','model_spend','resource_usage','post_assets','gallery_assets']
 
 
 def migration_url(value):
@@ -58,6 +58,7 @@ def main():
         target.execute((ROOT/'supabase/migrations/20261030000300_newsletter_signup_codes.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261101000100_private_muse_connector.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261101000300_post_share_pages.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261102000100_resource_usage.sql').read_text())
     headers={'apikey':values['SUPABASE_SECRET_KEY'],'Authorization':'Bearer '+values['SUPABASE_SECRET_KEY']}
     bucket=values.get('POST_IMAGE_BUCKET','post-images')
     origin=values['SUPABASE_URL'].rstrip('/')
@@ -83,6 +84,8 @@ def main():
     source.row_factory=sqlite3.Row
     try:
         for table in TABLES:
+            if table=='resource_usage' and not source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                continue  # Immutable snapshots made before monthly metering.
             count=0
             primary=[row[1] for row in sorted(source.execute('PRAGMA table_info('+table+')'),key=lambda row:row[5]) if row[5]]
             for row in source.execute('SELECT * FROM '+table):

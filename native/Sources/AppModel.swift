@@ -27,7 +27,6 @@ final class AppModel: ObservableObject {
     private let biggieConversations = BiggieConversationStore()
     @Published private(set) var guideProgressReady = false
     @Published var offline = false
-    @Published private(set) var photoCredits: [String: PhotoCredit] = [:]
     @Published var authConfiguration: AuthConfiguration?
     @Published private(set) var recoveryReady = false
     @Published private(set) var pendingEmail: String?
@@ -43,6 +42,7 @@ final class AppModel: ObservableObject {
     private var guideSyncTask: Task<Void, Never>?
     private var lastIdleJobPoll = Date.distantPast
     private var imageCache: [String: Data] = [:]
+    private let imageRequests = ImageRequests()
     private let base: URL = {
         #if targetEnvironment(simulator)
         if let value = ProcessInfo.processInfo.environment["UPTODATE_TEST_API_URL"],
@@ -802,31 +802,40 @@ final class AppModel: ObservableObject {
     }
 
     func visualData(_ post: Post, visual: PostVisual? = nil) async -> Data? {
+        await visualResponse(post, visual: visual)?.data
+    }
+
+    func visualResponse(_ post: Post, visual: PostVisual? = nil) async -> ImageResponse? {
         guard let assetId = (visual ?? post.visual)?.assetId, let accountID = account?.id else { return nil }
+        let epoch = sessionEpoch
         let livePhoto = (visual ?? post.visual)?.provider == "google_places"
         let cacheKey = accountID + "-" + post.id + "-" + assetId
-        if !livePhoto, let data = imageCache[cacheKey] { return data }
+        if !livePhoto, let data = imageCache[cacheKey] { return ImageResponse(data: data, credit: nil) }
         guard assetId.allSatisfy({ $0.isHexDigit }) else { return nil }
         let directory = cache.deletingLastPathComponent().appendingPathComponent("images")
         let path = directory.appendingPathComponent(cacheKey + ".png")
-        if !livePhoto, let data = try? Data(contentsOf: path) { imageCache[cacheKey] = data; return data }
+        if !livePhoto, let data = try? Data(contentsOf: path) { imageCache[cacheKey] = data; return ImageResponse(data: data, credit: nil) }
         guard !offline else { return nil }
         do {
             let route = assetId == post.visual?.assetId ? "image" : "images/\(assetId)"
-            let data = try await request("v1/posts/\(post.id)/\(route)", timeout: livePhoto ? 60 : 15) { response in
-                if let value = response.value(forHTTPHeaderField: "X-UpToDate-Photo-Credit"),
-                   let encoded = Data(base64Encoded: value),
-                   let credit = try? self.decoder.decode(PhotoCredit.self, from: encoded) {
-                    self.photoCredits[assetId] = credit
+            let response = try await imageRequests.load(key: "\(epoch)|\(cacheKey)") {
+                var credit: PhotoCredit?
+                let data = try await self.request("v1/posts/\(post.id)/\(route)", timeout: livePhoto ? 60 : 15) { response in
+                    if let value = response.value(forHTTPHeaderField: "X-UpToDate-Photo-Credit"),
+                       let encoded = Data(base64Encoded: value) {
+                        credit = try? self.decoder.decode(PhotoCredit.self, from: encoded)
+                    }
                 }
+                return ImageResponse(data: data, credit: credit)
             }
-            guard account?.id == accountID else { return nil }
-            if livePhoto { return data }
+            guard account?.id == accountID, sessionEpoch == epoch, !Task.isCancelled else { return nil }
+            if livePhoto { return response.credit == nil ? nil : response }
+            let data = response.data
             if imageCache.count >= 20 { imageCache.removeAll() }
             imageCache[cacheKey] = data
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: path, options: [.atomic, .completeFileProtection])
-            return data
+            return response
         } catch { return nil }
     }
 
@@ -955,7 +964,7 @@ final class AppModel: ObservableObject {
         Session.clear()
         token = nil; account = nil; feed = nil; readFeed = nil; bookmarks = []; sources = []; review = []; jobs = []; inboxCandidates = []; newsletterConfirmations = []
         imageCache.removeAll()
-        photoCredits.removeAll()
+        imageRequests.cancelAll()
         avatarData = nil; loadedAvatarRevision = nil
         try? FileManager.default.removeItem(at: cache.deletingLastPathComponent().appendingPathComponent("avatar.png"))
         let images = cache.deletingLastPathComponent().appendingPathComponent("images")

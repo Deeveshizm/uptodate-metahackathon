@@ -132,6 +132,13 @@ CREATE TABLE IF NOT EXISTS model_spend (
  created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS model_spend_day ON model_spend(created_at);
+CREATE TABLE IF NOT EXISTS resource_usage (
+ id TEXT PRIMARY KEY REFERENCES model_spend(id) ON DELETE CASCADE,
+ provider TEXT NOT NULL, sku TEXT NOT NULL, period TEXT NOT NULL,
+ units INTEGER NOT NULL CHECK(units>0), free_cap INTEGER,
+ unit_price_usd REAL NOT NULL, created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS resource_usage_period ON resource_usage(provider,sku,period);
 """
 
 # Additive migrations preserve accounts created by the first prototype.

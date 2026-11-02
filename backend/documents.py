@@ -36,6 +36,46 @@ def recipe_instructions(value, depth=0):
     return []
 
 
+def recipe_card_metadata(soup, url, recipe=None):
+    """Read the current recipe's visible card, including script-free print pages."""
+    cards = soup.select('.wprm-recipe-container, .wprm-recipe, .tasty-recipes, [itemtype*="schema.org/Recipe"]')
+    # Nested schema markup describes the same card, not another recipe.
+    cards = [card for card in cards if not any(parent in cards for parent in card.parents)]
+    if not cards:return recipe
+    heading = soup.find('h1') or soup.title
+    title = normalize(heading.get_text(' ')) if heading else ''
+    expected = normalize((recipe or {}).get('name', '')).casefold()
+    def name(card):
+        node = card.select_one('.wprm-recipe-name, .tasty-recipes-title, [itemprop="name"]')
+        return normalize(node.get_text(' ')) if node else ''
+    def matches(card):
+        candidate = name(card).casefold()
+        return bool(candidate and (candidate == expected or not expected and candidate in title.casefold()))
+    matching = [card for card in cards if matches(card)]
+    if len(matching) == 1:card = matching[0]
+    elif len(cards) == 1 and not expected and not title:card = cards[0]
+    else:return recipe  # Never substitute a related recipe widget.
+    ingredients = [normalize(node.get_text(' ')).lstrip('▢☐ ').strip() for node in card.select(
+        '.wprm-recipe-ingredient, .tasty-recipes-ingredients li, [itemprop="recipeIngredient"]')]
+    nodes = card.select('.wprm-recipe-instruction-text, .tasty-recipes-instructions li')
+    if not nodes:
+        container = card.select_one('[itemprop="recipeInstructions"]')
+        if container:nodes = container.select('li') or [container]
+    steps = [normalize(node.get_text(' ')) for node in nodes if normalize(node.get_text(' '))]
+    result = dict(recipe or {})
+    if not result and ingredients and len(ingredients) <= 60:
+        result = {'name': name(card) or title, 'ingredients': ingredients, 'source_url': url}
+    description=card.select_one('.wprm-recipe-summary, .tasty-recipes-description, [itemprop="description"]')
+    if result and not result.get('description') and description:
+        value=normalize(description.get_text(' '))
+        if len(value)<=8000:result['description']=value
+    if result and not result.get('instructions') and steps:
+        if len(steps) > 60 or sum(map(len, steps)) > 20000:
+            result['instructions_unavailable_reason'] = 'Source instructions exceed the supported size'
+        else:result.update(instructions=steps, instruction_source='visible_recipe_card')
+    return result or recipe
+
+
 def publication_name(soup):
     site = soup.find("meta", attrs={"property": "og:site_name"})
     if site and site.get("content", "").strip():
@@ -185,6 +225,9 @@ def source_metadata(soup, url):
             ingredients = [normalize(v)[:300] for v in obj["recipeIngredient"][:60] if isinstance(v, str) and normalize(v)]
             if ingredients:
                 result["recipe"] = {"name": normalize(str(obj.get("name", "Recipe")))[:200], "ingredients": ingredients, "source_url": url}
+                if isinstance(obj.get('description'),str):
+                    description=normalize(BeautifulSoup(obj['description'],'html.parser').get_text(' ',strip=True))
+                    if len(description)<=8000:result['recipe']['description']=description
                 raw_images=obj.get('image',[])
                 raw_images=raw_images if isinstance(raw_images,list) else [raw_images]
                 by_id={node['@id']:node for node in objects if isinstance(node.get('@id'),str)}
@@ -202,8 +245,10 @@ def source_metadata(soup, url):
                     images.sort(key=lambda image:bool(re.search(r'-\d+x\d+\.[a-z]+$',urlsplit(image).path,re.I)))
                     result['recipe']['images']=images[:1]
                 instructions=recipe_instructions(obj.get('recipeInstructions'))
-                if len(instructions)<=30 and sum(len(step) for step in instructions)<=12000:
+                if len(instructions)<=60 and sum(len(step) for step in instructions)<=20000:
                     result['recipe']['instructions']=instructions
+                else:
+                    result['recipe']['instructions_unavailable_reason']='Source instructions exceed the supported size'
         if any(kind in kinds for kind in ("Place", "LocalBusiness", "Restaurant", "CafeOrCoffeeShop")):
             address = obj.get("address")
             if isinstance(address, dict):
@@ -212,6 +257,8 @@ def source_metadata(soup, url):
                 result.setdefault("places", []).append({"name": normalize(obj["name"])[:200], "address": normalize(address)[:500], "source_url": url})
             if isinstance(obj.get('telephone'), str):
                 result.setdefault('contact_links', []).append({'url': 'tel:' + obj['telephone'], 'context': ''})
+    recipe=recipe_card_metadata(soup,url,result.get('recipe'))
+    if recipe:result['recipe']=recipe
     return result
 
 
@@ -298,6 +345,16 @@ def parse_document(resource: Resource) -> Document:
     if steps:
         chunks.append(('Recipe instructions: '+' '.join(f'{index}. {step}' for index,step in enumerate(steps,1)),'Instructions',None))
     spans = make_spans(chunks)
+    ingredients=(metadata.get('recipe') or {}).get('ingredients',[])
+    if ingredients:
+        spans.append({'id':'recipe-ingredients','text':'Recipe ingredients: '+'; '.join(ingredients),
+                      'section':'Ingredients','page':None,'source_kind':'recipe_ingredients'})
+    description=(metadata.get('recipe') or {}).get('description')
+    if description:
+        spans.append({'id':'recipe-description','text':description,'section':'Description',
+                      'page':None,'source_kind':'recipe_description'})
+    spans.extend({'id':f'recipe-instruction-{index}','text':step,'section':'Instructions',
+                  'page':None,'source_kind':'recipe_instructions'} for index,step in enumerate(steps,1))
     content="\n".join(normalize(chunk[0]) for chunk in chunks)
     if metadata.get('recipe'):
         content+='\n'+json.dumps({key:value for key,value in metadata['recipe'].items() if key not in ('source_url','images')},sort_keys=True,ensure_ascii=False)

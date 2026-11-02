@@ -11,6 +11,7 @@ import httpx
 
 from .retrieval import PublicFetcher, SourceError
 from .venue_identity import matches_place
+from .resource_usage import GOOGLE_PLACES_RATES
 
 REFERENCE_TYPE = 'application/x-uptodate-google-place'
 REFERENCE_PREFIX = b'uptodate-google-place-v1:'
@@ -97,13 +98,14 @@ class GooglePlacesPhotos:
         except (ValueError,TypeError):
             raise SourceError('Google Maps photos returned an invalid response') from None
 
-    def _paid_json(self, price, budget, *args, **kwargs):
-        reservation=budget.reserve(price) if budget else None
+    def _resource_json(self, sku, budget, *args, **kwargs):
+        if not self.key:raise SourceError('Google Maps photos are not configured')
+        reservation=budget.reserve_resource(GOOGLE_PLACES_RATES[sku]) if budget else None
         try:result=self._json(*args,**kwargs)
         except PlacesRejected as error:
-            if budget and error.status in (400,401,402,403,404,422,429):budget.settle(reservation,0)
+            if budget and error.status in (400,401,402,403,404,422,429):budget.settle_resource(reservation,rejected=True)
             raise
-        if budget:budget.settle(reservation,price)
+        if budget:budget.settle_resource(reservation)
         return result
 
     def lookup(self, place, fields, budget=None, place_id=None):
@@ -117,13 +119,12 @@ class GooglePlacesPhotos:
             if row:
                 values=json.loads(row['pages'])
                 if values and isinstance(values[0],str) and PLACE_ID.fullmatch(values[0]):place_id=values[0]
-        tier=0.025 if fields & {'reviews','reviewSummary'} else 0.020 if fields & {'rating','userRatingCount','regularOpeningHours','internationalPhoneNumber'} else 0.017
+        tier='enterprise_atmosphere' if fields & {'reviews','reviewSummary'} else 'enterprise' if fields & {'rating','userRatingCount','regularOpeningHours','internationalPhoneNumber'} else 'pro'
         if place_id and PLACE_ID.fullmatch(place_id):
-            found=self._paid_json(tier,budget,'GET','places/'+place_id,fields=','.join(sorted(fields)))
+            found=self._resource_json('place_details_'+tier,budget,'GET','places/'+place_id,fields=','.join(sorted(fields)))
             candidates=[found]
         else:
-            price=0.040 if tier==0.025 else 0.035 if tier==0.020 else 0.032
-            result=self._paid_json(price,budget,'POST','places:searchText',fields=','.join('places.'+field for field in sorted(fields)),
+            result=self._resource_json('text_search_'+tier,budget,'POST','places:searchText',fields=','.join('places.'+field for field in sorted(fields)),
                                    body={'textQuery':place['name']+', '+place['address'],'pageSize':3})
             candidates=result.get('places',[])
         if not isinstance(candidates,list):raise SourceError('Google Maps returned invalid place results')
@@ -172,7 +173,7 @@ class GooglePlacesPhotos:
         if value is None:raise SourceError('Invalid Google Maps photo reference')
         place_id,index=value['place_id'],value['index']
         # Photo names expire and must be obtained afresh for each display.
-        result=self._json('GET','places/'+place_id,fields='photos')
+        result=self._resource_json('place_details_ids_only',budget,'GET','places/'+place_id,fields='photos')
         photos=result.get('photos',[])
         if not isinstance(photos,list) or index>=len(photos):raise SourceError('This Google Maps photo is no longer available')
         photo=photos[index]
@@ -180,7 +181,7 @@ class GooglePlacesPhotos:
         name=photo.get('name','')
         if not isinstance(name,str) or not PHOTO_NAME.fullmatch(name) or not name.startswith('places/'+place_id+'/photos/'):
             raise SourceError('Invalid Google Maps photo response')
-        media=self._paid_json(0.007,budget,'GET',name+'/media',params={'maxWidthPx':1200,'maxHeightPx':1200,'skipHttpRedirect':'true'})
+        media=self._resource_json('place_photos',budget,'GET',name+'/media',params={'maxWidthPx':1200,'maxHeightPx':1200,'skipHttpRedirect':'true'})
         uri=media.get('photoUri','')
         parts=urlsplit(uri) if isinstance(uri,str) else None
         host=parts.hostname if parts else ''

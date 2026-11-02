@@ -11,6 +11,7 @@ struct PostVisualView: View {
     var onSelect: (() -> Void)? = nil
     @State private var selected: Int? = 0
     @State private var aspectRatios: [String: CGFloat] = [:]
+    @State private var photoCredits: [String: PhotoCredit] = [:]
     private var selection: Int { selected ?? 0 }
     private var aspectRatio: CGFloat {
         let ratio = post.gallery.first?.assetId.flatMap { aspectRatios[$0] }
@@ -22,8 +23,11 @@ struct PostVisualView: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
                         ForEach(Array(post.gallery.enumerated()), id: \.offset) { index, visual in
-                            VisualPage(post: post, visual: visual, size: geometry.size, onSelect: onSelect) { ratio in
-                                if let id = visual.assetId { aspectRatios[id] = ratio }
+                            VisualPage(post: post, visual: visual, size: geometry.size, onSelect: onSelect) { ratio, credit in
+                                if let id = visual.assetId {
+                                    aspectRatios[id] = ratio
+                                    photoCredits[id] = credit
+                                }
                             }
                                 .frame(width: geometry.size.width, height: geometry.size.height)
                                 .clipped().id(index)
@@ -65,6 +69,11 @@ struct PostVisualView: View {
                         .font(.caption2).foregroundStyle(.secondary).padding(.horizontal, inset)
                         .onTapGesture { onSelect?() }
                 }
+                if let id = visual.assetId, aspectRatios[id] != nil,
+                   let credit = photoCredits[id] {
+                    GooglePhotoCreditCard(credit: credit)
+                        .padding(.horizontal, inset).padding(.top, 4)
+                }
             }
         }
     }
@@ -76,7 +85,7 @@ private struct VisualPage: View {
     let visual: PostVisual
     let size: CGSize
     var onSelect: (() -> Void)? = nil
-    var onAspectRatio: (CGFloat) -> Void
+    var onAspectRatio: (CGFloat, PhotoCredit?) -> Void
     @State private var data: Data?
     #if os(iOS)
     @State private var renderedImage: UIImage?
@@ -84,50 +93,53 @@ private struct VisualPage: View {
     @State private var renderedImage: Image?
     #endif
     @State private var finished = false
+    @State private var retryID = 0
     @State private var zoomAnchor: UnitPoint = .center
     @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.3, dampingFraction: 0.72))) private var zoomScale: CGFloat = 1
     var body: some View {
-        Group {
-            if let onSelect {
-                page.onTapGesture(perform: onSelect)
-                    .accessibilityAddTraits(.isButton)
-                    .accessibilityAction { onSelect() }
-            } else {
-                page
-            }
-        }
-        .task(id: visual.assetId) {
+        page
+        .task(id: "\(visual.assetId ?? "")|\(retryID)") {
             finished = false
-            data = await model.visualData(post, visual: visual)
+            data = nil
+            renderedImage = nil
+            let response = await model.visualResponse(post, visual: visual)
+            data = response?.data
             renderedImage = data.flatMap(platformImage)
-            if let data, let ratio = imageAspectRatio(data) { onAspectRatio(ratio) }
+            if let data, let ratio = imageAspectRatio(data) { onAspectRatio(ratio, response?.credit) }
             finished = true
         }
+    }
+    @ViewBuilder
+    private func selectable<Content: View>(_ content: Content) -> some View {
+        if let onSelect {
+            content.contentShape(Rectangle()).onTapGesture(perform: onSelect)
+                .accessibilityAddTraits(.isButton).accessibilityAction { onSelect() }
+        } else { content }
     }
     private var page: some View {
         Group {
             if let image = renderedImage {
                 #if os(iOS)
-                PinchPanImage(image: image).frame(width: size.width, height: size.height)
+                selectable(PinchPanImage(image: image).frame(width: size.width, height: size.height))
                 #else
-                image.resizable()
+                selectable(image.resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(width: size.width, height: size.height)
-                    .clipped()
+                    .clipped())
                 #endif
             } else if !finished {
-                ProgressView("Loading source visual").frame(maxWidth: .infinity, minHeight: 180)
+                selectable(ProgressView("Loading source visual").frame(maxWidth: .infinity, minHeight: 180))
             } else {
-                Text("Image unavailable. Open the original source or reconnect to load it.")
-                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 100)
+                VStack(spacing: 10) {
+                    selectable(Text("Image unavailable. Open the original source or reconnect to load it.")
+                        .font(.caption).foregroundStyle(.secondary))
+                    Button("Try again") { retryID += 1 }
+                        .font(.caption).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                        .disabled(model.offline).accessibilityIdentifier("post.image.retry")
+                }.frame(maxWidth: .infinity, minHeight: 100)
             }
         }
         .contentShape(Rectangle())
-        .overlay(alignment: .bottomLeading) {
-            if data != nil, let id = visual.assetId, let credit = model.photoCredits[id] {
-                GooglePhotoCreditView(credit: credit).padding(8)
-            }
-        }
         #if os(macOS)
         .scaleEffect(zoomScale, anchor: zoomAnchor)
         .simultaneousGesture(
@@ -141,37 +153,6 @@ private struct VisualPage: View {
         #endif
         .accessibilityLabel(visual.caption ?? "Post image")
         .accessibilityHint(onSelect == nil ? "Pinch to zoom, drag to move; release to reset" : "Open full post. Pinch to zoom, drag to move; release to reset")
-    }
-}
-private struct GooglePhotoCreditView: View {
-    let credit: PhotoCredit
-    private func webURL(_ value: String?) -> URL? {
-        guard let value, let url = URL(string: value.hasPrefix("//") ? "https:" + value : value),
-              url.scheme == "https", url.host != nil else { return nil }
-        return url
-    }
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            if let source = webURL(credit.sourceUrl) {
-                Link("Google Maps", destination: source)
-            } else { Text("Google Maps") }
-            ForEach(Array(credit.authors.enumerated()), id: \.offset) { _, author in
-                HStack(spacing: 4) {
-                    if let avatar = webURL(author.photoUri) {
-                        AsyncImage(url: avatar) { image in image.resizable().scaledToFill() }
-                            placeholder: { Color.clear }
-                            .frame(width: 16, height: 16).clipShape(Circle())
-                    }
-                    if let profile = webURL(author.uri) {
-                        Link(author.displayName, destination: profile)
-                    } else { Text(author.displayName) }
-                }
-            }
-        }
-        .font(.system(size: 12, weight: .regular)).foregroundStyle(.primary)
-        .padding(.horizontal, 9).padding(.vertical, 6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .accessibilityElement(children: .contain)
     }
 }
 private func imageAspectRatio(_ data: Data) -> CGFloat? {

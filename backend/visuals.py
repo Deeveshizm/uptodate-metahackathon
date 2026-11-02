@@ -434,18 +434,25 @@ def venue_photo_candidates(soup, region, structured):
         if parent and re.search(r'\.(?:jpe?g|png|webp)(?:\?|$)', parent.get('href',''), re.I):
             candidates.append({'url':parent['href'], 'alt':node.get('alt','')})
         # Responsive and lazy-loaded markup often exposes only a tiny src.
-        srcset = node.get('data-srcset') or node.get('srcset','')
         variants = []
-        for entry in srcset.split(','):
-            parts = entry.strip().split()
-            if not parts:continue
-            try:rank = float(parts[-1].rstrip('wx')) if len(parts)>1 else 0
-            except ValueError:rank = 0
-            variants.append((rank,parts[0]))
-        for _, url in sorted(variants, reverse=True)[:1]:
+        for srcset in (node.get('data-srcset',''),node.get('srcset','')):
+            for entry in srcset.split(','):
+                parts = entry.strip().split()
+                if not parts:continue
+                try:rank = float(parts[-1].rstrip('wx')) if len(parts)>1 else 0
+                except ValueError:rank = 0
+                if not re.search(r'[{}]',parts[0]):variants.append((rank,parts[0]))
+        for _, url in sorted(set(variants), reverse=True)[:1]:
             candidates.append({'url':url, 'alt':node.get('alt','')})
-        raw = node.get('data-src') or node.get('data-original') or node.get('data-lazy-src') or node.get('nitro-lazy-src') or node.get('src','')
-        if raw and not variants:candidates.append({'url':raw, 'alt':node.get('alt','')})
+        for key in ('data-src','data-original','data-lazy-src','nitro-lazy-src','src'):
+            raw=node.get(key,'')
+            if not raw:continue
+            if '{width}' in raw:
+                try:widths=json.loads(node.get('data-widths','[]'))
+                except (ValueError,TypeError):widths=[]
+                widths=[int(value) for value in widths if isinstance(value,(int,float)) and 240<=value<=1600] if isinstance(widths,list) else []
+                raw=raw.replace('{width}',str(max(widths) if widths else 1024))
+            if not re.search(r'[{}]',raw):candidates.append({'url':raw,'alt':node.get('alt','')})
     for node in region.select('[style*="background"]')[:30]:
         if any(parent.name in ('nav','header','footer','aside') for parent in [node,*node.parents]):continue
         if BRANDING.search(' '.join(str(node.get(key,'')) for key in ('class','id'))):continue
@@ -467,9 +474,18 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
     from .email_content import map_link
     from .documents import Document,normalize
     from .venue_identity import matches_place
-    urls=pages if pages is not None else [link['url'] for link in document.links if not map_link(link['url'])]
+    urls=list(pages) if pages is not None else [place['website_url'] for place in places if place.get('website_url')]+[link['url'] for link in document.links if not map_link(link['url'])]
     urls=list(dict.fromkeys(url for url in urls if safe_url(url) and not re.search(r'unsubscribe|confirm|activate|login|sign.?in',url,re.I)))[:4 if pages is not None else 2]
     visited=set()
+    def follow_venue_pages(soup,resource):
+        if pages is not None:return
+        host=(urlsplit(resource.url).hostname or '').removeprefix('www.')
+        for anchor in soup.find_all('a',href=True):
+            target=safe_url(urljoin(resource.url,anchor['href']))
+            if not target or (urlsplit(target).hostname or '').removeprefix('www.')!=host:continue
+            label=anchor.get_text(' ',strip=True)+' '+urlsplit(target).path
+            if re.search(r'locations?|find.?us|our.?cafes?|our.?stores?|coffee.?shops?|contact|photo.?gallery',label,re.I) and target not in urls:urls.append(target)
+            if len(urls)>=5:break
     for url in urls:
         if url in visited:continue
         visited.add(url)
@@ -485,17 +501,8 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             matching=[place for place in places if matches_place(place,text)]
             matching.extend(place for place in structured_matching if place not in matching)
             if not matching:
-                if pages is None:
-                    # A linked official homepage often delegates venue evidence
-                    # to its location page. Follow bounded same-host locators.
-                    host=(urlsplit(resource.url).hostname or '').removeprefix('www.')
-                    for anchor in soup.find_all('a',href=True):
-                        target=safe_url(urljoin(resource.url,anchor['href']))
-                        if not target or (urlsplit(target).hostname or '').removeprefix('www.')!=host:continue
-                        label=anchor.get_text(' ',strip=True)+' '+urlsplit(target).path
-                        if re.search(r'locations?|find.?us|our.?cafes?|our.?stores?|coffee.?shops?',label,re.I) and target not in urls:
-                            urls.append(target)
-                        if len(urls)>=5:break
+                # A homepage may delegate its address and pictures to Contact.
+                follow_venue_pages(soup,resource)
                 continue
             # On a multi-location page, use images from the matching address's
             # smallest card/section, rather than a different branch's hero.
@@ -519,7 +526,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             for candidate in candidates:
                 image_url=safe_url(urljoin(resource.url,candidate['url']))
                 parts=urlsplit(image_url or '')
-                image_path=re.sub(r'-\d{2,4}x\d{2,4}(?=\.(?:png|jpe?g|webp)$)','',parts.path,flags=re.I)
+                image_path=re.sub(r'[-_]\d{2,4}x(?:\d{2,4})?(?=\.(?:png|jpe?g|webp)$)','',parts.path,flags=re.I)
                 identity=urlunsplit((parts.scheme,parts.netloc,image_path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
                 if not image_url or identity in seen or image_identity(image_url,resource.url) in branding or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
                 if re.search(r'(?:^|[/_.-])(?:maps?|staticmap|openstreetmap|googlemaps)(?:[/_.-]|$)|maps\.(?:google|apple)|\b(?:street map|map of|directions map)\b', image_url+' '+candidate['alt'], re.I):continue
@@ -538,6 +545,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                         selected.append(({**visual,'source_role':'venue_website','photo_source_page':resource.url},image));seen_images.add(identity)
                 if len(selected)>=limit:return selected
             if selected:return selected
+            follow_venue_pages(soup,resource)
         except SourceError:
             # Retry a supplied legacy www/HTTP URL through its HTTPS host form.
             # PublicFetcher still validates DNS, redirects, robots and size.

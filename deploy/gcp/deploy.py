@@ -113,9 +113,9 @@ def main():
         'MUSE_IMAGE_REASONING':values.get('MUSE_IMAGE_REASONING','high'),
         'POST_IMAGE_BUCKET':'post-images','CLOUD_TASKS_LOCATION':args.region,
         'CLOUD_TASKS_QUEUE':'uptodate-generation','CLOUD_TASKS_SERVICE_ACCOUNT':account('tasks'),
-        'GENERATION_DAILY_BUDGET_USD':values.get('GENERATION_DAILY_BUDGET_USD','2'),
-        'GENERATION_USER_DAILY_BUDGET_USD':values.get('GENERATION_USER_DAILY_BUDGET_USD','0.5'),
-        'GENERATION_JOB_BUDGET_USD':values.get('GENERATION_JOB_BUDGET_USD','0.25'),
+        'GENERATION_DAILY_BUDGET_USD':values.get('GENERATION_DAILY_BUDGET_USD','10'),
+        'GENERATION_USER_DAILY_BUDGET_USD':values.get('GENERATION_USER_DAILY_BUDGET_USD','5'),
+        'GENERATION_JOB_BUDGET_USD':values.get('GENERATION_JOB_BUDGET_USD','5'),
     }
     receiving_domain=values.get('RESEND_RECEIVING_DOMAIN') or values.get('RELAY_TEST_DOMAIN')
     if receiving_domain:plain['RESEND_RECEIVING_DOMAIN']=receiving_domain
@@ -123,7 +123,7 @@ def main():
         if values.get(name):plain[name]=values[name]
     if values.get('GOOGLE_PLACES_API_KEY'):
         plain['GOOGLE_PLACES_PHOTOS_ENABLED']=values.get('GOOGLE_PLACES_PHOTOS_ENABLED','0')
-    for name in ['PRIVATE_MUSE_CONNECTOR_ENABLED','PRIVATE_MUSE_USER_ID','PRIVATE_MUSE_EMAIL','PRIVATE_MUSE_ACCOUNTS','PUBLIC_POLICIES_ENABLED','PUBLIC_DEVELOPER_NAME','PUBLIC_SUPPORT_EMAIL','PUBLIC_SITE_ORIGIN','APP_INSTALL_URL']:
+    for name in ['PRIVATE_MUSE_CONNECTOR_ENABLED','PRIVATE_MUSE_USER_ID','PRIVATE_MUSE_EMAIL','PRIVATE_MUSE_ACCOUNTS','PUBLIC_POLICIES_ENABLED','PUBLIC_DEVELOPER_NAME','PUBLIC_SUPPORT_EMAIL','PUBLIC_SITE_ORIGIN','APP_INSTALL_URL','RESOURCE_FREE_USAGE_OFFSETS']:
         if values.get(name):plain[name]=values[name]
     with tempfile.TemporaryDirectory(prefix='uptodate-run-') as directory:
         env_path=Path(directory)/'environment.json'

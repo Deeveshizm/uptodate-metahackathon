@@ -404,7 +404,15 @@ class SourceEngine:
         else:
             candidates = [{"url": root.url, "title": root.title}]
         if payload.get('target_url'):
-            candidates=[candidate for candidate in candidates if candidate['url']==payload['target_url']]
+            target=payload['target_url']
+            selected=[candidate for candidate in candidates if candidate['url']==target]
+            if (not selected and payload.get('replace_post_id') and target.startswith(root.url+'#')
+                    and root.metadata.get('story_grouping')=='single_venue_recommendation'
+                    and len(candidates)==1 and candidates[0]['url']==root.url):
+                # A former supporting section now belongs to its full source
+                # recommendation. Keep the existing feed association on retry.
+                selected=candidates
+            candidates=selected
             if not candidates:raise SourceError('The original email section could not be reconstructed; no other story was substituted')
         candidates = payload.get("remaining_candidates", candidates)
         batch, remaining = candidates[:4], candidates[4:]
@@ -466,7 +474,7 @@ class SourceEngine:
                     continue
                 preserved = None if self.custom_generator else preserve_short_email(document)
                 if preserved:
-                    variant = 'source:preserved-email-v2-locations'
+                    variant = 'source:preserved-email-v3-complete-venue'
                 elif self.custom_generator:
                     variant = "custom:" + getattr(self.generator, "__qualname__", type(self.generator).__name__)
                 else:
