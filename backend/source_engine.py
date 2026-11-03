@@ -486,7 +486,7 @@ class SourceEngine:
                     continue
                 preserved = None if self.custom_generator else preserve_short_email(document)
                 if preserved:
-                    variant = 'source:preserved-email-v3-complete-venue'
+                    variant = 'source:preserved-email-v4-venue-story-boundaries'
                 elif self.custom_generator:
                     variant = "custom:" + getattr(self.generator, "__qualname__", type(self.generator).__name__)
                 else:

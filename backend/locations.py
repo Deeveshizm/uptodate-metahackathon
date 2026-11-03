@@ -25,6 +25,7 @@ def generic_map_label(value):
 
 
 def labelled_fields(text):
+    text=re.sub(r'(?m)^([ \t]*(?:[-–—•|][ \t]+)?)(?:\*\*|__)([A-Za-z][A-Za-z /\'’]{0,40}:)(?:\*\*|__)[ \t]*',r'\1\2 ',text)
     # Match each field's starting boundary independently so adjacent inline
     # fields are not swallowed by the previous value.
     starts=list(re.finditer(r"(?:(?:^|\n)[ \t]*(?:[-–—•|][ \t]+)?|(?<=[.!?])[ \t]+|[ \t]+[-–—•|][ \t]+)([A-Za-z][A-Za-z /'’]{0,40})\s*:[ \t]*",text))
@@ -38,9 +39,24 @@ def labelled_fields(text):
     return result
 
 
+def unique_address(addresses):
+    from .venue_identity import identity_text,street_text
+    values=list(dict.fromkeys(normalize(value) for value in addresses if value))
+    if len(values)==1:return values[0] if len(values[0])<=400 else None
+    if not values or len({street_text(value) for value in values})!=1:return None
+    # Repeated contact/map blocks may abbreviate the same street or omit its
+    # postcode. Keep the fuller original, but never merge different cities.
+    cities=set();postcodes=set()
+    for value in values:
+        tail=[part.strip() for part in value.split(',')[1:] if not re.match(r'^\s*(?:suite|ste|unit|#)\s*\w+',part,re.I)]
+        if tail:cities.add(identity_text(tail[0]))
+        postcodes.update(re.findall(r'\b\d{5}(?:-\d{4})?\b',','.join(tail)))
+    return max(values,key=len) if len(cities)<=1 and len(postcodes)<=1 and max(map(len,values))<=400 else None
+
+
 def labelled_address(text):
     addresses=[value for label,value in labelled_fields(text) if label in ('where','address','location') and not value.lower().startswith(('http:','https:'))]
-    return addresses[0] if len(addresses)==1 and len(addresses[0])<=400 else None
+    return unique_address(addresses)
 
 
 def text_address(text):
@@ -48,8 +64,7 @@ def text_address(text):
     if labelled:return labelled
     street=r"\d{1,6}\s+(?:[\w.'’/-]+\s+){1,8}(?:Street|St|Road|Rd|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Parkway|Pkwy)\b\.?"
     matches=list(re.finditer(street+r"(?:\s*(?:#|Suite|Ste|Unit)\s*[\w-]+)?(?:,\s*[A-Za-z][A-Za-z .'-]{1,45})?(?:,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?)?",text,re.I))
-    if len(matches)!=1:return None
-    return re.split(r'[.!?]\s+(?=[A-Z])',matches[0][0],maxsplit=1)[0].strip()
+    return unique_address([re.split(r'[.!?]\s+(?=[A-Z])',match[0],maxsplit=1)[0].strip() for match in matches])
 
 
 def map_link(url):
@@ -85,6 +100,9 @@ def email_places(document):
     name=explicit_name
     if not name and suffix and suffix.casefold() in text.casefold():name=suffix
     if not name:
+        titles=document.metadata.get('email_story_titles') or document.metadata.get('email_primary_headings',[])
+        if len(titles)==1 and not re.fullmatch(r'overview|introduction|details|highlights|today.s (?:news|stories|picks)',titles[0],re.I):name=venue_name(titles[0])
+    if not name:
         headings=list(dict.fromkeys(normalize(span.get('section','')) for span in document.spans
             if span.get('section') and span['section'] not in ('Body','Email',document.title)
             and not re.fullmatch(r'sources?|references?|footer|disclaimer|introduction|overview|ingredients|instructions|hours|contact(?: details)?',normalize(span['section']),re.I)))
@@ -106,7 +124,12 @@ def email_places(document):
             identity=explicit_name
         else:
             identity=label if label and not generic_map_label(label) and not label.startswith('http') else name or value
-        linked_address=(query.get('address') or [''])[0] or text_address(link.get('context','')) or (address if len(links)==1 else '')
+        from .venue_identity import name_matches,street_text
+        same_venue=bool(name and name_matches(name,identity,address_matches=True))
+        query_address=text_address(value)
+        known_address=address if len(links)==1 or same_venue else ''
+        if query_address and known_address and street_text(query_address)!=street_text(known_address):known_address=''
+        linked_address=(query.get('address') or [''])[0] or text_address(link.get('context','')) or known_address or query_address or ''
         if not identity:identity=linked_address or 'Location from email'
         place={'name':identity[:200],'address':linked_address[:400],'map_url':urlunsplit(parts._replace(scheme='https')),'source_url':document.url}
         if identity=='Location from email':place['identity_known']=False

@@ -33,6 +33,8 @@ def preserve_short_email(document):
             if venue:
                 if line.casefold() == document.title.casefold():continue
                 plain=re.sub(r'^[-–—•]\s*','',line)
+                if any(plain.casefold()==place.get('name','').casefold() for place in document.metadata['places']):continue
+                if plain.rstrip(':')==section:continue
                 if re.match(r'^(?:rating|address|postal address|where|location|website(?:\s*/\s*location)?|hours|phone|telephone)\s*:',plain,re.I):
                     metadata_continuation=True;continue
                 if metadata_continuation and re.match(r'^(?:\d|mon\b|tue\b|wed\b|thu\b|fri\b|sat\b|sun\b)',plain,re.I):continue

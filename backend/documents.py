@@ -368,11 +368,11 @@ def parse_document(resource: Resource) -> Document:
     return Document(resource.url, title[:250], spans, links, metadata, figures)
 
 
-def make_spans(chunks):
+def make_spans(chunks, *, min_length=15):
     candidates, total = [], 0
     for text, section, page in chunks:
         text = normalize(text)
-        if len(text) < 15:
+        if len(text) < min_length:
             continue
         for start in range(0, len(text), 1400):
             part = text[start:start + 1400]
