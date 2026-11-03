@@ -110,11 +110,11 @@ open native/UpToDate.xcodeproj
 
 Select the **UpToDate** scheme in Xcode, choose an iPhone simulator, and run. Physical-device builds require signing with an Apple Developer team. TestFlight access is by invitation during the beta.
 
-**The iOS app connects to the hosted backend. Testers do not need environment files or backend API keys.**
+**UpToDate already supports multiple users and is deployed on Google Cloud Platform (GCP).** Each user has their own account, newsletter alias, subscriptions, and personal feed. The iOS app connects to the hosted backend, so testers do not need environment files or backend API keys.
 
 ## Shared demo account
 
-Once you have access to the beta app, you can sign in with this shared test account:
+If you just want to try the beta app without creating an account, sign in with the shared demo account below. You can also create your own account to test the full signup experience and keep your subscriptions and feed separate.
 
 - **Email:** `deevesh.jain99@gmail.com`
 - **Password:** `G00dP@ssW0rd`
