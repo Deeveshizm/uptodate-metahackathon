@@ -44,7 +44,8 @@ def snapshot(post):
         identifier = item.get('asset_id', '')
         if not isinstance(identifier, str) or not ASSET.fullmatch(identifier) or identifier in seen: continue
         seen.add(identifier)
-        images.append({key: item.get(key) for key in ('asset_id', 'kind', 'caption', 'attribution', 'provider')})
+        images.append({key: item.get(key) for key in ('asset_id', 'kind', 'caption', 'attribution', 'provider',
+            'license_url','license_name','source_url','modifications')})
         if len(images) == 8: break
     paper = post.get('paper') or {}
     action = post.get('content_action') or {}
@@ -96,7 +97,14 @@ def render(data, token, install_url):
             body += '<figure data-image="' + image_url + '" data-google="' + str(image.get('provider') == 'google_places').lower() + '">'
             body += '<div class="photo"><img hidden alt="' + e(image.get('caption') or data.get('title')) + '"><span class="image-status">Loading image…</span></div>'
             if image.get('kind') == 'generated': body += '<figcaption>AI illustration</figcaption>'
-            elif image.get('attribution'): body += '<figcaption>' + e(image['attribution']) + '</figcaption>'
+            elif image.get('attribution'):
+                body += '<figcaption>' + e(image['attribution'])
+                license_url=public_link(image.get('license_url'))
+                if license_url:body += ' · <a href="'+e(license_url)+'" rel="license noopener noreferrer">'+e(image.get('license_name') or 'License')+'</a>'
+                if image.get('modifications'):body += ' · '+e(image['modifications'])
+                source=public_link(image.get('source_url'))
+                if source and license_url:body += ' · <a href="'+e(source)+'" rel="noopener noreferrer">Original photo</a>'
+                body += '</figcaption>'
             body += '<div class="photo-credit"></div></figure>'
         body += '</div>'
         if len(data['images']) > 1: body += '<p class="gallery-hint">Swipe to see more images</p>'

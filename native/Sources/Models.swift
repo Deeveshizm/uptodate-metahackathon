@@ -510,6 +510,8 @@ struct PostVisual: Codable {
     let sourceUrl: String?
     let licenseUrl: String?
     var provider: String? = nil
+    var licenseName: String? = nil
+    var modifications: String? = nil
 }
 
 struct PhotoCredit: Decodable, Sendable, Equatable {

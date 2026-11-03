@@ -2,6 +2,10 @@
 import re
 import unicodedata
 
+STREET_ORDINALS=dict(zip(('first','second','third','fourth','fifth','sixth','seventh','eighth','ninth','tenth',
+                        'eleventh','twelfth','thirteenth','fourteenth','fifteenth','sixteenth','seventeenth','eighteenth','nineteenth','twentieth'),
+                       ('1st','2nd','3rd','4th','5th','6th','7th','8th','9th','10th','11th','12th','13th','14th','15th','16th','17th','18th','19th','20th')))
+
 
 def identity_text(value):
     value = unicodedata.normalize('NFKD', str(value or '')).casefold()
@@ -12,6 +16,7 @@ def street_text(value):
     aliases = {'north':'n', 'south':'s', 'east':'e', 'west':'w', 'street':'st',
                'road':'rd', 'avenue':'ave', 'boulevard':'blvd', 'drive':'dr',
                'lane':'ln', 'court':'ct', 'parkway':'pkwy', 'highway':'hwy'}
+    aliases.update(STREET_ORDINALS)
     value = str(value or '').split(',')[0]
     value = re.split(r'(?:#|\b(?:suite|ste|unit|apt)\.?\s*)\s*[\w-]+', value, maxsplit=1, flags=re.I)[0]
     return ' '.join(aliases.get(word, word) for word in identity_text(value).split())
@@ -39,6 +44,7 @@ def address_matches(address, text):
     aliases = {'north':'n','south':'s','east':'e','west':'w','street':'st','road':'rd',
                'avenue':'ave','boulevard':'blvd','drive':'dr','lane':'ln','court':'ct',
                'parkway':'pkwy','highway':'hwy'}
+    aliases.update(STREET_ORDINALS)
     normalized = ' ' + ' '.join(aliases.get(word,word) for word in identity_text(text).split()) + ' '
     return ' ' + street + ' ' in normalized
 

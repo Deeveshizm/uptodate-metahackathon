@@ -6,7 +6,6 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from .documents import normalize
-from .google_places_photos import GooglePlacesPhotos, parse_reference
 from .locations import labelled_fields, maps_search
 from .pipeline import safe_url
 from .retrieval import SourceError
@@ -102,6 +101,11 @@ def website_values(resource, place, missing):
                 from .venue_reviews import number
                 rating=node['aggregateRating'];value=number(rating.get('ratingValue'))
                 if value is not None and 0<=value<=5:values['rating']=f'Rating: {value:g}/5'
+    if 'reviews' in missing:
+        from .venue_reviews import review_evidence
+        reviews=[{'text':record['text'],'author':record.get('author'),'source_url':resource.url}
+                 for record in review_evidence(resource,place) if record['kind']=='review']
+        if reviews:values['reviews']={'items':reviews[:2],'source_url':resource.url}
     if not matches_place(place,soup.get_text(' ',strip=True)) and not values:return {}
     if 'phone' in missing and not values.get('phone'):
         anchor=soup.find('a',href=re.compile(r'^tel:',re.I))
@@ -124,34 +128,49 @@ class VenueEnrichment:
         document.metadata['venue_reviews_needed']=not bool(own.get('reviews'))
         document.metadata['venue_missing_fields']=sorted(missing)
         if not missing:return document
+        # Only missing fields are supplemented. An official site is checked
+        # before reference pages, and Google is reserved for remaining gaps.
+        from .visuals import venue_page_groups
+        draft={'analysis':{'action':{'kind':'places','data':places}}}
+        official,references,social=venue_page_groups(document,draft)
+        remaining=missing-{'image'}
+        supplement={};sources={};checks=[];visited=set()
+        def collect(urls):
+            nonlocal remaining
+            for url in urls:
+                if not remaining or url in visited or len(visited)>=4:continue
+                visited.add(url)
+                try:
+                    resource=self.fetcher.fetch(url)
+                    values=website_values(resource,place,remaining)
+                    supplement.update(values)
+                    sources.update({key:resource.url for key in values})
+                    remaining-=set(values)
+                    checks.append({'url':resource.url,'fields':sorted(values)})
+                except SourceError:
+                    checks.append({'url':url,'fields':[],'status':'unavailable'})
+        collect(official)
+        collect([url for url in references if url not in official])
         found=None
+        fields=set()
         if self.google:
-            fields={GOOGLE_FIELDS[key] for key in missing if key in GOOGLE_FIELDS}
-            if 'image' in missing:fields.add('photos')
-            if 'reviews' in missing:fields.add('reviewSummary')
-            if 'rating' in missing:fields.add('userRatingCount')
-            try:found=self.google.lookup(place,fields,budget,document.metadata.get('google_venue_id'))
-            except SourceError:pass
-        available=google_values(found,missing) if found else {}
+            fields={GOOGLE_FIELDS[key] for key in remaining if key in GOOGLE_FIELDS}
+            if 'reviews' in remaining:fields.add('reviewSummary')
+            if 'rating' in remaining:fields.add('userRatingCount')
+            if fields:
+                try:found=self.google.lookup(place,fields,budget,document.metadata.get('google_venue_id'))
+                except SourceError:pass
+        available=google_values(found,remaining) if found else {}
         if found:
             document.metadata['google_venue_id']=found['id']
-            if 'image' in missing:
-                document.metadata['google_photo_checked']=True
-                gallery=self.google.selected_references(place,found)
-                document.metadata['google_photo_indices']=[parse_reference(data)['index'] for _,data in gallery]
             if available:
                 document.metadata['live_venue']={'place_id':found['id'],'fields':sorted(available)}
         # Google fields are deliberately not copied into source spans or saved
         # as newsletter facts. Clients fetch them live with source attribution.
-        remaining=missing-set(available)-{'image'}
-        website=own.get('website') or (found.get('websiteUri') if found else None)
-        supplement={}
-        if remaining and website:
-            try:
-                resource=self.fetcher.fetch(website)
-                supplement=website_values(resource,place,remaining)
-                document.metadata['venue_website_fields']={'values':supplement,'source_url':resource.url}
-            except SourceError:pass
+        remaining-=set(available)
+        collect(social)
+        if supplement:document.metadata['venue_website_fields']={'values':supplement,'source_url':next(iter(sources.values())),'sources':sources}
+        document.metadata['venue_detail_checks']=checks
         document.metadata['venue_reviews_needed']='reviews' in remaining
         return document
 

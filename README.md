@@ -101,7 +101,7 @@ Local mode still defaults to SQLite and `AUTH_MODE=local`; `AUTH_MODE=supabase` 
 
 The Resend adapter routes provider-reported recipients through a private per-account alias registry. Hosted receiving runs through scheduled/authenticated workers, so it does not depend on a Mac staying online. App-owned Cloudflare receiving and automatic publisher subscription confirmation remain follow-up work. Importing an `.eml` remains an explicit extractive action, not authenticated publisher delivery. Supabase's default Auth sender is restricted; general-public registration needs appropriate email-delivery configuration.
 
-EML imports remain **offline and extractive**, available in Manage, and are clearly tagged as not yet analyzed from the original. The source-link engine retrieves public HTML/text/PDF originals and uses **Muse Spark 1.3 in Standard mode** for drafting and a separate verification call by default. Set `GENERATION_PROVIDER=ollama` for explicit local testing. Successful text goes directly to the private feed, even if its image needs work; the post carries a pending tag. Invalid model output is not published. Machine checks do not guarantee accuracy. Public permission remains a separate human assertion. Seeded sample posts retain code-drawn covers and unverified-sample labels.
+EML imports remain **offline and extractive**, available in Manage, and are clearly tagged as not yet analyzed from the original. The source-link engine retrieves public HTML/text/PDF originals and uses **Muse Wonder 1.0 in Standard mode** for drafting and a separate verification call by default. Set `GENERATION_PROVIDER=ollama` for explicit local testing. Successful text goes directly to the private feed, even if its image needs work; the post carries a pending tag. Invalid model output is not published. Machine checks do not guarantee accuracy. Public permission remains a separate human assertion. Seeded sample posts retain code-drawn covers and unverified-sample labels.
 
 The backend is hosted, but Universal Links, App Store identity, broader publisher-signup compatibility, app-owned-domain receiving and operational hardening remain follow-up work. The private source-bounded Ask AI service is implemented; there are no likes, friends or creator posting.
 
@@ -222,16 +222,18 @@ The receiver scans at most 300 recent provider messages per poll and bounds resp
 
 ## Source-to-post engine
 
-Muse Spark 1.3 is the default. Keep these settings in ignored `.env.local`:
+Muse Wonder 1.0 is the default. Keep these settings in ignored `.env.local`:
 
 ```sh
 GENERATION_PROVIDER=meta
-META_MODEL=muse-spark-1.3
+META_MODEL=muse-wonder-1.0
 META_REASONING_EFFORT=low
 # Also save MODEL_API_KEY locally; never commit or send it to the native client.
 ```
 
 Load the settings before starting the API (`set -a; source .env.local; set +a`). The adapter uses the fixed HTTPS Meta endpoint, Standard mode, strict JSON schemas and a maximum of 5,000 output tokens per call, including reasoning. It does not silently switch providers, use Contributor mode, call search/tools or automatically retry failed HTTP requests. `GET /v1/engine` reports the selected provider/model and readiness without exposing its key.
+
+Venue photos use `VENUE_PHOTO_PROVIDER=source_first`: keep a usable newsletter photo, then try the official website, press/reference pages and Commons/Openverse, followed by public-page discovery and Google/Facebook fallbacks. Muse Image runs only when real-photo retrieval is exhausted. Branch matching and filters reject branding, maps, stock/decorative images and promotional social-feed posts. This mode does not require an explicit website permission marker to try a photo; source URLs and credits are retained. Google Places photos remain live with attribution; other saved post images use the existing private image cache. Set `GOOGLE_PLACES_PHOTOS_ENABLED=1` with a backend-only Google Places key to enable that fallback. The stricter `licensed` mode remains available for testing.
 
 For explicit local inference, start `make model` in another terminal and use `make api-local`. This selects the existing `llama3:8b`; no model downloads are performed automatically.
 
@@ -268,7 +270,7 @@ Retrieval validates resolved addresses and pins connections to a validated publi
 
 Source evidence and job state are stored per account. Generated artifacts from verified, anonymous, query-free public sources can be reused across accounts using a source-revision/model/prompt key and an atomic claim. Tracking URLs are shared only after a clean URL has been fetched and verified to return the same revision; signed/unknown-query/private sources remain tenant-scoped. Each account retains its own private post association, bookmarks, read state and newsletter provenance. A story discovered through multiple newsletters appears once in that account and remains visible while any associated source is unmuted. The local schema keeps compatibility snapshots in private post rows; a fully normalized hosted store remains deployment work. Existing databases receive additive migrations. Deleting an account deletes its source evidence too. Failed source jobs retain their request for explicit retry; successful jobs discard their temporary request payload. Source revisions already represented by a nonrejected post are deduplicated per account. The API accepts `refresh: true` to re-fetch a changed page.
 
-In explicit local mode, choose another installed model with `GENERATION_PROVIDER=ollama OLLAMA_MODEL=your-installed-model make api`. `OLLAMA_URL` defaults to `http://127.0.0.1:11434`. The adapter uses Ollama's documented [JSON schema output format](https://docs.ollama.com/capabilities/structured-outputs), includes the output schema in the prompt, and validates the result server-side. That explicit Ollama mode does not call Meta. The default Spark mode does.
+In explicit local mode, choose another installed model with `GENERATION_PROVIDER=ollama OLLAMA_MODEL=your-installed-model make api`. `OLLAMA_URL` defaults to `http://127.0.0.1:11434`. The adapter uses Ollama's documented [JSON schema output format](https://docs.ollama.com/capabilities/structured-outputs), includes the output schema in the prompt, and validates the result server-side. That explicit Ollama mode does not call Meta. The default Meta mode does.
 
 ### Usage limits, source details and validation
 

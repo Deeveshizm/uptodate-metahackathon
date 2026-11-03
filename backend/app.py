@@ -1095,6 +1095,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         import base64
         headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"}
         if parse_reference(bytes(asset['image'])) is not None:
+            from .licensed_venue_photos import licensed_photo_mode
+            if licensed_photo_mode():raise HTTPException(409,'Google photo retrieval is off; retry this post image to use saved-photo retrieval')
             # Older clients permanently cache every image and cannot render
             # live author/source attribution. Require the updated image client.
             if request.headers.get('X-UpToDate-Photo-Attribution')!='1':

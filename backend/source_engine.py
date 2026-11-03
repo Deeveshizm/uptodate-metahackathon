@@ -44,6 +44,7 @@ class SourceEngine:
         self.illustrator = illustrator
         self.photo_searcher = None
         self.review_searcher = None
+        self.licensed_photos = None
 
     def enrich_recommendation(self, document, job):
         if self.custom_generator or document.metadata.get('format') != 'email' or not document.metadata.get('places'):
@@ -66,10 +67,13 @@ class SourceEngine:
             return None
         if self.photo_searcher is None:
             from .venue_photo_search import VenuePhotoSearch
-            self.photo_searcher=VenuePhotoSearch(self.store)
+            from .licensed_venue_photos import venue_photo_mode
+            self.photo_searcher=VenuePhotoSearch(self.store,purpose='licensed_photos' if venue_photo_mode()!='google' else 'photos')
         return lambda places, **options:self.photo_searcher.pages(places,JobBudget(self.store,job['id']),**options)
 
     def google_photo_lookup(self,job,document=None):
+        from .licensed_venue_photos import licensed_photo_mode
+        if licensed_photo_mode():return None
         from .google_places_photos import GooglePlacesPhotos, supports_live_venue
         if self.custom_generator or not GooglePlacesPhotos.enabled() or not supports_live_venue(job['user_id']):return None
         provider=GooglePlacesPhotos(fetcher=self.fetcher,store=self.store)
@@ -82,6 +86,12 @@ class SourceEngine:
                 return [(self.google_visual(places[0],identifier),reference(identifier,index)) for index in indices[:3]] if places else []
             return selected
         return lambda places:provider.gallery(places,JobBudget(self.store,job['id']))
+
+    def licensed_photo_lookup(self,job):
+        from .licensed_venue_photos import LicensedVenuePhotos,venue_photo_mode
+        if venue_photo_mode()=='google':return None
+        if self.licensed_photos is None:self.licensed_photos=LicensedVenuePhotos(self.store,self.fetcher)
+        return lambda places:self.licensed_photos.gallery(places,JobBudget(self.store,job['id']))
 
     @staticmethod
     def google_visual(place,identifier):
@@ -304,7 +314,7 @@ class SourceEngine:
         draft = dict(post)
         draft["analysis"] = json.loads(post["analysis"])
         draft["evidence"] = json.loads(post["evidence"])
-        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=None if payload.get('source_only') else self.photo_lookup(job),google_photos=None if payload.get('source_only') else self.google_photo_lookup(job,document))
+        original_gallery = source_gallery(document,draft,self.fetcher,stage=lambda value:self.stage(job['id'],value),photo_search=None if payload.get('source_only') else self.photo_lookup(job),google_photos=None if payload.get('source_only') else self.google_photo_lookup(job,document),licensed_photos=self.licensed_photo_lookup(job))
         if original_gallery:
             visual,image=original_gallery[0]
         elif payload.get('source_only'):
@@ -330,6 +340,8 @@ class SourceEngine:
                 return visual
             from .image_generation import image_variant
             visual_variant = image_variant()
+            from .licensed_venue_photos import venue_photo_mode
+            if venue_photo_mode()!='google':visual_variant+=':'+venue_photo_mode()+'-venue-v2'
             _, visual, reused = self.artifacts.obtain(document, job["user_id"], "visual:" + visual_variant + ":" + post["artifact_key"], produce_visual)
             with self.store.connect() as db:
                 stored = db.execute("SELECT * FROM gallery_assets WHERE id=? AND artifact_key=?", (visual["asset_id"], post["artifact_key"])).fetchone()
@@ -503,7 +515,7 @@ class SourceEngine:
                 draft["analysis"]["cache"] = {"reused": reused, "new_inference_cost_usd": 0 if reused else draft["analysis"].get("usage", {}).get("estimated_cost_usd", 0)}
                 draft["analysis"]["provenance"] = {"newsletter_issue_url": "" if job["kind"] in ("received_email","connector_edition") else root.url, "secondary_url": secondary.url,
                                                     "original_url": document.url, "content_author": document.metadata.get("author", "")}
-                gallery = source_gallery(document, draft, self.fetcher, stage=lambda value: self.stage(job["id"], value),photo_search=self.photo_lookup(job),google_photos=self.google_photo_lookup(job,document))
+                gallery = source_gallery(document, draft, self.fetcher, stage=lambda value: self.stage(job["id"], value),photo_search=self.photo_lookup(job),google_photos=self.google_photo_lookup(job,document),licensed_photos=self.licensed_photo_lookup(job))
                 if gallery:
                     visual, image = gallery[0]
                 elif document.metadata.get('email_images_pending'):

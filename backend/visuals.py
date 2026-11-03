@@ -319,7 +319,16 @@ def source_visual(document, draft, fetcher, allow_pdf=True):
     return None
 
 
-def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None, text_model=None, budget=None, photo_search=None, google_photos=None, venue_photos_checked=False):
+def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: None, text_model=None, budget=None, photo_search=None, google_photos=None, venue_photos_checked=False, licensed_photos=None):
+    from .licensed_venue_photos import venue_photo_mode
+    if venue_photo_mode()!='google' and draft.get('analysis',{}).get('action',{}).get('kind')=='places':
+        if not venue_photos_checked:
+            gallery=source_gallery(document,draft,fetcher,stage,photo_search=photo_search,google_photos=google_photos,licensed_photos=licensed_photos)
+            if gallery:return gallery[0]
+        # The entire real-photo chain has finished. Do not run a second,
+        # differently ordered lookup before the final illustration fallback.
+        document=replace(document,figures=[],links=[])
+        venue_photos_checked=True
     # Prefer the paper/original linked by a secondary article before using its
     # own hero image. No recursive discovery, signup, or arbitrary site crawl.
     checks = []
@@ -377,8 +386,10 @@ def choose_visual(document, draft, fetcher, illustrator=None, stage=lambda _: No
 
 def venue_address_text(value):
     from .documents import normalize
+    from .venue_identity import STREET_ORDINALS
     aliases={'north':'n','south':'s','east':'e','west':'w','street':'st','road':'rd','avenue':'ave',
              'boulevard':'blvd','drive':'dr','lane':'ln','court':'ct','parkway':'pkwy','highway':'hwy'}
+    aliases.update(STREET_ORDINALS)
     return ' '.join(aliases.get(word,word) for word in re.findall(r'[\w]+',normalize(value).casefold()))
 
 
@@ -423,13 +434,32 @@ def structured_venue_photos(soup, places):
 
 def venue_photo_candidates(soup, region, structured):
     candidates = list(structured)
-    if region is soup:
+    # Social-feed mirrors expose recent posts as a "gallery". Those can be
+    # menus or notices, rather than photographs of the establishment itself.
+    feed_text=region.get_text(' ',strip=True)
+    dated_feed=len(re.findall(r'\b\d{1,2}/\d{1,2}/\d{4}\b',feed_text))>=3
+    if region is soup and not dated_feed:
         hero = soup.find('meta', attrs={'property':'og:image'})
         if hero:candidates.append({'url':hero.get('content',''), 'alt':''})
     for node in region.find_all(['img','source'], limit=100):
         if any(parent.name in ('nav','header','footer','aside') for parent in node.parents):continue
         attributes = ' '.join(str(node.get(key,'')) for key in ('class','id','alt'))
         if BRANDING.search(attributes):continue
+        # Public venue galleries often interleave hiring ads, event flyers and
+        # food photos. Keep the nearby caption so an ad cannot become the cover.
+        nearby=node.parent
+        context=''
+        for _ in range(4):
+            if nearby is None or nearby is region or nearby.name in ('body','main','html'):break
+            text=nearby.get_text(' ',strip=True)
+            if len(text)>1600:break
+            if text:context=text
+            if len(text)>25:context=text;break
+            nearby=nearby.parent
+        description=node.get('alt','')+' '+context
+        if dated_feed and not re.search(r'\b(?:interior|exterior|inside (?:our|the)|dining room|seating area|front of|storefront|patio|terrace|outdoor seating|view (?:of|from))\b',description,re.I):continue
+        if re.search(r'\b(?:hiring|job openings?|open positions?|apply (?:now|today|in person)|help wanted|join our team|employment|gift cards?|coupon|discount code|ticket sales?|raffle|giveaway|featured drinks?|new shirt|shirt designs?|karaoke|goth night|trivia night|line.?up|this week at|this month at)\b',description,re.I):continue
+        if re.search(r'\bclosed\s+(?:today|tomorrow|(?:on\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+at\b',description,re.I):continue
         parent = node.find_parent('a')
         if parent and re.search(r'\.(?:jpe?g|png|webp)(?:\?|$)', parent.get('href',''), re.I):
             candidates.append({'url':parent['href'], 'alt':node.get('alt','')})
@@ -467,24 +497,28 @@ def contains_multiple_venue_addresses(region):
     return len({venue_address_text(value) for value in addresses})>1
 
 
-def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, pages=None):
+def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, pages=None, require_permission=False, follow_media=False):
     """Check explicit venue websites/verified photo pages, without rewriting email content."""
     places=draft.get('analysis',{}).get('action',{}).get('data',[])
     if draft.get('analysis',{}).get('action',{}).get('kind')!='places' or not places:return []
     from .email_content import map_link
     from .documents import Document,normalize
     from .venue_identity import matches_place
+    from .photo_permissions import EditorialPhotoPermissions
+    permission_lookup=EditorialPhotoPermissions(fetcher) if require_permission else None
     urls=list(pages) if pages is not None else [place['website_url'] for place in places if place.get('website_url')]+[link['url'] for link in document.links if not map_link(link['url'])]
     urls=list(dict.fromkeys(url for url in urls if safe_url(url) and not re.search(r'unsubscribe|confirm|activate|login|sign.?in',url,re.I)))[:4 if pages is not None else 2]
     visited=set()
     def follow_venue_pages(soup,resource):
-        if pages is not None:return
+        if pages is not None and not (require_permission or follow_media):return
         host=(urlsplit(resource.url).hostname or '').removeprefix('www.')
         for anchor in soup.find_all('a',href=True):
             target=safe_url(urljoin(resource.url,anchor['href']))
             if not target or (urlsplit(target).hostname or '').removeprefix('www.')!=host:continue
             label=anchor.get_text(' ',strip=True)+' '+urlsplit(target).path
-            if re.search(r'locations?|find.?us|our.?cafes?|our.?stores?|coffee.?shops?|contact|photo.?gallery',label,re.I) and target not in urls:urls.append(target)
+            locator=re.search(r'locations?|find.?us|our.?cafes?|our.?stores?|coffee.?shops?|contact|photo.?gallery',label,re.I)
+            media=(require_permission or follow_media) and re.search(r'press.?kit|media.?kit|press.?photos?|media.?gallery|press.?room',label,re.I)
+            if (locator or media) and target not in urls:urls.append(target)
             if len(urls)>=5:break
     for url in urls:
         if url in visited:continue
@@ -495,11 +529,17 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             resource=fetcher.fetch(url)
             if 'html' not in resource.content_type:continue
             soup=BeautifulSoup(resource.body,'html.parser')
+            from .licensed_venue_photos import website_photo_licenses
+            permissions=website_photo_licenses(soup,resource.url,fetcher,permission_lookup) if require_permission else {}
+            if require_permission:
+                document.metadata.setdefault('venue_photo_permission_checks',[]).append({'url':resource.url,'permitted_images':len(permissions)})
             text=normalize(soup.get_text(' ',strip=True)).casefold()
             address_text=' '+venue_address_text(text)+' '
             structured_matching, structured = structured_venue_photos(soup, places)
             matching=[place for place in places if matches_place(place,text)]
             matching.extend(place for place in structured_matching if place not in matching)
+            if matching:
+                document.metadata.setdefault('licensed_venue_identity_pages',{})[matching[0]['address']]=resource.url
             if not matching:
                 # A homepage may delegate its address and pictures to Contact.
                 follow_venue_pages(soup,resource)
@@ -525,14 +565,25 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
             seen=set()
             for candidate in candidates:
                 image_url=safe_url(urljoin(resource.url,candidate['url']))
+                permission=permissions.get(image_identity(image_url,resource.url)) if image_url else None
+                if require_permission and not permission:continue
                 parts=urlsplit(image_url or '')
+                from .licensed_venue_photos import venue_photo_mode
+                host=(parts.hostname or '').lower()
+                if venue_photo_mode()!='google' and (host.endswith(('.googleusercontent.com','.ggpht.com')) or host=='places.googleapis.com'):continue
+                # A directory can repeat the correct business/address while
+                # decorating it with an unrelated stock coffee-shop image.
+                if host.endswith(('.unsplash.com','.pexels.com','.pixabay.com')) or host in ('picsum.photos','loremflickr.com','placehold.co','via.placeholder.com'):continue
+                if re.search(r'(?:^|[/_.-])(?:default|placeholder|stock|categor(?:y|ies)|cuisines?|restaurantmenu|menu|no[-_]?image|coming[-_]?soon)(?:[/_.-]|$)',parts.path,re.I):continue
                 image_path=re.sub(r'[-_]\d{2,4}x(?:\d{2,4})?(?=\.(?:png|jpe?g|webp)$)','',parts.path,flags=re.I)
                 identity=urlunsplit((parts.scheme,parts.netloc,image_path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
-                if not image_url or identity in seen or image_identity(image_url,resource.url) in branding or re.search(r'logo|avatar|icon|badge|facebook|instagram|twitter|linkedin|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                if not image_url or identity in seen or image_identity(image_url,resource.url) in branding or re.search(r'logo|avatar|icon|badge|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                if re.search(r'(?:facebook|instagram|twitter|linkedin)',parts.path+' '+candidate['alt'],re.I) and re.search(r'logo|icon|follow|share|social',parts.path+' '+candidate['alt'],re.I):continue
                 if re.search(r'(?:^|[/_.-])(?:maps?|staticmap|openstreetmap|googlemaps)(?:[/_.-]|$)|maps\.(?:google|apple)|\b(?:street map|map of|directions map)\b', image_url+' '+candidate['alt'], re.I):continue
                 seen.add(identity)
                 figures.append({'id':'venue-photo-'+str(len(figures)), 'url':image_url,'caption':matching[0]['name']+' · photo from '+resource.url,
-                                'license_url':'','page':None,'selection_basis':'venue_website_photo'})
+                                'license_url':permission['license_url'] if permission else '','page':None,'selection_basis':'venue_website_photo',
+                                **({'reuse_permission':permission} if permission else {})})
             title=soup.title.get_text(' ',strip=True) if soup.title else matching[0]['name']
             source=Document(resource.url,title,[],metadata={'author':title},figures=figures)
             selected=[];seen_images=set()
@@ -540,6 +591,12 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                 value=source_visual(Document(source.url,source.title,[],metadata=source.metadata,figures=[figure]),draft,fetcher,allow_pdf=False)
                 if value:
                     visual,image=value
+                    permission=figure.get('reuse_permission')
+                    if permission:
+                        visual.update(permission)
+                        visual.update(provider='venue_website',rights_status=permission.get('rights_status','recognized_reuse_license'),cache_policy='stored',modifications='Resized for display')
+                    else:
+                        visual.update(provider='venue_website',cache_policy='stored',modifications='Resized for display')
                     identity=hashlib.sha256(image).hexdigest()
                     if identity not in seen_images:
                         selected.append(({**visual,'source_role':'venue_website','photo_source_page':resource.url},image));seen_images.add(identity)
@@ -557,7 +614,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
     return []
 
 
-def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4):
+def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4,require_permission=False,retry=True):
     action=draft.get('analysis',{}).get('action',{})
     if not photo_search or action.get('kind')!='places':return []
     stage('searching_real_venue_photos')
@@ -567,8 +624,9 @@ def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4):
         raise
     except SourceError:
         return []
-    gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=pages)
+    gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=pages,require_permission=require_permission)
     if gallery:return gallery
+    if not retry:return []
     stage('retrying_real_venue_photo_search')
     try:
         recovered=photo_search(action['data'],recovery=True,exclude_urls=pages)
@@ -576,7 +634,7 @@ def searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit=4):
         raise
     except (SourceError,TypeError):
         return []
-    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=recovered)
+    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=recovered,require_permission=require_permission)
 
 
 def google_venue_gallery(draft,stage,google_photos):
@@ -587,10 +645,84 @@ def google_venue_gallery(draft,stage,google_photos):
     except SourceError:return []
 
 
-def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, photo_search=None, google_photos=None):
+def venue_page_groups(document, draft):
+    """Keep social/map pages out of the earlier official-website pass."""
+    from .email_content import map_link
+    places=draft.get('analysis',{}).get('action',{}).get('data',[])
+    official=[place['website_url'] for place in places if place.get('website_url')]
+    if not official:
+        from .venue_enrichment import newsletter_fields
+        website=newsletter_fields(document).get('website')
+        if website:official.append(website)
+    linked=[link['url'] for link in document.links]
+    if not official:
+        labelled=[link['url'] for link in document.links if re.search(r'\b(?:website|official site)\b',link.get('title','')+' '+link.get('context',''),re.I)]
+        official=labelled or linked[:1]
+    references=document.metadata.get('venue_reference_pages',[])+document.metadata.get('venue_photo_discovery_pages',[])
+    def social(url):
+        host=(urlsplit(url).hostname or '').lower().removeprefix('www.').removeprefix('m.')
+        return host in ('facebook.com','fb.com','instagram.com')
+    valid=list(dict.fromkeys(url for url in official+linked+references if safe_url(url) and not map_link(url)))
+    return ([url for url in official if url in valid and not social(url)],
+            [url for url in valid if not social(url)],
+            [url for url in valid if social(url) and (urlsplit(url).hostname or '').lower().endswith('facebook.com')])
+
+
+def source_first_venue_gallery(document,draft,fetcher,stage,limit,photo_search,google_photos,licensed_photos):
+    official,references,social=venue_page_groups(document,draft)
+    stage('checking_official_venue_photos')
+    gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=official,follow_media=True)
+    if gallery:return gallery
+    stage('checking_press_and_reference_photos')
+    gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=[url for url in references if url not in official],follow_media=True)
+    if gallery:return gallery
+    if licensed_photos:
+        stage('checking_openly_licensed_venue_photos')
+        places=[dict(place) for place in draft['analysis']['action'].get('data',[])]
+        for place in places:
+            page=document.metadata.get('licensed_venue_identity_pages',{}).get(place.get('address'))
+            if page:place['identity_page_url']=page
+        if len(places)==1 and not places[0].get('website_url') and official:places[0]['website_url']=official[0]
+        try:gallery=licensed_photos(places)
+        except SourceError:gallery=[]
+        if gallery:return gallery
+    if photo_search:
+        stage('searching_official_venue_website')
+        try:pages=photo_search(draft['analysis']['action']['data'])
+        except GenerationPending:raise
+        except SourceError:pages=[]
+        document.metadata['venue_photo_discovery_pages']=pages
+        _,discovered,facebook=venue_page_groups(document,draft)
+        gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=[url for url in discovered if url not in references],follow_media=True)
+        if gallery:return gallery
+        social=list(dict.fromkeys(social+facebook))
+        if pages:
+            stage('retrying_real_venue_photo_search')
+            try:recovered=photo_search(draft['analysis']['action']['data'],recovery=True,exclude_urls=pages)
+            except GenerationPending:raise
+            except (SourceError,TypeError):recovered=[]
+            document.metadata['venue_photo_discovery_pages']=list(dict.fromkeys(pages+recovered))
+            _,discovered,facebook=venue_page_groups(document,draft)
+            gallery=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=[url for url in discovered if url not in references+pages],follow_media=True)
+            if gallery:return gallery
+            social=list(dict.fromkeys(social+facebook))
+    gallery=google_venue_gallery(draft,stage,google_photos)
+    if gallery:return gallery
+    stage('checking_public_facebook_photos')
+    # Only public supplied/discovered pages; PublicFetcher enforces robots,
+    # redirect, timeout and size limits. Login walls are never bypassed.
+    return linked_venue_gallery(document,draft,fetcher,stage,limit,pages=social)
+
+
+def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, photo_search=None, google_photos=None, licensed_photos=None):
     """Ordered source figures only. Never generate filler images for a gallery."""
     sources = [document]
-    for url in primary_visual_urls(document):
+    from .licensed_venue_photos import venue_photo_mode,LicensedVenuePhotos
+    venue=draft.get('analysis',{}).get('action',{}).get('kind')=='places'
+    mode=venue_photo_mode()
+    licensed=mode=='licensed' and venue
+    # Venue links are visited by the ordered venue chain, after email photos.
+    for url in ([] if venue and mode=='source_first' else primary_visual_urls(document)):
         try:
             from .documents import parse_document
             sources.insert(0, parse_document(fetcher.fetch(url)))
@@ -599,6 +731,8 @@ def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, phot
     for source in sources:
         selected, seen = [], set()
         for figure in rank_figures(source, draft)[:8]:
+            host=(urlsplit(figure.get('url','')).hostname or '').lower()
+            if venue and mode!='google' and (host.endswith(('.googleusercontent.com','.ggpht.com')) or host=='places.googleapis.com'):continue
             stage("selecting_source_visual")
             value = source_visual(replace(source, figures=[figure], metadata={k: v for k, v in source.metadata.items() if k != "pdf_url"}), draft, fetcher, allow_pdf=False)
             if value:
@@ -616,6 +750,29 @@ def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, phot
         fallback = source_visual(source, draft, fetcher) if source.metadata.get('pdf_url') else None
         if fallback:
             return [fallback]
+    if venue and mode=='source_first':
+        return source_first_venue_gallery(document,draft,fetcher,stage,limit,photo_search,google_photos,licensed_photos)
+    if licensed:
+        stage('checking_permitted_venue_photos')
+        venues=linked_venue_gallery(document,draft,fetcher,stage,limit,require_permission=True)
+        if not venues and document.metadata.get('venue_reference_pages'):
+            venues=linked_venue_gallery(document,draft,fetcher,stage,limit,pages=document.metadata['venue_reference_pages'],require_permission=True)
+        if venues:return venues
+        stage('checking_openly_licensed_venue_photos')
+        lookup=licensed_photos or LicensedVenuePhotos(fetcher=fetcher).gallery
+        places=[dict(place) for place in draft['analysis']['action'].get('data',[])]
+        for place in places:
+            page=document.metadata.get('licensed_venue_identity_pages',{}).get(place.get('address'))
+            if page:place['identity_page_url']=page
+        if len(places)==1 and not places[0].get('website_url'):
+            from .venue_enrichment import newsletter_fields
+            website=newsletter_fields(document).get('website')
+            if website:places[0]['website_url']=website
+        gallery=lookup(places)
+        if gallery:return gallery
+        # One cached discovery request can recover a usable official/media
+        # website when the newsletter supplied only a social profile or dead URL.
+        return searched_venue_gallery(document,draft,fetcher,stage,photo_search,limit,require_permission=True,retry=False)
     venues=google_venue_gallery(draft,stage,google_photos)
     if not venues:venues=linked_venue_gallery(document,draft,fetcher,stage,limit)
     if not venues and document.metadata.get('venue_reference_pages'):

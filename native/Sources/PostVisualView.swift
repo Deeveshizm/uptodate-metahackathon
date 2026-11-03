@@ -74,6 +74,26 @@ struct PostVisualView: View {
                     GooglePhotoCreditCard(credit: credit)
                         .padding(.horizontal, inset).padding(.top, 4)
                 }
+                if ["venue_website", "wikimedia_commons", "openverse"].contains(visual.provider ?? ""),
+                   let license = visual.licenseUrl, let url = URL(string: license),
+                   ["https", "http"].contains(url.scheme ?? ""), url.user == nil, url.password == nil {
+                    HStack(spacing: 6) {
+                        Text("Photo: \(visual.attribution ?? "Original photographer")")
+                            .lineLimit(2)
+                        Text("·")
+                        Link(visual.licenseName ?? "License", destination: url)
+                        if visual.modifications != nil { Text("· Resized") }
+                        Spacer(minLength: 0)
+                        if let value = visual.sourceUrl, let source = URL(string: value),
+                           ["https", "http"].contains(source.scheme ?? ""), source.user == nil, source.password == nil {
+                            Link(destination: source) { Image(systemName: "arrow.up.right") }
+                                .accessibilityLabel("Original photo and credit")
+                        }
+                    }
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.horizontal, inset).padding(.top, 3)
+                    .accessibilityIdentifier("post.licensedPhotoCredit")
+                }
             }
         }
     }

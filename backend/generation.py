@@ -164,7 +164,7 @@ class MetaModel:
               "muse-spark-1.1": (1.25, 4.25), "muse-wonder-1.0": (4.0, 20.0)}
 
     def __init__(self, transport=None):
-        self.model = os.environ.get("META_MODEL", "muse-spark-1.3")
+        self.model = os.environ.get("META_MODEL", "muse-wonder-1.0")
         if self.model not in self.PRICES:
             raise SourceError("Choose a supported Meta Standard model; Contributor mode is disabled for newsletter content")
         self.key, self.transport = os.environ.get("MODEL_API_KEY", "").strip(), transport
