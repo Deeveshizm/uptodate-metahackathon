@@ -112,6 +112,15 @@ Select the **UpToDate** scheme in Xcode, choose an iPhone simulator, and run. Ph
 
 **The iOS app connects to the hosted backend. Testers do not need environment files or backend API keys.**
 
+## Shared demo account
+
+Once you have access to the beta app, you can sign in with this shared test account:
+
+- **Email:** `deevesh.jain99@gmail.com`
+- **Password:** `G00dP@ssW0rd`
+
+This account is shared publicly. Use it only for testing; its feed and account settings can be changed by other testers. Create your own account for personal subscriptions and content.
+
 ## Built with
 
 SwiftUI · Python/FastAPI · Supabase Auth, PostgreSQL, and Storage · Google Cloud Run and Cloud Tasks · Cloudflare Email Routing and an Email Worker · Meta Model API
