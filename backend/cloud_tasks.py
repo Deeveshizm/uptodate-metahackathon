@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import time
+import threading
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
@@ -25,9 +26,9 @@ def service_lease(store, name):
 
 class CloudDispatcher:
     def __init__(self, store, client=None):
-        from google.cloud import tasks_v2
         self.store = store
-        self.client = client or tasks_v2.CloudTasksClient()
+        self._client = client
+        self._client_lock = threading.Lock()
         self.project = os.environ['GOOGLE_CLOUD_PROJECT']
         self.location = os.environ.get('CLOUD_TASKS_LOCATION', 'us-east4')
         self.queue = os.environ.get('CLOUD_TASKS_QUEUE', 'uptodate-generation')
@@ -37,7 +38,15 @@ class CloudDispatcher:
         if self.worker and (parsed.scheme != 'https' or not parsed.hostname or not parsed.hostname.endswith('.run.app')
                             or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
             raise ValueError('CLOUD_WORKER_URL must be the HTTPS Cloud Run worker origin')
-        self.parent = self.client.queue_path(self.project, self.location, self.queue)
+        self.parent = f'projects/{self.project}/locations/{self.location}/queues/{self.queue}'
+
+    @property
+    def client(self):
+        with self._client_lock:
+            if self._client is None:
+                from google.cloud import tasks_v2
+                self._client = tasks_v2.CloudTasksClient()
+            return self._client
 
     def enqueue_pending(self, limit=20):
         from google.api_core.exceptions import AlreadyExists

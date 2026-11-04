@@ -1,9 +1,15 @@
 import Foundation
 
-struct AuthConfiguration: Decodable {
+struct AuthConfiguration: Codable {
     let mode: String
     let url: String?
     let publishableKey: String?
+}
+
+struct CachedAuthConfiguration: Codable {
+    let backend: String
+    let savedAt: Date
+    let configuration: AuthConfiguration
 }
 
 enum PasswordRequirement: String, CaseIterable, Identifiable {

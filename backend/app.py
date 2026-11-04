@@ -38,6 +38,7 @@ from .source_identity import newsletter_identity
 from .source_lifecycle import category, maintain_sources, management_source
 from .profile_avatars import MAX_UPLOAD, normalize_avatar
 from .cloudflare_receiving import MAX_EMAIL_BYTES, INGEST_PATH, authentic_delivery, receiving_domain, relay_from_environment, save_delivery
+from .post_batch import PostBatch
 
 
 def uid():
@@ -233,13 +234,26 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 with suppress(asyncio.CancelledError):
                     await poller
 
-    app = FastAPI(title="UpToDate prototype", version="0.1.0", lifespan=lifespan)
+    @asynccontextmanager
+    async def runtime_lifespan(app):
+        try:
+            async with lifespan(app):
+                yield
+        finally:
+            if auth and hasattr(auth, 'close'):
+                auth.close()
+            if hasattr(store, 'close'):
+                store.close()
+
+    app = FastAPI(title="UpToDate prototype", version="0.1.0", lifespan=runtime_lifespan)
     app.state.store = store
     app.state.engine = engine
     app.state.test_relay = relay
     app.state.process_job = process_job
     app.state.receive_mail = receive_mail
     app.state.dispatcher = dispatcher
+    from .read_compression import ReadCompressionMiddleware
+    app.add_middleware(ReadCompressionMiddleware)
     hosts = ['*.run.app'] if cloud else ["localhost", "127.0.0.1", "testserver", "[::1]"]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
     bearer = HTTPBearer(auto_error=False)
@@ -384,8 +398,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             raise HTTPException(404, "Post not found")
         return row
 
-    def post_json(db, row, user):
-        source = db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
+    def post_json(db, row, user, batch=None):
+        source = batch.sources.get(row['source_id']) if batch is not None else db.execute("SELECT * FROM sources WHERE id=?", (row["source_id"],)).fetchone()
         analysis, visual = json.loads(row["analysis"]), json.loads(row["visual"])
         saved = None
         paper = analysis.get('source') or {}
@@ -393,14 +407,16 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 urlsplit(row['original_url']).hostname in ('arxiv.org', 'www.arxiv.org') or paper.get('doi')):
             revision = paper.get('revision_hash')
             if not revision and row['artifact_key']:
-                artifact = db.execute('SELECT content_hash FROM generation_artifacts WHERE cache_key=?', (row['artifact_key'],)).fetchone()
-                revision = artifact['content_hash'] if artifact else None
+                if batch is not None:revision=batch.artifact_revisions.get(row['artifact_key'])
+                else:
+                    artifact = db.execute('SELECT content_hash FROM generation_artifacts WHERE cache_key=?', (row['artifact_key'],)).fetchone()
+                    revision = artifact['content_hash'] if artifact else None
             query = 'SELECT url,title,metadata,content_hash,spans FROM documents WHERE user_id=? AND job_id=? AND url=?'
             params = [user['id'], row['job_id'], row['original_url']]
             if revision:
                 query += ' AND content_hash=?'
                 params.append(revision)
-            saved = db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
+            saved = batch.saved_document(row,revision) if batch is not None else db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
             metadata = json.loads(saved['metadata']) if saved else {}
             if metadata.get('abstract'):
                 paper = {'url': row['original_url'], 'title': saved['title'], 'authors': metadata.get('author', ''),
@@ -431,7 +447,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
                 if revision:
                     query += ' AND content_hash=?'
                     params.append(revision)
-                saved = db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
+                saved = batch.saved_document(row,revision) if batch is not None else db.execute(query + ' ORDER BY created_at ASC LIMIT 1', params).fetchone()
             document = None
             if saved:
                 from .documents import Document
@@ -454,11 +470,15 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             "publication": analysis.get("publication", {}),
             "is_demo": bool(row["is_demo"]), "source": dict(source),
             "author": source["name"], "newsletter_name": source["name"], "newsletter_url": source["url"],
-            "discovered_via": [dict(item) for item in db.execute("SELECT s.id,s.name,s.url FROM post_sources ps JOIN sources s ON s.id=ps.source_id WHERE ps.post_id=? AND ps.user_id=? AND s.user_id=?", (row["id"], user["id"], user["id"]))],
+            "discovered_via": batch.references.get(row['id'],[]) if batch is not None else [dict(item) for item in db.execute("SELECT s.id,s.name,s.url FROM post_sources ps JOIN sources s ON s.id=ps.source_id WHERE ps.post_id=? AND ps.user_id=? AND s.user_id=?", (row["id"], user["id"], user["id"]))],
             "evidence": json.loads(row["evidence"]),
-            "bookmarked": bool(db.execute("SELECT 1 FROM bookmarks WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
-            "read": bool(db.execute("SELECT 1 FROM reads WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
+            "bookmarked": row['id'] in batch.bookmarked if batch is not None else bool(db.execute("SELECT 1 FROM bookmarks WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
+            "read": row['id'] in batch.read if batch is not None else bool(db.execute("SELECT 1 FROM reads WHERE user_id=? AND post_id=?", (user["id"], row["id"])).fetchone()),
         }
+
+    def posts_json(db,rows,user):
+        batch=PostBatch(db,rows,user)
+        return [post_json(db,row,user,batch) for row in rows]
 
     @app.get("/health")
     def health():
@@ -841,7 +861,8 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
         with store.connect() as db:
             maintain_sources(db, user['id'])
             rows = db.execute("SELECT s.*,EXISTS(SELECT 1 FROM newsletter_confirmations c WHERE c.source_id=s.id AND c.user_id=s.user_id AND c.status='confirmed') AS subscription_confirmed FROM sources s WHERE s.user_id=? AND s.archived_at IS NULL ORDER BY s.name", (user['id'],)).fetchall()
-            return [management_source(row, db.execute('SELECT COUNT(*) FROM posts WHERE source_id=? AND user_id=?', (row['id'], user['id'])).fetchone()[0]) for row in rows]
+            counts={row['source_id']:row['total'] for row in db.execute('SELECT source_id,COUNT(*) AS total FROM posts WHERE user_id=? GROUP BY source_id',(user['id'],))}
+            return [management_source(row,counts.get(row['id'],0)) for row in rows]
 
     @app.get("/v1/inbox/candidates")
     def inbox_candidates(user=Depends(current_user)):
@@ -991,7 +1012,7 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
     @app.get("/v1/review")
     def review(user=Depends(current_user)):
         with store.connect() as db:
-            return [post_json(db, row, user) for row in db.execute("SELECT * FROM posts WHERE user_id=? AND status='review' ORDER BY created_at", (user["id"],)).fetchall()]
+            return posts_json(db,db.execute("SELECT * FROM posts WHERE user_id=? AND status='review' ORDER BY created_at", (user["id"],)).fetchall(),user)
 
     @app.post("/v1/review/{post_id}/approve")
     def approve(post_id: str, body: Approval, user=Depends(current_user)):
@@ -1051,14 +1072,37 @@ def create_app(db_path: str | None = None, source_fetcher=None, generator=None, 
             rows=db.execute('SELECT p.*'+page_sql+' ORDER BY p.published_date DESC,p.created_at DESC,p.id DESC LIMIT ?',page_params+[limit+1]).fetchall()
             next_cursor=rows[limit-1]['id'] if len(rows)>limit else None
             rows=rows[:limit]
-            posts = [post_json(db, row, user) for row in rows]
+            posts = posts_json(db,rows,user)
         return {"date": edition_date, "posts": posts, "total": totals[0], "unread": totals[1], "finite": True,'next_cursor':next_cursor}
 
     @app.get("/v1/bookmarks")
     def bookmarks(user=Depends(current_user)):
         with store.connect() as db:
             rows = db.execute("SELECT p.* FROM posts p JOIN bookmarks b ON b.post_id=p.id WHERE b.user_id=? AND p.status='approved' ORDER BY p.created_at DESC", (user["id"],)).fetchall()
-            return [post_json(db, row, user) for row in rows]
+            return posts_json(db,rows,user)
+
+    def mail_state(user):
+        # Read jobs before the feed so a completed job cannot be paired with an
+        # older feed that polling would otherwise never know to refresh.
+        return {'jobs':jobs(user),'sources':sources(user),
+                'inbox_candidates':inbox_candidates(user),
+                'newsletter_confirmations':json.loads(newsletter_confirmations(user).body)}
+
+    @app.get('/v1/bootstrap')
+    def bootstrap(user=Depends(current_user), credentials=Depends(bearer)):
+        account=me(user,credentials)
+        state=mail_state(user)
+        state.update(account=account,feed=feed(day=None,history=True,read_state='unread',limit=50,before=None,user=user))
+        return JSONResponse(state,headers={'Cache-Control':'private, no-store'})
+
+    @app.get('/v1/updates')
+    def updates(user=Depends(current_user)):
+        return JSONResponse(mail_state(user),headers={'Cache-Control':'private, no-store'})
+
+    @app.get('/v1/library')
+    def library(user=Depends(current_user)):
+        return JSONResponse({'read_feed':feed(day=None,history=True,read_state='read',limit=50,before=None,user=user),
+            'bookmarks':bookmarks(user),'review':review(user)},headers={'Cache-Control':'private, no-store'})
 
     @app.get("/v1/posts/{post_id}")
     def post(post_id: str, user=Depends(current_user)):

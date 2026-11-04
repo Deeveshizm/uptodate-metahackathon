@@ -98,7 +98,7 @@ The backend is designed to avoid paying for the same work repeatedly:
 
 Bloom-filter prechecks run alongside the exact generation cache. Each worker keeps a small filter of artifact fingerprints and refreshes it from the shared database. Possible matches use an exact lookup; negative checks proceed through an atomic database claim, so stale filters and false positives cannot cause duplicate generation or reuse the wrong result. Cached results avoid repeated model calls, while the filter reduces cache-check work. No additional cache service is required.
 
-Text generation, Biggie, and model-assisted retrieval use **Muse Wonder 1.0** by default. Fallback illustrations use **Muse Image**. `.eml` imports retain their extractive import flow.
+Text generation, Biggie, and model-assisted retrieval use **Muse Spark 1.3** by default. Fallback illustrations use **Muse Image**. `.eml` imports retain their extractive import flow.
 
 ## Install the iPhone beta
 
@@ -129,7 +129,6 @@ This account is shared publicly. Use it only for testing; its feed and account s
 
 SwiftUI · Python/FastAPI · Supabase Auth, PostgreSQL, and Storage · Google Cloud Run and Cloud Tasks · Cloudflare Email Routing and an Email Worker · Meta Model API
 
-The receiving layer also retains legacy Resend support. Backend development can use Ollama for explicit local text-inference testing.
 
 | Folder | Purpose |
 | --- | --- |

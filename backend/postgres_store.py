@@ -1,14 +1,16 @@
 """Persistent server store; preserves the existing repository's SQL contract.
 
 All runtime tables live in a non-exposed schema, independent of Supabase Auth.
-Connections are short lived and use no prepared statements (Supavisor compatible).
+Connections are bounded and reused without prepared statements (Supavisor compatible).
 Schema changes are applied explicitly, never during an API container cold start.
 """
 import os
 import re
+import threading
 from contextlib import contextmanager
 
 import psycopg
+from psycopg_pool import ConnectionPool
 
 SCHEMA = 'uptodate_runtime'
 VERSION = 1
@@ -65,6 +67,19 @@ class Connection:
 class PostgresStore:
     def __init__(self, url):
         self.path = url
+        self._depth = threading.local()
+        options = dict(prepare_threshold=None, row_factory=row_factory, connect_timeout=10,
+                       application_name='uptodate')
+        if os.environ.get('UPTODATE_ENV') == 'cloud':
+            options['sslmode'] = 'require'
+        pool_options = dict(conninfo=url, kwargs=options, min_size=0, timeout=10,
+            max_idle=120, max_lifetime=600, open=False,
+            check=ConnectionPool.check_connection)
+        self._pool = ConnectionPool(max_size=4, **pool_options)
+        # Media uploads commit their orphan-recovery registry independently of
+        # the outer post transaction. Reserve connections prevent nested work
+        # from waiting behind a full pool of outer transactions.
+        self._nested_pool = ConnectionPool(max_size=2, **pool_options)
         with self.connect() as db:
             version = db.execute('SELECT version FROM schema_version WHERE id=1').fetchone()
             if not version or version['version'] != VERSION:
@@ -72,16 +87,22 @@ class PostgresStore:
 
     @contextmanager
     def connect(self):
-        options = dict(prepare_threshold=None, row_factory=row_factory, connect_timeout=10,
-                       application_name='uptodate')
-        # Local integration tests use a Unix socket; hosted connections require TLS.
-        if os.environ.get('UPTODATE_ENV') == 'cloud':
-            options['sslmode'] = 'require'
-        with psycopg.connect(self.path, **options) as connection:
-            # Transaction-local settings work through transaction poolers and do
-            # not leak into the next tenant using the underlying connection.
-            connection.execute(f"SET LOCAL search_path TO {SCHEMA},pg_catalog; "
-                               "SET LOCAL statement_timeout TO '30s'; "
-                               "SET LOCAL lock_timeout TO '10s'; "
-                               "SET LOCAL extra_float_digits TO 3")
-            yield Connection(connection)
+        depth = getattr(self._depth, 'value', 0)
+        pool = self._nested_pool if depth else self._pool
+        pool.open()
+        with pool.connection() as connection:
+            self._depth.value = depth + 1
+            try:
+                # These settings reset on commit/rollback, including through
+                # Supabase's transaction pooler. No caller identity is cached.
+                connection.execute(f"SET LOCAL search_path TO {SCHEMA},pg_catalog; "
+                                   "SET LOCAL statement_timeout TO '30s'; "
+                                   "SET LOCAL lock_timeout TO '10s'; "
+                                   "SET LOCAL extra_float_digits TO 3")
+                yield Connection(connection)
+            finally:
+                self._depth.value = depth
+
+    def close(self):
+        self._pool.close()
+        self._nested_pool.close()

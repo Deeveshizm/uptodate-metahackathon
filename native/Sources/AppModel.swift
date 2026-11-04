@@ -27,6 +27,8 @@ final class AppModel: ObservableObject {
     private let biggieConversations = BiggieConversationStore()
     @Published private(set) var guideProgressReady = false
     @Published var offline = false
+    @Published private(set) var refreshing = false
+    @Published private(set) var loadingLibrary = false
     @Published var authConfiguration: AuthConfiguration?
     @Published private(set) var recoveryReady = false
     @Published private(set) var pendingEmail: String?
@@ -37,6 +39,13 @@ final class AppModel: ObservableObject {
     private var authSession: AuthSession?
     private var refreshTask: Task<AuthSession, Error>?
     private var sessionEpoch = 0
+    private let refreshRequests = RefreshRequests()
+    private var libraryTask: Task<Void, Never>?
+    private var profileTask: Task<Void, Never>?
+    private var configurationTask: Task<AuthConfiguration, Error>?
+    private var configurationSavedAt = Date.distantPast
+    private var libraryLoadedAt = Date.distantPast
+    private var pollingJobs = false
     private var guideOwner: String?
     private var guideLoadTask: Task<GuideProgress?, Never>?
     private var guideSyncTask: Task<Void, Never>?
@@ -65,6 +74,14 @@ final class AppModel: ObservableObject {
     }()
 
     init() {
+        let configurationFile = cache.deletingLastPathComponent().appendingPathComponent("auth-configuration.json")
+        if let data = try? Data(contentsOf: configurationFile),
+           let saved = try? JSONDecoder().decode(CachedAuthConfiguration.self, from: data),
+           saved.backend == base.absoluteString, Date().timeIntervalSince(saved.savedAt) < 86_400,
+           saved.configuration.mode == "local" || (try? AuthClient(configuration: saved.configuration)) != nil {
+            authConfiguration = saved.configuration
+            configurationSavedAt = saved.savedAt
+        }
         if let stored = Session.read() {
             authSession = try? JSONDecoder().decode(AuthSession.self, from: Data(stored.utf8))
             token = authSession?.accessToken ?? stored
@@ -110,6 +127,7 @@ final class AppModel: ObservableObject {
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         let usedToken = token
         let (data, response) = try await URLSession.shared.data(for: request)
+        try Task.checkCancellation()
         guard epoch == sessionEpoch else { throw CancellationError() }
         guard let response = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard 200..<300 ~= response.statusCode else {
@@ -133,10 +151,7 @@ final class AppModel: ObservableObject {
         await loadAuthConfiguration()
         guard token != nil else { return }
         await perform {
-            self.account = try await self.get("v1/me")
-            await self.syncTimezone()
-            await self.refreshAvatar()
-            try await self.reload()
+            try await self.reload(waitForLibrary: false)
         }
     }
 
@@ -155,13 +170,31 @@ final class AppModel: ObservableObject {
     }
 
     func loadAuthConfiguration() async {
+        guard authConfiguration == nil || Date().timeIntervalSince(configurationSavedAt) >= 86_400 else { return }
         do {
-            let (data, response) = try await URLSession.shared.data(from: base.appendingPathComponent("v1/auth/config"))
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            let configuration = try decoder.decode(AuthConfiguration.self, from: data)
-            guard ["local", "supabase"].contains(configuration.mode) else { throw URLError(.cannotParseResponse) }
+            let task: Task<AuthConfiguration, Error>
+            if let existing = configurationTask { task = existing }
+            else {
+                task = Task {
+                    let (data, response) = try await URLSession.shared.data(from: self.base.appendingPathComponent("v1/auth/config"))
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                    let configuration = try self.decoder.decode(AuthConfiguration.self, from: data)
+                    guard ["local", "supabase"].contains(configuration.mode) else { throw URLError(.cannotParseResponse) }
+                    if configuration.mode == "supabase" { _ = try AuthClient(configuration: configuration) }
+                    return configuration
+                }
+                configurationTask = task
+            }
+            let configuration = try await task.value
+            configurationTask = nil
             authConfiguration = configuration
-        } catch { self.error = "Cannot connect to the account service. Start the backend and retry." }
+            configurationSavedAt = Date()
+            let saved = CachedAuthConfiguration(backend: base.absoluteString, savedAt: configurationSavedAt, configuration: configuration)
+            try? JSONEncoder().encode(saved).write(to: cache.deletingLastPathComponent().appendingPathComponent("auth-configuration.json"), options: [.atomic, .completeFileProtection])
+        } catch {
+            configurationTask = nil
+            if authConfiguration == nil { self.error = "Cannot connect to the account service. Please retry." }
+        }
     }
 
     private func authClient() throws -> AuthClient {
@@ -180,10 +213,7 @@ final class AppModel: ObservableObject {
         clearLocalSession()
         do {
             try persistSession(session)
-            account = try await get("v1/me")
-            await syncTimezone()
-            await refreshAvatar()
-            try await reload()
+            try await reload(waitForLibrary: false)
         } catch {
             clearLocalSession()
             throw error
@@ -404,10 +434,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func refresh() async { await perform { try await self.reload() } }
+    func refresh() async { await perform { try await self.reload(waitForLibrary: false) } }
 
     func refreshAccount() async {
-        await perform { self.account = try await self.get("v1/me"); await self.refreshAvatar(); try await self.reload() }
+        await perform { try await self.reload(waitForLibrary: false) }
     }
 
     func savePersonalization(interests: [String], complete: Bool) async -> Bool {
@@ -540,31 +570,70 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func reload() async throws {
+    private func reload(waitForLibrary: Bool = true) async throws {
         let epoch = sessionEpoch
-        // Read job states before the feed: a fast background job can otherwise
-        // finish between parallel requests, leaving an empty feed paired with
-        // an already-completed job that polling will never see transition.
-        let jobs: [Job] = try await get("v1/jobs")
-        async let feed: DailyFeed = get("v1/feed", query: feedQuery(read: false))
-        async let readFeed: DailyFeed = get("v1/feed", query: feedQuery(read: true))
-        async let bookmarks: [Post] = get("v1/bookmarks")
-        async let sources: [NewsletterSource] = get("v1/me/sources")
-        async let review: [Post] = get("v1/review")
-        async let candidates: [IncomingNewsletter] = get("v1/inbox/candidates")
-        async let confirmations: [NewsletterConfirmation] = get("v1/newsletter-confirmations")
-        let values = try await (feed, bookmarks, sources, review, candidates, readFeed, confirmations)
-        guard epoch == sessionEpoch else { throw CancellationError() }
-        self.feed = values.0; self.bookmarks = values.1; self.sources = values.2
-        self.review = values.3; self.jobs = jobs
-        self.inboxCandidates = values.4
-        self.newsletterConfirmations = values.6
-        self.readFeed = values.5
+        let version = refreshRequests.generation
+        refreshing = true
+        defer { if epoch == sessionEpoch, version == refreshRequests.generation { refreshing = false } }
+        let data = try await refreshRequests.load("bootstrap") { try await self.request("v1/bootstrap", timeout: 30) }
+        let state = try decoder.decode(BootstrapState.self, from: data)
+        guard epoch == sessionEpoch, version == refreshRequests.generation else { throw CancellationError() }
+        account = state.account; feed = state.feed; jobs = state.jobs; sources = state.sources
+        inboxCandidates = state.inboxCandidates; newsletterConfirmations = state.newsletterConfirmations
+        lastIdleJobPoll = Date()
         offline = false
-        if let account {
-            let snapshot = Snapshot(account: account, feed: self.feed, bookmarks: self.bookmarks, sources: self.sources, readFeed: self.readFeed)
-            try JSONEncoder().encode(snapshot).write(to: cache, options: [.atomic, .completeFileProtection])
+        saveSnapshot()
+        // Avatar and timezone updates must not delay the first usable feed.
+        profileTask?.cancel()
+        profileTask = Task {
+            let previousTimezone = self.account?.timezone
+            await self.syncTimezone()
+            guard !Task.isCancelled, epoch == self.sessionEpoch else { return }
+            await self.refreshAvatar()
+            if !Task.isCancelled, epoch == self.sessionEpoch, previousTimezone != self.account?.timezone {
+                // Recalculate the edition boundary after travelling, without
+                // delaying the initial saved feed or cancelling this task.
+                self.profileTask = nil
+                if !self.busy { try? await self.reload(waitForLibrary: false) }
+            }
         }
+        if waitForLibrary { try await loadLibrary() }
+        else {
+            libraryTask?.cancel()
+            libraryTask = Task { try? await self.loadLibrary() }
+        }
+    }
+
+    private func saveSnapshot() {
+        guard let account else { return }
+        let snapshot = Snapshot(account: account, feed: feed, bookmarks: bookmarks, sources: sources, readFeed: readFeed)
+        try? JSONEncoder().encode(snapshot).write(to: cache, options: [.atomic, .completeFileProtection])
+    }
+
+    private func loadLibrary() async throws {
+        let epoch = sessionEpoch
+        let version = refreshRequests.generation
+        loadingLibrary = true
+        defer { if epoch == sessionEpoch, version == refreshRequests.generation { loadingLibrary = false } }
+        let data = try await refreshRequests.load("library") { try await self.request("v1/library", timeout: 30) }
+        let state = try decoder.decode(LibraryState.self, from: data)
+        guard epoch == sessionEpoch, version == refreshRequests.generation else { throw CancellationError() }
+        readFeed = state.readFeed; bookmarks = state.bookmarks; review = state.review
+        libraryLoadedAt = Date()
+        saveSnapshot()
+    }
+
+    func refreshLibraryIfNeeded() async {
+        guard account != nil, !offline, Date().timeIntervalSince(libraryLoadedAt) >= 30 else { return }
+        do { try await loadLibrary() }
+        catch { /* Home remains available; the next library visit retries. */ }
+    }
+
+    private func invalidateRefreshes() {
+        refreshRequests.invalidate()
+        libraryTask?.cancel(); libraryTask = nil
+        profileTask?.cancel(); profileTask = nil
+        refreshing = false; loadingLibrary = false
     }
 
     private func feedQuery(read: Bool, before: String? = nil) -> [URLQueryItem] {
@@ -579,9 +648,11 @@ final class AppModel: ObservableObject {
         if read { loadingReadHistory = true } else { loadingOlder = true }
         defer { if read { loadingReadHistory = false } else { loadingOlder = false } }
         let epoch = sessionEpoch
+        let version = refreshRequests.generation
         do {
             let page: DailyFeed = try await get("v1/feed", query: feedQuery(read: read, before: cursor))
-            guard epoch == sessionEpoch, let current = read ? readFeed : feed, current.nextCursor == cursor else { return }
+            guard epoch == sessionEpoch, version == refreshRequests.generation,
+                  let current = read ? readFeed : feed, current.nextCursor == cursor else { return }
             let known = Set(current.posts.map(\.id))
             let merged = DailyFeed(date: page.date, posts: current.posts + page.posts.filter { !known.contains($0.id) }, total: page.total, unread: page.unread, finite: page.finite, nextCursor: page.nextCursor)
             if read { readFeed = merged } else { feed = merged }
@@ -597,6 +668,7 @@ final class AppModel: ObservableObject {
 
     private func perform(_ operation: () async throws -> Void) async {
         guard !busy else { return }
+        invalidateRefreshes()
         busy = true
         defer {
             busy = false
@@ -693,28 +765,29 @@ final class AppModel: ObservableObject {
     }
 
     func pollJobs() async {
-        guard !busy, account != nil else { return }
+        guard !busy, !pollingJobs, account != nil else { return }
         let pending = jobs.contains(where: { ["queued", "processing"].contains($0.status) })
         guard pending || Date().timeIntervalSince(lastIdleJobPoll) >= 15 else { return }
         lastIdleJobPoll = Date()
+        pollingJobs = true
+        defer { pollingJobs = false }
         let epoch = sessionEpoch
+        let version = refreshRequests.generation
         do {
-            if account?.aliasStatus != "active" { account = try await get("v1/me") }
-            let updated: [Job] = try await get("v1/jobs")
-            async let candidates: [IncomingNewsletter] = get("v1/inbox/candidates")
-            async let confirmations: [NewsletterConfirmation] = get("v1/newsletter-confirmations")
-            async let sourceList: [NewsletterSource] = get("v1/me/sources")
-            let mail = try await (candidates, confirmations, sourceList)
-            guard epoch == sessionEpoch else { return }
-            inboxCandidates = mail.0; newsletterConfirmations = mail.1; sources = mail.2
-            let discovered = Set(updated.map(\.id)) != Set(jobs.map(\.id))
-            let finished = updated.contains { job in
+            let data = try await refreshRequests.load("updates") { try await self.request("v1/updates") }
+            let state = try decoder.decode(MailState.self, from: data)
+            guard !busy, epoch == sessionEpoch, version == refreshRequests.generation else { return }
+            inboxCandidates = state.inboxCandidates; newsletterConfirmations = state.newsletterConfirmations; sources = state.sources
+            let discovered = Set(state.jobs.map(\.id)) != Set(jobs.map(\.id))
+            let finished = state.jobs.contains { job in
                 !["queued", "processing"].contains(job.status) && jobs.contains(where: { $0.id == job.id && ["queued", "processing"].contains($0.status) })
             }
-            jobs = updated
-            if finished || discovered { try await reload() }
+            jobs = state.jobs
+            if finished || discovered || account?.aliasStatus != "active" || offline {
+                try await reload(waitForLibrary: false)
+            }
         } catch {
-            if error is URLError { offline = true }
+            if epoch == sessionEpoch, version == refreshRequests.generation, error is URLError { offline = true }
         }
     }
 
@@ -952,6 +1025,8 @@ final class AppModel: ObservableObject {
         cancelEmailFlow()
         deferredAuthURL = nil
         sessionEpoch += 1
+        invalidateRefreshes()
+        libraryLoadedAt = .distantPast
         guideLoadTask?.cancel(); guideLoadTask = nil
         guideSyncTask?.cancel(); guideSyncTask = nil
         guideOwner = nil; guideProgressReady = false; completedGuides = []

@@ -7,6 +7,7 @@ with Auth and reads their RLS-protected profile using the SAME bearer token.
 import base64
 import json
 import os
+import threading
 import uuid
 from datetime import date
 from urllib.parse import urlsplit
@@ -34,6 +35,24 @@ class SupabaseAuth:
         self.url, self.key, self.secret = url.rstrip("/"), publishable_key, secret_key
         self.transport = transport
         self.relay_aliases = relay_aliases
+        self._client = None
+        self._client_lock = threading.Lock()
+
+    @property
+    def client(self):
+        # Only the transport is shared. Credentials remain request-local, and
+        # every request still validates the current session with Supabase.
+        with self._client_lock:
+            if self._client is None:
+                self._client = httpx.Client(timeout=15, trust_env=False, transport=self.transport,
+                    limits=httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=30))
+            return self._client
+
+    def close(self):
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
 
     @classmethod
     def from_environment(cls):
@@ -51,12 +70,11 @@ class SupabaseAuth:
 
     def request(self, method, path, token, *, admin=False, **kwargs):
         key = self.secret if admin else self.key
-        with httpx.Client(timeout=15, trust_env=False, transport=self.transport) as client:
-            try:
-                result = client.request(method, self.url + path,
-                                        headers={"apikey": key, "Authorization": "Bearer " + token}, **kwargs)
-            except httpx.HTTPError:
-                raise HTTPException(503, "Account service is temporarily unavailable; try again") from None
+        try:
+            result = self.client.request(method, self.url + path,
+                headers={"apikey": key, "Authorization": "Bearer " + token}, **kwargs)
+        except httpx.HTTPError:
+            raise HTTPException(503, "Account service is temporarily unavailable; try again") from None
         if result.status_code in (401, 403):
             if admin:
                 raise HTTPException(503, "Server account administration is unavailable; your account was not deleted")

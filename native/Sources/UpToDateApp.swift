@@ -139,7 +139,7 @@ struct RootView: View {
             if model.offline {
                 HStack {
                     Image(systemName: "wifi.slash")
-                    Text("Cached edition · backend unavailable")
+                    Text(model.refreshing ? "Saved feed · updating…" : "Cached edition · backend unavailable")
                     Spacer()
                     Button("Retry") { Task { await model.refresh() } }
                 }.font(.caption).padding(10).background(.orange.opacity(0.1))
@@ -294,7 +294,8 @@ struct LibraryView: View {
     var body: some View {
         PageScroll {
             PageHeader(title: "Saved posts", trailing: "\(model.bookmarks.count) saved")
-            if model.bookmarks.isEmpty {
+            if model.loadingLibrary && model.bookmarks.isEmpty { ProgressView().padding() }
+            else if model.bookmarks.isEmpty {
                 EmptyState(symbol: "bookmark", title: "Nothing saved yet.",
                            message: "Bookmark a post from today's edition and it will wait for you here.")
             } else {
@@ -304,7 +305,7 @@ struct LibraryView: View {
                     RowDivider()
                 }
             }
-        }.toolbar(.hidden)
+        }.toolbar(.hidden).task { await model.refreshLibraryIfNeeded() }
     }
 }
 
@@ -330,7 +331,8 @@ struct ReadPostsView: View {
     var body: some View {
         PageScroll {
             PageHeader(title: "Read posts", trailing: "\(model.readFeed?.total ?? 0) read")
-            if model.readFeed?.posts.isEmpty != false {
+            if model.loadingLibrary && model.readFeed?.posts.isEmpty != false { ProgressView().padding() }
+            else if model.readFeed?.posts.isEmpty != false {
                 EmptyState(symbol: "checkmark.circle", title: "Nothing marked read yet.",
                            message: "Choose Mark read on a post to move it from Home to this section.")
             } else {
@@ -343,6 +345,7 @@ struct ReadPostsView: View {
                 }
             }
         }.toolbar(.hidden).refreshable { await model.refresh() }
+            .task { await model.refreshLibraryIfNeeded() }
     }
 }
 

@@ -48,7 +48,7 @@ class VenuePhotoSearch:
 
     def _lookup(self,venues,budget,*,recovery=False,exclude_urls=()):
         key=os.environ.get('MODEL_API_KEY','').strip()
-        model=os.environ.get('META_MODEL','muse-wonder-1.0')
+        model=os.environ.get('META_MODEL','muse-spark-1.3')
         if not key or model not in MetaModel.PRICES:
             raise SourceError('Venue photo search needs a supported Meta Standard model and backend key')
         instructions = ('Find public pages with customer review text and stated ratings/counts for these exact businesses. '

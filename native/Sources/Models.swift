@@ -641,6 +641,28 @@ struct DailyFeed: Codable {
     let nextCursor: String?
 }
 
+struct BootstrapState: Decodable {
+    let account: Account
+    let feed: DailyFeed
+    let jobs: [Job]
+    let sources: [NewsletterSource]
+    let inboxCandidates: [IncomingNewsletter]
+    let newsletterConfirmations: [NewsletterConfirmation]
+}
+
+struct MailState: Decodable {
+    let jobs: [Job]
+    let sources: [NewsletterSource]
+    let inboxCandidates: [IncomingNewsletter]
+    let newsletterConfirmations: [NewsletterConfirmation]
+}
+
+struct LibraryState: Decodable {
+    let readFeed: DailyFeed
+    let bookmarks: [Post]
+    let review: [Post]
+}
+
 struct Job: Codable, Identifiable {
     let id: String
     let subject: String

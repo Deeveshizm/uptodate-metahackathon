@@ -107,7 +107,7 @@ def main():
     plain={
         'UPTODATE_ENV':'cloud','AUTH_MODE':'supabase','GOOGLE_CLOUD_PROJECT':args.project,
         'SUPABASE_URL':values['SUPABASE_URL'],'SUPABASE_PUBLISHABLE_KEY':values['SUPABASE_PUBLISHABLE_KEY'],
-        'GENERATION_PROVIDER':'meta','META_MODEL':values.get('META_MODEL','muse-wonder-1.0'),
+        'GENERATION_PROVIDER':'meta','META_MODEL':values.get('META_MODEL','muse-spark-1.3'),
         'META_REASONING_EFFORT':values.get('META_REASONING_EFFORT','low'),
         'IMAGE_GENERATION_PROVIDER':'meta','NEWSLETTER_SIGNUP_MODE':'browser',
         'MUSE_IMAGE_REASONING':values.get('MUSE_IMAGE_REASONING','high'),

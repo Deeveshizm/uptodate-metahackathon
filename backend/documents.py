@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from pypdf import PdfReader
 
 from .pipeline import safe_url
 from .retrieval import Resource, SourceError
@@ -412,6 +411,7 @@ def make_spans(chunks, *, min_length=15):
 
 
 def parse_pdf(resource):
+    from pypdf import PdfReader
     try:
         reader = PdfReader(io.BytesIO(resource.body))
         if reader.is_encrypted:
