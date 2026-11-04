@@ -1,7 +1,8 @@
-"""Account-restricted private Muse API connector; credentials never grant app access."""
+"""Per-account private Muse API connector; credentials never grant app access."""
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -19,6 +20,7 @@ from .retrieval import SourceError
 from .source_lifecycle import category
 
 MAX_BODY = 128_000
+logger = logging.getLogger(__name__)
 TOKEN_PATTERN = re.compile(r'utd_muse_[A-Za-z0-9_-]{43}')
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS muse_connector_grants (
@@ -47,7 +49,12 @@ def settings():
         if len(accounts)!=len(pairs) or any(not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email) for email in accounts.values()) or len(set(accounts.values()))!=len(accounts):raise ValueError()
     except (ValueError,TypeError,AttributeError):accounts={}
     enabled=os.environ.get('PRIVATE_MUSE_CONNECTOR_ENABLED','0')=='1'
-    return accounts,enabled and bool(accounts)
+    mode=os.environ.get('MUSE_CONNECTOR_ACCESS','approved_accounts')
+    return accounts,enabled and (mode=='all_verified' or mode=='approved_accounts' and bool(accounts))
+
+
+def all_verified_accounts():
+    return os.environ.get('MUSE_CONNECTOR_ACCESS','approved_accounts')=='all_verified'
 
 
 def enabled():
@@ -62,7 +69,13 @@ def allowed(user):
 
 def available_to(user):
     accounts,active=settings()
-    return active and accounts.get(user.get('id'))==user.get('email','').casefold()
+    # Callers obtain this identity from verified Supabase authentication, or
+    # revalidate it with connector_identity before authorizing a connector.
+    try:identifier=str(uuid.UUID(user.get('id','')))
+    except (ValueError,TypeError,AttributeError):return False
+    email=user.get('email','').casefold()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):return False
+    return active and (all_verified_accounts() or accounts.get(identifier)==email)
 
 
 def issue_grant(store,user):
@@ -82,24 +95,36 @@ def issue_grant(store,user):
 def ensure_job_allowed(db,job_id):
     row=db.execute('SELECT g.* FROM muse_connector_deliveries d JOIN muse_connector_grants g ON g.id=d.grant_id WHERE d.job_id=?',(job_id,)).fetchone()
     accounts,active=settings()
-    if not row or not active or row['user_id'] not in accounts or row['revoked_at'] is not None or row['expires_at']<=time.time():
+    owner_allowed=bool(row and (all_verified_accounts() or row['user_id'] in accounts))
+    if not row or not active or not owner_allowed or row['revoked_at'] is not None or row['expires_at']<=time.time():
         raise SourceError('Muse connection was disconnected or expired; no further processing was authorized')
 
 
 class MuseConnector:
     def __init__(self,store,auth):self.store,self.auth=store,auth
 
+    def authentication_failed(self,reason,detail):
+        # Record only a fixed reason code. Credentials and their digests must
+        # never appear in logs, even when Muse sends the wrong saved key.
+        logger.warning('Muse connector authentication rejected (%s)',reason)
+        raise HTTPException(401,detail,headers={'WWW-Authenticate':'Bearer realm="UpToDate Muse"'})
+
     def authenticate(self,request):
         enabled()
         header=request.headers.get('authorization','')
-        token=header[7:] if header.startswith('Bearer ') else ''
+        parts=header.split()
+        token=parts[1] if len(parts)==2 and parts[0].casefold()=='bearer' else ''
         if not TOKEN_PATTERN.fullmatch(token):
-            raise HTTPException(401,'A private Muse connection credential is required',headers={'WWW-Authenticate':'Bearer realm="UpToDate Muse"'})
+            self.authentication_failed('missing_or_malformed_credential','An UpToDate Muse connection key is required. Use the credential saved in your existing connector’s secure authentication settings.')
         digest=hashlib.sha256(token.encode()).hexdigest()
         with self.store.connect() as db:
             row=db.execute('SELECT * FROM muse_connector_grants WHERE token_hash=?',(digest,)).fetchone()
-        if not row or not hmac.compare_digest(row['token_hash'],digest) or row['revoked_at'] is not None or row['expires_at']<=time.time():
-            raise HTTPException(401,'Muse connection was disconnected or expired')
+        if not row or not hmac.compare_digest(row['token_hash'],digest):
+            self.authentication_failed('unrecognized_credential','Muse sent an unrecognized UpToDate connection key. Use the credential saved in your existing UpToDate connector’s secure authentication settings.')
+        if row['revoked_at'] is not None:
+            self.authentication_failed('revoked_credential','This Muse connection key was replaced or disconnected. Update the key in Muse’s existing UpToDate connector settings.')
+        if row['expires_at']<=time.time():
+            self.authentication_failed('expired_credential','This Muse connection key has expired. Replace it in UpToDate Profile and update Muse’s existing connector settings.')
         user=self.auth.connector_identity(row['user_id'])
         allowed(user)
         verified_at=time.time()
@@ -107,7 +132,7 @@ class MuseConnector:
             accepted=db.execute('UPDATE muse_connector_grants SET last_used_at=? WHERE id=? AND revoked_at IS NULL AND expires_at>?',
                                 (verified_at,row['id'],verified_at)).rowcount
         if accepted!=1:
-            raise HTTPException(401,'Muse connection was disconnected or expired')
+            self.authentication_failed('credential_changed_during_request','The Muse connection key was disconnected or expired during this request. Check the existing connector’s secure authentication settings.')
         return dict(row)|{'last_used_at':verified_at}
 
     def submit(self,grant,edition):
@@ -249,7 +274,7 @@ def install(app,store,auth,current_user,schedule_job):
         schema=ConnectorEdition.model_json_schema(ref_template='#/components/schemas/{model}')
         definitions=schema.pop('$defs',{})
         result={'openapi':'3.1.0','info':{'title':'UpToDate private Muse connector','version':'1.0.0',
-            'description':'Deliver editions to the connected private account. Approved test accounts only; bearer credential required.'},
+            'description':'Deliver editions to the connected private account. A verified UpToDate account and its own Muse bearer credential are required. Reuse the existing configured connector and its securely stored credential for every newsletter. Never substitute an app sign-in token or a placeholder key.'},
             'servers':[{'url':public_origin(request)}],
             'security':[{'ConnectionCredential':[]}],
             'components':{'securitySchemes':{'ConnectionCredential':{'type':'http','scheme':'bearer'}},
@@ -261,7 +286,9 @@ def install(app,store,auth,current_user,schedule_job):
                 'responses':{'202':{'description':'Accepted or previously accepted; poll delivery status'},'401':{'description':'Credential invalid, expired or disconnected'},'409':{'description':'Conflicting edition ID or stopped newsletter'},'429':{'description':'Private delivery rate limit'}}}},
                 prefix+'/deliveries/{delivery_id}':{'get':{'operationId':'getNewsletterDelivery', 'summary':'Check the connected account’s edition processing status',
                     'parameters':[{'name':'delivery_id','in':'path','required':True,'schema':{'type':'string'}}], 'responses':{'200':{'description':'Delivery status'}}}},
-                prefix+'/newsletters':{'get':{'operationId':'listCustomNewsletters','summary':'List the connected account’s custom newsletters for optional source_id selection','responses':{'200':{'description':'Custom newsletter IDs and names'}}}}}}
+                prefix+'/newsletters':{'get':{'operationId':'listCustomNewsletters','summary':'List the connected account’s custom newsletters for optional source_id selection',
+                    'description':'Use this authenticated read to verify the existing saved connector before creating another newsletter. An empty list is success. On a 401, report the response detail and check the credential stored securely in that same connector; do not create another connector or replace an UpToDate key automatically.',
+                    'responses':{'200':{'description':'Custom newsletter IDs and names'},'401':{'description':'Connection credential missing, unrecognized, replaced, or expired; read detail for the appropriate recovery step'}}}}}}
         result['paths'][prefix+'/newsletters/{newsletter_key}/status']={'get':{
             'operationId':'getNewsletterProcessingStatus','summary':'Read whether the owner has stopped this custom newsletter',
             'description':'Read-only preflight for the stable newsletter key. should_process=false means processing was stopped or the entry was removed; submitting a new edition for it will be rejected. An unknown key represents a new newsletter.',
@@ -272,7 +299,10 @@ def install(app,store,auth,current_user,schedule_job):
     @app.get(prefix,include_in_schema=False,response_class=HTMLResponse)
     def instructions(request:Request):
         enabled()
-        return HTMLResponse(INSTRUCTIONS,headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'Referrer-Policy':'no-referrer'})
+        html=INSTRUCTIONS
+        if all_verified_accounts():
+            html=html.replace('This beta is enabled only for approved, verified test accounts.','This beta is available to verified UpToDate accounts.')
+        return HTMLResponse(html,headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",'Referrer-Policy':'no-referrer'})
 
     @app.get(prefix+'/connect',include_in_schema=False,response_class=HTMLResponse)
     def connection_page():

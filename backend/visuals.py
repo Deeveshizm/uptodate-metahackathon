@@ -7,7 +7,7 @@ import warnings
 import hashlib
 from dataclasses import replace
 import xml.etree.ElementTree as ET
-from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode, unquote
 
 from bs4 import BeautifulSoup
 from PIL import Image
@@ -32,6 +32,17 @@ def image_identity(value, base):
     url = safe_url(urljoin(base, value))
     if not url:
         return None
+    # Image CDNs can put responsive sizing in the path while embedding the
+    # original asset URL. Those renditions still represent one picture.
+    for _ in range(3):
+        parts=urlsplit(url)
+        embedded=re.search(r'(?:^|/)u_(https?://.+)$',unquote(parts.path))
+        original=''
+        if embedded:original=embedded[1]+('?' + parts.query if parts.query else '')
+        elif parts.path.endswith('/_next/image'):original=dict(parse_qsl(parts.query)).get('url','')
+        original=safe_url(original) if original else None
+        if not original or original==url:break
+        url=original
     parts = urlsplit(url)
     # Keep asset-identifying query values on image proxies; ignore renditions.
     query = sorted((k,v) for k,v in parse_qsl(parts.query) if k.lower() not in
@@ -442,6 +453,13 @@ def venue_photo_candidates(soup, region, structured):
         hero = soup.find('meta', attrs={'property':'og:image'})
         if hero:candidates.append({'url':hero.get('content',''), 'alt':''})
     for node in region.find_all(['img','source'], limit=100):
+        if node.name=='source':
+            picture=node.find_parent('picture')
+            fallback=picture.find('img') if picture else None
+            if fallback:
+                raw=[fallback.get(key,'') for key in ('data-src','data-original','data-lazy-src','nitro-lazy-src','src','srcset','data-srcset')]
+                if any(value and not value.startswith(('data:','blob:')) and not re.search(r'placeholder|spacer|transparent',value,re.I) for value in raw):
+                    continue  # Responsive sources do not add extra slides.
         if any(parent.name in ('nav','header','footer','aside') for parent in node.parents):continue
         attributes = ' '.join(str(node.get(key,'')) for key in ('class','id','alt'))
         if BRANDING.search(attributes):continue
@@ -489,6 +507,26 @@ def venue_photo_candidates(soup, region, structured):
         for url in re.findall(r'url\(\s*[\"\']?([^\"\')]+)', node.get('style','')):
             candidates.append({'url':url.strip(), 'alt':node.get('aria-label','')})
     return candidates
+
+
+def usable_venue_photo(data):
+    """Reject blank pages and flat decorative graphics, only for venue photos.
+
+    This inexpensive pixel check needs no model call. Research figures and
+    recipe illustrations use their own selection paths and remain eligible.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as original:
+            image=original.convert('RGB')
+            entropy=image.entropy()
+            image.thumbnail((128,128),Image.Resampling.LANCZOS)
+            colors=sorted(image.quantize(colors=32).getcolors(),reverse=True)
+            flat_fraction=sum(count for count,_ in colors[:3])/(image.width*image.height)
+            # Measure full-size entropy: shrinking a logo antialiases its edges
+            # and can make a flat graphic appear deceptively detailed.
+            return not (entropy<6 or flat_fraction>=0.75 and entropy<7)
+    except (OSError,ValueError):
+        return False
 
 
 def contains_multiple_venue_addresses(region):
@@ -576,21 +614,24 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                 if host.endswith(('.unsplash.com','.pexels.com','.pixabay.com')) or host in ('picsum.photos','loremflickr.com','placehold.co','via.placeholder.com'):continue
                 if re.search(r'(?:^|[/_.-])(?:default|placeholder|stock|categor(?:y|ies)|cuisines?|restaurantmenu|menu|no[-_]?image|coming[-_]?soon)(?:[/_.-]|$)',parts.path,re.I):continue
                 image_path=re.sub(r'[-_]\d{2,4}x(?:\d{2,4})?(?=\.(?:png|jpe?g|webp)$)','',parts.path,flags=re.I)
-                identity=urlunsplit((parts.scheme,parts.netloc,image_path,urlencode([(key,value) for key,value in parse_qsl(parts.query) if key.lower() not in ('w','h','width','height','q','quality','dpr','fit','crop','auto')]),''))
-                if not image_url or identity in seen or image_identity(image_url,resource.url) in branding or re.search(r'logo|avatar|icon|badge|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
+                identity=image_identity(urlunsplit((parts.scheme,parts.netloc,image_path,parts.query,'')),resource.url)
+                if not image_url or image_url in seen or identity in branding or re.search(r'logo|avatar|icon|badge|chatgpt|ai.generated|dall.e|midjourney',image_url+' '+candidate['alt'],re.I):continue
                 if re.search(r'(?:facebook|instagram|twitter|linkedin)',parts.path+' '+candidate['alt'],re.I) and re.search(r'logo|icon|follow|share|social',parts.path+' '+candidate['alt'],re.I):continue
                 if re.search(r'(?:^|[/_.-])(?:maps?|staticmap|openstreetmap|googlemaps)(?:[/_.-]|$)|maps\.(?:google|apple)|\b(?:street map|map of|directions map)\b', image_url+' '+candidate['alt'], re.I):continue
-                seen.add(identity)
+                seen.add(image_url)
                 figures.append({'id':'venue-photo-'+str(len(figures)), 'url':image_url,'caption':matching[0]['name']+' · photo from '+resource.url,
                                 'license_url':permission['license_url'] if permission else '','page':None,'selection_basis':'venue_website_photo',
+                                'photo_identity':identity,
                                 **({'reuse_permission':permission} if permission else {})})
             title=soup.title.get_text(' ',strip=True) if soup.title else matching[0]['name']
             source=Document(resource.url,title,[],metadata={'author':title},figures=figures)
-            selected=[];seen_images=set()
-            for figure in figures[:6]:
+            selected=[];seen_images=set();seen_photos=set()
+            for figure in figures[:12]:
+                if figure['photo_identity'] in seen_photos:continue
                 value=source_visual(Document(source.url,source.title,[],metadata=source.metadata,figures=[figure]),draft,fetcher,allow_pdf=False)
                 if value:
                     visual,image=value
+                    if not usable_venue_photo(image):continue
                     permission=figure.get('reuse_permission')
                     if permission:
                         visual.update(permission)
@@ -600,6 +641,7 @@ def linked_venue_gallery(document, draft, fetcher, stage=lambda _: None, limit=4
                     identity=hashlib.sha256(image).hexdigest()
                     if identity not in seen_images:
                         selected.append(({**visual,'source_role':'venue_website','photo_source_page':resource.url},image));seen_images.add(identity)
+                        seen_photos.add(figure['photo_identity'])
                 if len(selected)>=limit:return selected
             if selected:return selected
             follow_venue_pages(soup,resource)
@@ -737,6 +779,7 @@ def source_gallery(document, draft, fetcher, stage=lambda _: None, limit=4, phot
             value = source_visual(replace(source, figures=[figure], metadata={k: v for k, v in source.metadata.items() if k != "pdf_url"}), draft, fetcher, allow_pdf=False)
             if value:
                 visual, image = value
+                if venue and not usable_venue_photo(image):continue
                 identity = hashlib.sha256(image).hexdigest()
                 if identity not in seen:
                     selected.append(({**visual, "source_role": "primary" if source.url != document.url else "article"}, image))

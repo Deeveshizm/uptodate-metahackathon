@@ -8,7 +8,7 @@ But the experience often ends in an overflowing inbox. The content we chose to e
 
 I built **UpToDate** to give that content a home of its own: an app that turns newsletters into digestible posts, while keeping the subscriptions out of your main inbox.
 
-[Website](https://up2-date.app) · [Privacy](https://up2-date.app/privacy) · [Terms](https://up2-date.app/terms)
+[Install the iPhone beta](https://testflight.apple.com/join/6ngBfc4R) · [Website](https://up2-date.app) · [Privacy](https://up2-date.app/privacy) · [Terms](https://up2-date.app/terms)
 
 ## 1. Create your account and get a newsletter address
 
@@ -77,7 +77,7 @@ There are two delivery options:
 
 **Direct delivery:** connect Muse from Profile, then use **Create Directly with Muse**. The request uses your existing private connector to deliver editions straight to your account and feed, without email. You confirm the newsletter task and schedule in Muse.
 
-A public connector is pending review and approval. Direct delivery is currently limited to approved private-connector beta accounts.
+A public connector is pending review and approval. Every verified UpToDate account can set up its own private Muse connection for direct delivery. Each connection has a separate, revocable key; setup and schedules are managed in Muse.
 
 ## 7. Keep your feed yours
 
@@ -100,7 +100,11 @@ The backend is designed to avoid paying for the same work repeatedly:
 
 Text generation, Biggie, and model-assisted retrieval use **Muse Wonder 1.0** by default. Fallback illustrations use **Muse Image**. `.eml` imports retain their extractive import flow.
 
-## Run the app
+## Install the iPhone beta
+
+Open the [UpToDate TestFlight invitation](https://testflight.apple.com/join/6ngBfc4R) on your iPhone. Install Apple's TestFlight app if prompted, then accept the invitation and install UpToDate. You can create your own account or use the shared demo account below to try it.
+
+## Run the app from source
 
 ```sh
 git clone https://github.com/Deeveshizm/uptodate-metahackathon.git
@@ -108,7 +112,7 @@ cd uptodate-metahackathon
 open native/UpToDate.xcodeproj
 ```
 
-Select the **UpToDate** scheme in Xcode, choose an iPhone simulator, and run. Physical-device builds require signing with an Apple Developer team. TestFlight access is by invitation during the beta.
+Select the **UpToDate** scheme in Xcode, choose an iPhone simulator, and run. Physical-device builds require signing with an Apple Developer team.
 
 **UpToDate already supports multiple users and is deployed on Google Cloud Platform (GCP).** Each user has their own account, newsletter alias, subscriptions, and personal feed. The iOS app connects to the hosted backend, so testers do not need environment files or backend API keys.
 

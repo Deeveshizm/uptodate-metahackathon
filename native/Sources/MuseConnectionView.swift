@@ -37,6 +37,8 @@ struct MuseConnectionView: View {
                             .font(.subheadline.weight(.semibold))
                         Text("Copy this key into Muse’s secure connector setup. It stays available only during this app session.")
                             .font(.caption).foregroundStyle(.secondary)
+                        Text("Save this latest key in your existing Muse connector. Previous keys stop working when you reconnect or replace them.")
+                            .font(.caption).foregroundStyle(.secondary)
                         Button {
                             MuseHandoff.copyConnectionKey(credential.credential)
                             showSetupNotice("Key copied. Paste it into Muse’s secure credential field.")
@@ -173,7 +175,7 @@ struct MuseConnectionView: View {
     }
 
     private func openSetup() {
-        guard let connection, let prompt = MuseSetupPrompt.make(schema: connection.schemaUrl) else { return }
+        guard let connection, let prompt = MuseSetupPrompt.make(schema: connection.schemaUrl, newKeyIssued: credential != nil) else { return }
         copyText(prompt)
         showSetupNotice("Setup request copied. Paste it in Muse; provide the key only in secure setup.")
         MuseHandoff.openChat { showSetupNotice("Request copied. Open Muse and paste it into a chat.") }
