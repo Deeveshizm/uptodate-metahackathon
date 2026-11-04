@@ -96,7 +96,7 @@ The backend is designed to avoid paying for the same work repeatedly:
 - Complete source content can be preserved, and real images are preferred over generating replacements.
 - Bounded model requests and spending limits control generation and retrieval work.
 
-**Bloom-filter pre-checks are a planned optimization, not part of the current implementation.** The current token savings come from exact hash/database checks, reusable generation artifacts, and avoiding unnecessary model calls.
+Bloom-filter prechecks run alongside the exact generation cache. Each worker keeps a small filter of artifact fingerprints and refreshes it from the shared database. Possible matches use an exact lookup; negative checks proceed through an atomic database claim, so stale filters and false positives cannot cause duplicate generation or reuse the wrong result. Cached results avoid repeated model calls, while the filter reduces cache-check work. No additional cache service is required.
 
 Text generation, Biggie, and model-assisted retrieval use **Muse Wonder 1.0** by default. Fallback illustrations use **Muse Image**. `.eml` imports retain their extractive import flow.
 

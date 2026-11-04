@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .editorial import PIPELINE_VERSION, EDITOR, VERIFIER
 from .retrieval import SourceError
+from .artifact_bloom import ArtifactBloom
 
 
 class GenerationPending(SourceError):
@@ -32,6 +33,7 @@ def public_identity(url):
 class Artifacts:
     def __init__(self, store):
         self.store = store
+        self.bloom = ArtifactBloom(store)
 
     def identity(self, document, user_id, variant):
         public = public_identity(document.url)
@@ -44,18 +46,27 @@ class Artifacts:
     def obtain(self, document, user_id, variant, producer):
         key, scope = self.identity(document, user_id, variant)
         now, token = time.time(), uuid.uuid4().hex
+        maybe_present = self.bloom.might_contain(key)
         with self.store.connect() as db:
-            db.execute("INSERT OR IGNORE INTO generation_artifacts(cache_key,scope,source_url,content_hash,status,claim_token,lease_until,updated_at) VALUES(?,?,?,?,'processing',?,?,?)",
-                       (key, scope, document.url, document.content_hash, token, now + 1200, now))
-            row = db.execute("SELECT * FROM generation_artifacts WHERE cache_key=?", (key,)).fetchone()
-            if row["status"] == "ready":
+            row = db.execute("SELECT * FROM generation_artifacts WHERE cache_key=?", (key,)).fetchone() if maybe_present else None
+            if row is None:
+                claimed = db.execute("INSERT INTO generation_artifacts(cache_key,scope,source_url,content_hash,status,claim_token,lease_until,updated_at) VALUES(?,?,?,?,'processing',?,?,?) ON CONFLICT(cache_key) DO NOTHING RETURNING cache_key",
+                    (key, scope, document.url, document.content_hash, token, now + 1200, now)).fetchone()
+                if not claimed:
+                    # Another worker may have inserted this key since our last
+                    # filter refresh. SQL uniqueness remains authoritative.
+                    row = db.execute("SELECT * FROM generation_artifacts WHERE cache_key=?", (key,)).fetchone()
+                    if row is None:
+                        raise GenerationPending('The generation claim changed; retry the cache check')
+            self.bloom.add(key)
+            if row is not None and row["status"] == "ready":
                 return key, json.loads(row["result"]), True
-            if row["claim_token"] != token:
+            if row is not None and row["claim_token"] != token:
                 if row["status"] == "failed" and row["updated_at"] > now - 60:
                     raise SourceError("This source recently failed generation; retry after a minute")
                 if row["status"] == "processing" and row["lease_until"] > now:
                     raise GenerationPending("This story is already being generated; your feed will attach when it is ready")
-                changed = db.execute("UPDATE generation_artifacts SET status='processing',claim_token=?,lease_until=?,updated_at=?,error=NULL WHERE cache_key=? AND (status='failed' OR lease_until<=?)",
+                changed = db.execute("UPDATE generation_artifacts SET status='processing',claim_token=?,lease_until=?,updated_at=?,error=NULL WHERE cache_key=? AND status!='ready' AND (status='failed' OR lease_until<=?)",
                                      (token, now + 1200, now, key, now)).rowcount
                 if not changed:
                     raise GenerationPending("This story is already being generated")

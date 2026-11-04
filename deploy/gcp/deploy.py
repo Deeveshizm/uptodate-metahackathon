@@ -117,6 +117,7 @@ def main():
         'GENERATION_DAILY_BUDGET_USD':values.get('GENERATION_DAILY_BUDGET_USD','10'),
         'GENERATION_USER_DAILY_BUDGET_USD':values.get('GENERATION_USER_DAILY_BUDGET_USD','5'),
         'GENERATION_JOB_BUDGET_USD':values.get('GENERATION_JOB_BUDGET_USD','5'),
+        'ARTIFACT_BLOOM_ENABLED':values.get('ARTIFACT_BLOOM_ENABLED','1'),
     }
     receiving_domain=values.get('RESEND_RECEIVING_DOMAIN') or values.get('RELAY_TEST_DOMAIN')
     if receiving_domain:plain['RESEND_RECEIVING_DOMAIN']=receiving_domain

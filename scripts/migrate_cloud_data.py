@@ -59,6 +59,7 @@ def main():
         target.execute((ROOT/'supabase/migrations/20261101000100_private_muse_connector.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261101000300_post_share_pages.sql').read_text())
         target.execute((ROOT/'supabase/migrations/20261102000100_resource_usage.sql').read_text())
+        target.execute((ROOT/'supabase/migrations/20261103000100_artifact_bloom_index.sql').read_text())
     headers={'apikey':values['SUPABASE_SECRET_KEY'],'Authorization':'Bearer '+values['SUPABASE_SECRET_KEY']}
     bucket=values.get('POST_IMAGE_BUCKET','post-images')
     origin=values['SUPABASE_URL'].rstrip('/')

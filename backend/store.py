@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS generation_artifacts (
  content_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('processing','ready','failed')),
  claim_token TEXT, lease_until REAL NOT NULL, result TEXT, error TEXT, updated_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS artifact_bloom_updates ON generation_artifacts(updated_at,cache_key);
 CREATE TABLE IF NOT EXISTS post_sources (
  post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
