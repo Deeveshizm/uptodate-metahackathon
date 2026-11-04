@@ -139,5 +139,3 @@ The receiving layer also retains legacy Resend support. Backend development can 
 | `deploy/gcp/` | Hosted backend deployment. |
 | `deploy/cloudflare/` | Email receiver Worker. |
 | `scripts/` | Development and maintenance utilities. |
-
-Backend deployments read configuration from ignored `.env.local` settings and keep runtime secrets in Google Cloud Secret Manager. Keep environment files and service credentials out of Git and the iOS app.
